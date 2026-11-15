@@ -340,7 +340,7 @@ FreeLdrMigrateBootDrivePart(
         /* Check for boot type to migrate */
         if (!IniGetKey(OsIniSection, L"BootType", &KeyData) || !KeyData)
         {
-            /* Certainly not a ReactOS installation */
+            /* Certainly not a CATV 95 installation */
             DPRINT1("No BootType value present\n");
             continue;
         }
@@ -392,7 +392,7 @@ CreateCommonFreeLdrSections(
     IniSection = IniAddSection(BootStore->IniCache, L"Display");
 
     /* TitleText and MinimalUI */
-    IniAddKey(IniSection, L"TitleText", L"ReactOS Boot Manager");
+    IniAddKey(IniSection, L"TitleText", L"CATV 95 Boot Manager");
     IniAddKey(IniSection, L"MinimalUI", L"Yes");
 
     /*

@@ -268,7 +268,7 @@ BtrfsChkdsk(
         TEXTOUTPUT TextOut;
 
         TextOut.Lines = 1;
-        TextOut.Output = "stub, not implemented";
+        TextOut.Output = "AUTOCHK is temporarily UNIMPLEMENTED...";
 
         Callback(OUTPUT, 0, &TextOut);
     }

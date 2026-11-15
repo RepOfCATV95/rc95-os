@@ -652,12 +652,41 @@ KiDisplayBlueScreen(IN ULONG MessageId,
         if (HardErrMessage) InbvDisplayString(HardErrMessage);
     }
 
-    /* Begin the display */
+    /* Begin the display by adding extra line */
     InbvDisplayString("\r\n");
 
-    /* Print out initial message */
-    KeGetBugMessageText(BUGCHECK_MESSAGE_INTRO, NULL);
-    InbvDisplayString("\r\n\r\n");
+    /* Print a bugcheck data on the top */
+    RtlStringCbPrintfA(AnsiName,
+                       sizeof(AnsiName),
+                       "*** STOP: 0x%08lX (0x%p,0x%p,0x%p,0x%p)\r\n",
+                       (ULONG)KiBugCheckData[0],
+                       (PVOID)KiBugCheckData[1],
+                       (PVOID)KiBugCheckData[2],
+                       (PVOID)KiBugCheckData[3],
+                       (PVOID)KiBugCheckData[4]);
+    InbvDisplayString(AnsiName);
+
+    /* Check if this is the generic message */
+    if (MessageId == BUGCODE_PSS_MESSAGE)
+    {
+        /* It is, so get the bug code string as well */
+        KeGetBugMessageText(BugCheckCode, NULL);
+        InbvDisplayString("\r\n");
+    }
+
+    /* Check if we have a driver and no hard error */
+    if (KiBugCheckDriver && !IsHardError)
+    {
+        /* Display technical driver data */
+        InbvDisplayString(Message);
+    }
+    else
+    {
+        KiDumpParameterImages(Message,
+                              (PVOID)&KiBugCheckData[1],
+                              4,
+                              KeBugCheckUnicodeToAnsi);
+    }
 
     /* Check if we have a driver */
     if (KiBugCheckDriver)
@@ -672,50 +701,14 @@ KiDisplayBlueScreen(IN ULONG MessageId,
         InbvDisplayString("\r\n\r\n");
     }
 
-    /* Check if this is the generic message */
-    if (MessageId == BUGCODE_PSS_MESSAGE)
-    {
-        /* It is, so get the bug code string as well */
-        KeGetBugMessageText(BugCheckCode, NULL);
-        InbvDisplayString("\r\n\r\n");
-    }
-
-    /* Print second introduction message */
+    /* Print an intermediate message */
+    InbvDisplayString("\r\n");
     KeGetBugMessageText(PSS_MESSAGE_INTRO, NULL);
     InbvDisplayString("\r\n\r\n");
 
     /* Get the bug code string */
     KeGetBugMessageText(MessageId, NULL);
     InbvDisplayString("\r\n\r\n");
-
-    /* Print message for technical information */
-    KeGetBugMessageText(BUGCHECK_TECH_INFO, NULL);
-
-    /* Show the technical Data */
-    RtlStringCbPrintfA(AnsiName,
-                       sizeof(AnsiName),
-                       "\r\n\r\n*** STOP: 0x%08lX (0x%p,0x%p,0x%p,0x%p)\r\n\r\n",
-                       BugCheckCode,
-                       (PVOID)KiBugCheckData[1],
-                       (PVOID)KiBugCheckData[2],
-                       (PVOID)KiBugCheckData[3],
-                       (PVOID)KiBugCheckData[4]);
-    InbvDisplayString(AnsiName);
-
-    /* Check if we have a driver*/
-    if (KiBugCheckDriver)
-    {
-        /* Display technical driver data */
-        InbvDisplayString(Message);
-    }
-    else
-    {
-        /* Dump parameter information */
-        KiDumpParameterImages(Message,
-                              (PVOID)&KiBugCheckData[1],
-                              4,
-                              KeBugCheckUnicodeToAnsi);
-    }
 }
 
 DECLSPEC_NORETURN

@@ -73,59 +73,61 @@ CreateFreeLoaderReactOSEntries(
 
     Options->OsLoadPath = ArcPath;
 
-    /* ReactOS */
-    // BootEntry->BootEntryKey = MAKESTRKEY(L"ReactOS");
-    BootEntry->FriendlyName = L"\"ReactOS\"";
+    /* RC95 */
+    // BootEntry->BootEntryKey = MAKESTRKEY(L"RC95");
+    BootEntry->FriendlyName = L"\"Republic of CATV 95\"";
     Options->OsLoadOptions  = L"/FASTDETECT";
-    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"ReactOS"));
+    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"RC95"));
 
-    /* ReactOS_Debug */
-    // BootEntry->BootEntryKey = MAKESTRKEY(L"ReactOS_Debug");
-    BootEntry->FriendlyName = L"\"ReactOS (Debug)\"";
+#if DBG
+    /* RC95_Debug */
+    // BootEntry->BootEntryKey = MAKESTRKEY(L"RC95_Debug");
+    BootEntry->FriendlyName = L"\"Republic of CATV 95 (Debug)\"";
     Options->OsLoadOptions  = L"/DEBUG /DEBUGPORT=COM1 /BAUDRATE=115200 /SOS";
-    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"ReactOS_Debug"));
+    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"RC95_Debug"));
+#endif
 
 #ifdef _WINKD_
-    /* ReactOS_VBoxDebug */
+    /* RC95_VBoxDebug */
     // BootEntry->BootEntryKey = MAKESTRKEY(L"ReactOS_VBoxDebug");
-    BootEntry->FriendlyName = L"\"ReactOS (VBox Debug)\"";
+    BootEntry->FriendlyName = L"\"Republic of CATV 95 (Virtual Box-styled Debug)\"";
     Options->OsLoadOptions  = L"/DEBUG /DEBUGPORT=VBOX /SOS";
-    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"ReactOS_VBoxDebug"));
+    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"RC95_VBoxDebug"));
 #endif
 #if DBG
 #ifndef _WINKD_
-    /* ReactOS_KdSerial */
-    // BootEntry->BootEntryKey = MAKESTRKEY(L"ReactOS_KdSerial");
-    BootEntry->FriendlyName = L"\"ReactOS (RosDbg)\"";
+    /* RC95_KDSerial */
+    // BootEntry->BootEntryKey = MAKESTRKEY(L"RC95_KDSerial");
+    BootEntry->FriendlyName = L"\"Republic of CATV 95 (KD Serial Debug)\"";
     Options->OsLoadOptions  = L"/DEBUG /DEBUGPORT=COM1 /BAUDRATE=115200 /SOS /KDSERIAL";
-    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"ReactOS_KdSerial"));
+    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"RC95_KDSerial"));
 #endif
 
-    /* ReactOS_Screen */
-    // BootEntry->BootEntryKey = MAKESTRKEY(L"ReactOS_Screen");
-    BootEntry->FriendlyName = L"\"ReactOS (Screen)\"";
-    Options->OsLoadOptions  = L"/DEBUG /DEBUGPORT=SCREEN /SOS";
-    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"ReactOS_Screen"));
+    /* RC95_DebugScreen */
+    // BootEntry->BootEntryKey = MAKESTRKEY(L"RC95_DebugScreen");
+    BootEntry->FriendlyName = L"\"Republic of CATV 95 (Screen Debug)\"";
+    Options->OsLoadOptions  = L"/DEBUG /DEBUGPORT=SCREEN /SOS /NOGUIBOOT";
+    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"RC95_DebugScreen"));
 
-    /* ReactOS_LogFile */
+    /* RC95_LogFile */
     // BootEntry->BootEntryKey = MAKESTRKEY(L"ReactOS_LogFile");
-    BootEntry->FriendlyName = L"\"ReactOS (Log file)\"";
-    Options->OsLoadOptions  = L"/DEBUG /DEBUGPORT=FILE /SOS";
-    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"ReactOS_LogFile"));
+    BootEntry->FriendlyName = L"\"Republic of CATV 95 (Log file)\"";
+    Options->OsLoadOptions  = L"/DEBUG /DEBUGPORT=FILE /SOS /BOOTLOG";
+    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"RC95_LogFile"));
 
-    /* ReactOS_Ram */
-    // BootEntry->BootEntryKey = MAKESTRKEY(L"ReactOS_Ram");
-    BootEntry->FriendlyName = L"\"ReactOS (RAM Disk)\"";
+    /* RC95_RAMBOOT */
+    // BootEntry->BootEntryKey = MAKESTRKEY(L"RC95_RAMBOOT");
+    BootEntry->FriendlyName = L"\"Republic of CATV 95 (RAM Disk)\"";
     Options->OsLoadPath     = L"ramdisk(0)\\ReactOS";
     Options->OsLoadOptions  = L"/DEBUG /DEBUGPORT=COM1 /BAUDRATE=115200 /SOS /RDPATH=reactos.img /RDIMAGEOFFSET=32256";
-    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"ReactOS_Ram"));
+    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"RC95_RAMBOOT"));
 
-    /* ReactOS_EMS */
-    // BootEntry->BootEntryKey = MAKESTRKEY(L"ReactOS_EMS");
-    BootEntry->FriendlyName = L"\"ReactOS (Emergency Management Services)\"";
+    /* RC95_EMSBOOT */
+    // BootEntry->BootEntryKey = MAKESTRKEY(L"RC95_EMSBOOT");
+    BootEntry->FriendlyName = L"\"Republic of CATV 95 (Emergency Management Services)\"";
     Options->OsLoadPath     = ArcPath;
     Options->OsLoadOptions  = L"/DEBUG /DEBUGPORT=COM1 /BAUDRATE=115200 /SOS /redirect=com2 /redirectbaudrate=115200";
-    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"ReactOS_EMS"));
+    AddBootStoreEntry(BootStoreHandle, BootEntry, MAKESTRKEY(L"RC95_EMSBOOT"));
 #endif
 
 
@@ -133,15 +135,15 @@ CreateFreeLoaderReactOSEntries(
 #if DBG && !defined(_WINKD_)
     if (IsUnattendedSetup)
     {
-        BootOptions.NextBootEntryKey = MAKESTRKEY(L"ReactOS_KdSerial");
+        BootOptions.NextBootEntryKey = MAKESTRKEY(L"RC95_KDSerial");
     }
     else
 #endif
     {
 #if DBG
-        BootOptions.NextBootEntryKey = MAKESTRKEY(L"ReactOS_Debug");
+        BootOptions.NextBootEntryKey = MAKESTRKEY(L"RC95_Debug");
 #else
-        BootOptions.NextBootEntryKey = MAKESTRKEY(L"ReactOS");
+        BootOptions.NextBootEntryKey = MAKESTRKEY(L"RC95");
 #endif
     }
 
@@ -384,9 +386,9 @@ SkipThisEntry:
     if (Type == FreeLdr && wcscmp(Data->SectionName, (PWSTR)BootEntry->BootEntryKey)== 0)
     {
         RtlStringCchPrintfW(Data->SectionName, ARRAYSIZE(Data->SectionName),
-                            L"ReactOS_%lu", Data->i);
+                            L"RC95_%lu", Data->i);
         RtlStringCchPrintfW(Data->OsName, ARRAYSIZE(Data->OsName),
-                            L"\"ReactOS %lu\"", Data->i);
+                            L"\"Republic of CATV 95 %lu\"", Data->i);
         Data->i++;
     }
     return STATUS_SUCCESS;
@@ -415,8 +417,8 @@ UpdateFreeLoaderIni(
     Data.UseExistingEntry = TRUE;
     Data.i = 1;
     Data.ArcPath = ArcPath;
-    RtlStringCchCopyW(Data.SectionName, ARRAYSIZE(Data.SectionName), L"ReactOS");
-    RtlStringCchCopyW(Data.OsName, ARRAYSIZE(Data.OsName), L"\"ReactOS\"");
+    RtlStringCchCopyW(Data.SectionName, ARRAYSIZE(Data.SectionName), L"RC95");
+    RtlStringCchCopyW(Data.OsName, ARRAYSIZE(Data.OsName), L"\"Republic of CATV 95\"");
 
     //
     // FIXME: We temporarily use EnumerateBootStoreEntries, until
@@ -424,11 +426,11 @@ UpdateFreeLoaderIni(
     //
     Status = EnumerateBootStoreEntries(BootStoreHandle, EnumerateReactOSEntries, &Data);
 
-    /* Create a new "ReactOS" entry if there is none already existing that suits us */
+    /* Create a new "RC95" entry if there is none already existing that suits us */
     if (!Data.UseExistingEntry)
     {
-        // RtlStringCchPrintfW(Data.SectionName, ARRAYSIZE(Data.SectionName), L"ReactOS_%lu", Data.i);
-        // RtlStringCchPrintfW(Data.OsName, ARRAYSIZE(Data.OsName), L"\"ReactOS %lu\"", Data.i);
+        // RtlStringCchPrintfW(Data.SectionName, ARRAYSIZE(Data.SectionName), L"RC95_%lu", Data.i);
+        // RtlStringCchPrintfW(Data.OsName, ARRAYSIZE(Data.OsName), L"\"Republic of CATV 95 %lu\"", Data.i);
 
         BootEntry->Version = FreeLdr;
         BootEntry->BootFilePath = NULL;
@@ -477,8 +479,8 @@ UpdateBootIni(
     Data.UseExistingEntry = TRUE;
     // Data.i = 1;
     Data.ArcPath = EntryName;
-    // RtlStringCchCopyW(Data.SectionName, ARRAYSIZE(Data.SectionName), L"ReactOS");
-    RtlStringCchCopyW(Data.OsName, ARRAYSIZE(Data.OsName), L"\"ReactOS\"");
+    // RtlStringCchCopyW(Data.SectionName, ARRAYSIZE(Data.SectionName), L"RC95");
+    RtlStringCchCopyW(Data.OsName, ARRAYSIZE(Data.OsName), L"\"Republic of CATV 95\"");
 
     //
     // FIXME: We temporarily use EnumerateBootStoreEntries, until
@@ -1030,7 +1032,7 @@ InstallFatBootcodeToPartition(
         DPRINT1("Update 'boot.ini'\n");
         Status = UpdateBootIni(SystemRootPath->Buffer,
                                L"C:\\bootsect.ros",
-                               L"\"ReactOS\"");
+                               L"\"CATV 95 In FreeLDR Mode\"");
         if (!NT_SUCCESS(Status))
         {
             DPRINT1("UpdateBootIni() failed (Status %lx)\n", Status);
