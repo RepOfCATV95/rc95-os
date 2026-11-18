@@ -33,14 +33,3 @@ NTAPI
 DisplayBootBitmap(
     _In_ BOOLEAN TextMode);
 
-VOID
-NTAPI
-HibernationDisplay(
-    _In_ BOOLEAN TextMode
-);
-
-VOID
-NTAPI
-HibernationFinished(
-    _In_ BOOLEAN TextMode
-);
