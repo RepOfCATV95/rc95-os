@@ -48,6 +48,47 @@ extern PMMPTE MmDebugPte; // internal
 
 extern KSPIN_LOCK MmPfnLock;
 
+typedef NTSTATUS
+(NTAPI *PMI_MEMORY_SERIALIZATION_MAP_ROUTINE)(
+    _In_ PVOID Context,
+    _In_ PHYSICAL_ADDRESS PhysicalAddress,
+    _In_ ULONG Length,
+    _Out_ PVOID *MappedAddress
+);
+
+typedef VOID
+(NTAPI *PMI_MEMORY_SERIALIZATION_UNMAP_ROUTINE)(
+    _In_ PVOID Context,
+    _In_ PVOID MappedAddress,
+    _In_ ULONG Length
+);
+
+typedef NTSTATUS
+(NTAPI *PMI_MEMORY_SERIALIZATION_CALLBACK)(
+    _In_ PVOID Context,
+    _In_ PHYSICAL_ADDRESS PhysicalAddress,
+    _In_reads_bytes_(Length) const VOID *MappedAddress,
+    _In_ ULONG Length
+);
+
+/*
+ * Ranges, context, and callbacks must be resident and support the caller's IRQL.
+ * The mapped bytes are valid only until the serialization callback returns.
+ */
+NTSTATUS
+NTAPI
+MiSerializePhysicalMemory(
+    _In_reads_(RangeCount) PPHYSICAL_MEMORY_RANGE Ranges,
+    _In_ ULONG RangeCount,
+    _In_ ULONG ChunkSize,
+    _In_ PMI_MEMORY_SERIALIZATION_MAP_ROUTINE MapRoutine,
+    _In_ PMI_MEMORY_SERIALIZATION_UNMAP_ROUTINE UnmapRoutine,
+    _In_ PMI_MEMORY_SERIALIZATION_CALLBACK Callback,
+    _In_opt_ PVOID Context,
+    _Out_ PULONGLONG PagesSerialized,
+    _Out_ PULONGLONG BytesSerialized
+);
+
 //struct _KTRAP_FRAME;
 struct _EPROCESS;
 struct _MM_RMAP_ENTRY;

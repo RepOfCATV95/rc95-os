@@ -677,6 +677,12 @@ NTSTATUS
 IopQueueDevicePropertyChangeEvent(
     _In_ PCUNICODE_STRING DeviceId);
 
+NTSTATUS
+IopQueuePowerEvent(
+    _In_ ULONG NotificationCode,
+    _In_ ULONG NotificationData,
+    _In_ BOOLEAN Synchronous);
+
 ULONG
 IopGetDeviceNodeStatus(
     _In_ PDEVICE_NODE DeviceNode);

@@ -11,6 +11,8 @@ typedef struct _ACPI_CACHED_TABLE
     // ...
 } ACPI_CACHED_TABLE, *PACPI_CACHED_TABLE;
 
+extern FADT HalpFixedAcpiDescTable;
+
 NTSTATUS
 NTAPI
 HalpAcpiTableCacheInit(
@@ -37,5 +39,27 @@ HalAcpiGetTable(
     IN PLOADER_PARAMETER_BLOCK LoaderBlock,
     IN ULONG Signature
 );
+
+VOID
+NTAPI
+HalpSetWakeEnable(
+    IN BOOLEAN Enable
+);
+
+#if (NTDDI_VERSION >= NTDDI_WIN8)
+VOID
+NTAPI
+HalpSetWakeAlarm(
+    IN ULONGLONG AlarmTime,
+    IN ULONGLONG DcWakeTime
+);
+#else
+VOID
+NTAPI
+HalpSetWakeAlarm(
+    IN ULONGLONG AlarmTime,
+    IN PTIME_FIELDS TimeFields
+);
+#endif
 
 /* EOF */

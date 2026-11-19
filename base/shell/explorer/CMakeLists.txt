@@ -23,6 +23,7 @@ list(APPEND SOURCE
     taskswnd.cpp
     tbsite.cpp
     trayclock.cpp
+    trayflyouts.cpp
     traydeskbtn.cpp
     trayntfy.cpp
     trayprop.cpp

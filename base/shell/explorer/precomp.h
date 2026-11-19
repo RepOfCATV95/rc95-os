@@ -370,6 +370,9 @@ CStartMenuSite_CreateInstance(IN OUT ITrayWindow *Tray, const IID & riid, PVOID 
 
 /* TrayClockWnd */
 HRESULT CTrayClockWnd_CreateInstance(HWND hwndParent, REFIID riid, void **ppv);
+HRESULT CTrayClockFlyout_CreateInstance(HWND hwndOwner, REFIID riid, void **ppv);
+VOID CTrayClockFlyout_Show(IN HWND hwndFlyout);
+VOID CTrayClockFlyout_Hide(IN HWND hwndFlyout);
 
 static inline BOOL GetHideClock()
 {

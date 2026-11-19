@@ -18,6 +18,8 @@
 #include <aclapi.h>
 #include <mmsystem.h>
 #include <userenv.h>
+#include <ndk/pofuncs.h>
+#include <ndk/potypes.h>
 #include <ndk/setypes.h>
 #include <ndk/sefuncs.h>
 
@@ -1204,11 +1206,103 @@ HandleShutdown(
 }
 
 static
+NTSTATUS
+HandleSuspend(
+    _In_ PWLSESSION Session,
+    _In_ DWORD WlxAction)
+{
+    NTSTATUS Status;
+    NTSTATUS RestoreStatus;
+    BOOLEAN OldPrivilege;
+    SYSTEM_POWER_STATE MinimumState;
+    SYSTEM_POWER_CAPABILITIES PowerCapabilities;
+
+    if (WlxAction == WLX_SAS_ACTION_SHUTDOWN_HIBERNATE)
+    {
+        DisplayStatusMessage(Session,
+                             Session->WinlogonDesktop,
+                             IDS_PREPARETOHIBERNATE);
+        MinimumState = PowerSystemHibernate;
+    }
+    else
+    {
+        Status = NtPowerInformation(SystemPowerCapabilities,
+                                    NULL,
+                                    0,
+                                    &PowerCapabilities,
+                                    sizeof(PowerCapabilities));
+        if (!NT_SUCCESS(Status))
+        {
+            ERR("NtPowerInformation(SystemPowerCapabilities) failed (Status 0x%08lx)\n",
+                Status);
+            return Status;
+        }
+
+        if (PowerCapabilities.SystemS3)
+            MinimumState = PowerSystemSleeping3;
+        else if (PowerCapabilities.SystemS2)
+            MinimumState = PowerSystemSleeping2;
+        else if (PowerCapabilities.SystemS1)
+            MinimumState = PowerSystemSleeping1;
+        else
+            return STATUS_NOT_SUPPORTED;
+    }
+
+    Status = RtlAdjustPrivilege(SE_SHUTDOWN_PRIVILEGE,
+                               TRUE,
+                               FALSE,
+                               &OldPrivilege);
+    if (!NT_SUCCESS(Status))
+    {
+        ERR("Failed to enable shutdown privilege (Status 0x%08lx)\n", Status);
+        return Status;
+    }
+
+    Status = NtSetSystemPowerState(
+                 WlxAction == WLX_SAS_ACTION_SHUTDOWN_HIBERNATE ?
+                     PowerActionHibernate : PowerActionSleep,
+                 MinimumState,
+                 0);
+
+    RestoreStatus = RtlAdjustPrivilege(SE_SHUTDOWN_PRIVILEGE,
+                                       OldPrivilege,
+                                       FALSE,
+                                       &OldPrivilege);
+    if (!NT_SUCCESS(RestoreStatus))
+    {
+        ERR("Failed to restore shutdown privilege (Status 0x%08lx)\n",
+            RestoreStatus);
+    }
+
+    if (!NT_SUCCESS(Status))
+    {
+        ERR("NtSetSystemPowerState failed for WLX action 0x%lx (Status 0x%08lx)\n",
+            WlxAction,
+            Status);
+        if (WlxAction == WLX_SAS_ACTION_SHUTDOWN_HIBERNATE &&
+            Status == STATUS_DEVICE_DOES_NOT_EXIST)
+        {
+            DisplayStatusMessage(Session,
+                                 Session->WinlogonDesktop,
+                                 IDS_SAVEYOURSETTINGS);
+        }
+    }
+
+    return Status;
+}
+
+static
 VOID
 DoGenericAction(
     IN OUT PWLSESSION Session,
     IN DWORD wlxAction)
 {
+    if (WLX_SUSPENDING(wlxAction))
+    {
+        HandleSuspend(Session, wlxAction);
+        return;
+    }
+
     switch (wlxAction)
     {
         case WLX_SAS_ACTION_LOGON: /* 0x01 */

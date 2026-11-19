@@ -1475,6 +1475,16 @@ IoRegisterPlugPlayNotification(
 
 _IRQL_requires_max_(PASSIVE_LEVEL)
 NTKERNELAPI
+ULONG
+NTAPI
+IoPnPDeliverServicePowerNotification(
+  _In_ ULONG VetoedPowerOperation,
+  _In_ ULONG PowerNotificationCode,
+  _In_ ULONG PowerNotificationData,
+  _In_ BOOLEAN Synchronous);
+
+_IRQL_requires_max_(PASSIVE_LEVEL)
+NTKERNELAPI
 NTSTATUS
 NTAPI
 IoRegisterShutdownNotification(

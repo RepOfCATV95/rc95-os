@@ -1622,7 +1622,7 @@ EnumServicesStatusExW(SC_HANDLE hSCManager,
  *
  * Undocumented
  *
- * @unimplemented
+ * @implemented
  */
 BOOL
 WINAPI
@@ -1632,27 +1632,31 @@ I_ScSendPnPMessage(
     _In_ DWORD dwEventType,
     _In_ PVOID pEventData)
 {
-    BOOL bResult;
+    DWORD Error = ERROR_SUCCESS;
 
     TRACE("I_ScSendPnPMessage(%p %lu %lu %p)\n",
           hServiceStatus, dwControlCode, dwEventType, pEventData);
 
     RpcTryExcept
     {
-        bResult = RI_ScSendPnPMessage((RPC_SERVICE_STATUS_HANDLE)hServiceStatus,
-                                       dwControlCode,
-                                       dwEventType,
-                                       ((PDEV_BROADCAST_HDR)pEventData)->dbch_size,
-                                       pEventData);
+        Error = RI_ScSendPnPMessage((RPC_SERVICE_STATUS_HANDLE)hServiceStatus,
+                                    dwControlCode,
+                                    dwEventType,
+                                    (dwControlCode == SERVICE_CONTROL_DEVICEEVENT &&
+                                     pEventData != NULL) ?
+                                        ((PDEV_BROADCAST_HDR)pEventData)->dbch_size : 0,
+                                    pEventData);
     }
     RpcExcept(EXCEPTION_EXECUTE_HANDLER)
     {
-        SetLastError(ScmRpcStatusToWinError(RpcExceptionCode()));
-        bResult = FALSE;
+        Error = ScmRpcStatusToWinError(RpcExceptionCode());
     }
     RpcEndExcept;
 
-    return bResult;
+    if (Error != ERROR_SUCCESS)
+        SetLastError(Error);
+
+    return Error == ERROR_SUCCESS;
 }
 
 

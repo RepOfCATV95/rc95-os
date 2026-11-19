@@ -1420,13 +1420,46 @@ PnpRootPowerControl(
     IN PIRP Irp)
 {
     PIO_STACK_LOCATION IrpSp = IoGetCurrentIrpStackLocation(Irp);
-    NTSTATUS Status = Irp->IoStatus.Status;
+    NTSTATUS Status = STATUS_NOT_SUPPORTED;
 
     switch (IrpSp->MinorFunction)
     {
         case IRP_MN_QUERY_POWER:
         case IRP_MN_SET_POWER:
-            Status = STATUS_SUCCESS;
+            if (IrpSp->Parameters.Power.Type == SystemPowerState)
+            {
+                SYSTEM_POWER_STATE SystemState =
+                    IrpSp->Parameters.Power.State.SystemState;
+
+                if (SystemState >= PowerSystemWorking &&
+                    SystemState < PowerSystemMaximum)
+                {
+                    Status = STATUS_SUCCESS;
+                }
+                else
+                {
+                    Status = STATUS_INVALID_PARAMETER;
+                }
+            }
+            else if (IrpSp->Parameters.Power.Type == DevicePowerState)
+            {
+                DEVICE_POWER_STATE DeviceState =
+                    IrpSp->Parameters.Power.State.DeviceState;
+
+                if (DeviceState >= PowerDeviceD0 &&
+                    DeviceState <= PowerDeviceD3)
+                {
+                    Status = STATUS_SUCCESS;
+                }
+                else
+                {
+                    Status = STATUS_INVALID_PARAMETER;
+                }
+            }
+            else
+            {
+                Status = STATUS_INVALID_PARAMETER;
+            }
             break;
     }
     Irp->IoStatus.Status = Status;

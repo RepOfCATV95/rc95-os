@@ -8,6 +8,7 @@
 
 #include <guiddef.h>
 #include <poclass.h>
+#include <reactos/hiberfil.h>
 
 //
 // Define this if you want debugging support
@@ -45,74 +46,6 @@ typedef enum _POP_POLICY_DEVICE_TYPE
     PolicySystemIdle = 7,
     PolicyDeviceMax = 8,
 } POP_POLICY_DEVICE_TYPE;
-
-typedef struct _PO_HIBER_PERF
-{
-    ULONGLONG IoTicks;
-    ULONGLONG InitTicks;
-    ULONGLONG CopyTicks;
-    ULONGLONG StartCount;
-    ULONG ElapsedTime;
-    ULONG IoTime;
-    ULONG CopyTime;
-    ULONG InitTime;
-    ULONG PagesWritten;
-    ULONG PagesProcessed;
-    ULONG BytesCopied;
-    ULONG DumpCount;
-    ULONG FileRuns;
-} PO_HIBER_PERF, *PPO_HIBER_PERF;
-
-typedef struct _PO_MEMORY_IMAGE
-{
-    ULONG Signature;
-    ULONG Version;
-    ULONG CheckSum;
-    ULONG LengthSelf;
-    PFN_NUMBER PageSelf;
-    ULONG PageSize;
-    ULONG ImageType;
-    LARGE_INTEGER SystemTime;
-    ULONGLONG InterruptTime;
-    ULONG FeatureFlags;
-    UCHAR HiberFlags;
-    UCHAR spare[3];
-    ULONG NoHiberPtes;
-    ULONG_PTR HiberVa;
-    PHYSICAL_ADDRESS HiberPte;
-    ULONG NoFreePages;
-    ULONG FreeMapCheck;
-    ULONG WakeCheck;
-    PFN_NUMBER TotalPages;
-    PFN_NUMBER FirstTablePage;
-    PFN_NUMBER LastFilePage;
-    PO_HIBER_PERF PerfInfo;
-} PO_MEMORY_IMAGE, *PPO_MEMORY_IMAGE;
-
-typedef struct _PO_MEMORY_RANGE_ARRAY_RANGE
-{
-    PFN_NUMBER PageNo;
-    PFN_NUMBER StartPage;
-    PFN_NUMBER EndPage;
-    ULONG CheckSum;
-} PO_MEMORY_RANGE_ARRAY_RANGE;
-
-typedef struct _PO_MEMORY_RANGE_ARRAY_LINK
-{
-    struct _PO_MEMORY_RANGE_ARRAY *Next;
-    PFN_NUMBER NextTable;
-    ULONG CheckSum;
-    ULONG EntryCount;
-} PO_MEMORY_RANGE_ARRAY_LINK;
-
-typedef struct _PO_MEMORY_RANGE_ARRAY
-{
-    union
-    {
-        PO_MEMORY_RANGE_ARRAY_RANGE Range;
-        PO_MEMORY_RANGE_ARRAY_LINK Link;
-    };
-} PO_MEMORY_RANGE_ARRAY, *PPO_MEMORY_RANGE_ARRAY;
 
 typedef struct _POP_HIBER_CONTEXT
 {
@@ -154,7 +87,72 @@ typedef struct _POP_HIBER_CONTEXT
     PVOID DmaIO;
     PVOID TemporaryHeap;
     PO_HIBER_PERF PerfInfo;
+    PO_HIBER_IMAGE_HEADER ImageHeader;
+    ULONG HiberPercentComplete;
+    BOOLEAN HiberStatusScreenInitialized;
+    volatile ULONG ResumeFlag;
 } POP_HIBER_CONTEXT, *PPOP_HIBER_CONTEXT;
+
+NTSTATUS
+NTAPI
+PopHiberSystemHandler(
+    _In_ PVOID SystemContext
+);
+
+NTSTATUS
+NTAPI
+PopHiberFinished(
+    _In_ NTSTATUS Status
+);
+
+VOID
+NTAPI
+PopHiberUpdateComplete(
+    _In_ ULONG Percentage
+);
+
+NTSTATUS
+NTAPI
+PopSaveHiberContextStates(
+    _Inout_ PPOP_HIBER_CONTEXT Context
+);
+
+NTSTATUS
+NTAPI
+PopHiberWriteImageHeader(
+    _Inout_ PPOP_HIBER_CONTEXT Context
+);
+
+NTSTATUS
+NTAPI
+PopHiberOpenFile(
+    _In_ ULONG64 Size
+);
+
+VOID
+NTAPI
+PopHiberCloseFile(
+    VOID
+);
+
+VOID
+NTAPI
+PopHiberReadPolicy(
+    _Out_ PULONG Enabled,
+    _Out_ PULONG Percent
+);
+
+VOID
+NTAPI
+PopHiberInvalidate(
+    VOID
+);
+
+VOID
+NTAPI
+PopHiberRelease(
+    VOID
+);
 
 typedef struct _PO_NOTIFY_ORDER_LEVEL
 {
@@ -281,14 +279,14 @@ CODE_SEG("INIT")
 BOOLEAN
 NTAPI
 PoInitSystem(
-    IN ULONG BootPhase
+    _In_ ULONG BootPhase
 );
 
 CODE_SEG("INIT")
 VOID
 NTAPI
 PoInitializePrcb(
-    IN PKPRCB Prcb
+    _In_ PKPRCB Prcb
 );
 
 VOID
@@ -303,19 +301,19 @@ PopInitShutdownList(
 VOID
 NTAPI
 PoInitializeDeviceObject(
-    IN OUT PDEVOBJ_EXTENSION DeviceObjectExtension
+    _Inout_ PDEVOBJ_EXTENSION DeviceObjectExtension
 );
 
 VOID
 NTAPI
 PoVolumeDevice(
-    IN PDEVICE_OBJECT DeviceObject
+    _In_ PDEVICE_OBJECT DeviceObject
 );
 
 VOID
 NTAPI
 PoRemoveVolumeDevice(
-    IN PDEVICE_OBJECT DeviceObject);
+    _In_ PDEVICE_OBJECT DeviceObject);
 
 //
 // Power State routines
@@ -323,21 +321,27 @@ PoRemoveVolumeDevice(
 NTSTATUS
 NTAPI
 PopSetSystemPowerState(
-    SYSTEM_POWER_STATE PowerState,
-    POWER_ACTION PowerAction
+    _In_ SYSTEM_POWER_STATE PowerState,
+    _In_ POWER_ACTION PowerAction
+);
+
+NTSTATUS
+NTAPI
+PopEnterSleepState(
+    _In_ SYSTEM_POWER_STATE SystemState
 );
 
 VOID
 NTAPI
 PopCleanupPowerState(
-    IN PPOWER_STATE PowerState
+    _Inout_ PUCHAR PowerState
 );
 
 NTSTATUS
 NTAPI
 PopAddRemoveSysCapsCallback(
-    IN PVOID NotificationStructure,
-    IN PVOID Context
+    _In_ PVOID NotificationStructure,
+    _In_ PVOID Context
 );
 
 //
@@ -361,22 +365,24 @@ PopReadShutdownPolicy(
 VOID
 NTAPI
 PopGracefulShutdown(
-    IN PVOID Context
+    _In_opt_ PVOID Context
 );
 
 VOID
 NTAPI
 PopFlushVolumes(
-    IN BOOLEAN ShuttingDown
+    _In_ BOOLEAN ShuttingDown
 );
 
 //
 // Global data inside the Power Manager
 //
 extern PDEVICE_NODE PopSystemPowerDeviceNode;
+extern PKWIN32_POWERSTATE_CALLOUT PopStateCallout;
 extern KGUARDED_MUTEX PopVolumeLock;
 extern LIST_ENTRY PopVolumeDevices;
 extern KSPIN_LOCK PopDopeGlobalLock;
 extern POP_POWER_ACTION PopAction;
 extern SYSTEM_POWER_CAPABILITIES PopCapabilities;
+extern PPOP_HIBER_CONTEXT PopHiberContext;
 

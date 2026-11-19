@@ -1486,6 +1486,11 @@ LoadAndBootWindowsCommon(
     /* Map pages and create memory descriptors */
     WinLdrSetupMemoryLayout(LoaderBlock);
 
+#if defined(_M_IX86) || defined(_M_AMD64)
+    /* Hibernation file I/O needs the firmware descriptor tables. */
+    WinLdrResumeFromHibernation(SystemPartition);
+#endif
+
     /* Set processor context */
     WinLdrSetProcessorContext(OperatingSystemVersion);
 

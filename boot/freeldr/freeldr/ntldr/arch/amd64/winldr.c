@@ -27,6 +27,10 @@ PVOID GdtIdt;
 PFN_NUMBER SharedUserDataPfn;
 ULONG_PTR TssBasePage;
 
+#define HIBER_RESTORE_WINDOW 0xFFFFF78000010000ULL
+
+static PHARDWARE_PTE HiberRestorePageTable;
+
 /* FUNCTIONS **************************************************************/
 
 static
@@ -266,6 +270,62 @@ WinLdrMapSpecialPages(VOID)
 }
 
 static
+BOOLEAN
+WinLdrPrepareHiberMapping(VOID)
+{
+    PHARDWARE_PTE PpeBase, PdeBase;
+
+    PpeBase = MempGetOrCreatePageDir(PxeBase, VAtoPXI(HIBER_RESTORE_WINDOW));
+    PdeBase = MempGetOrCreatePageDir(PpeBase, VAtoPPI(HIBER_RESTORE_WINDOW));
+    HiberRestorePageTable =
+        MempGetOrCreatePageDir(PdeBase, VAtoPDI(HIBER_RESTORE_WINDOW));
+
+    return HiberRestorePageTable != NULL;
+}
+
+BOOLEAN
+WinLdrMapHiberChunk(
+    ULONGLONG PhysicalAddress,
+    ULONG Length,
+    const VOID *Buffer)
+{
+    ULONG Page;
+    ULONG PageCount;
+    ULONG PteIndex;
+
+    if (HiberRestorePageTable == NULL ||
+        Buffer == NULL ||
+        Length == 0 ||
+        Length > 64 * 1024 ||
+        (PhysicalAddress & (PAGE_SIZE - 1)) != 0 ||
+        (Length & (PAGE_SIZE - 1)) != 0 ||
+        PhysicalAddress >= (1ULL << 40) ||
+        (ULONGLONG)Length > (1ULL << 40) - PhysicalAddress)
+    {
+        return FALSE;
+    }
+
+    PageCount = Length >> PAGE_SHIFT;
+    PteIndex = VAtoPTI(HIBER_RESTORE_WINDOW);
+    if (PteIndex + PageCount > 512)
+        return FALSE;
+
+    for (Page = 0; Page < PageCount; Page++)
+    {
+        PHARDWARE_PTE Pte = &HiberRestorePageTable[PteIndex + Page];
+        RtlZeroMemory(Pte, sizeof(*Pte));
+        Pte->PageFrameNumber =
+            (PhysicalAddress >> PAGE_SHIFT) + Page;
+        Pte->Write = 1;
+        Pte->Valid = 1;
+    }
+
+    __writecr3((ULONG64)PxeBase);
+    RtlCopyMemory((PVOID)(ULONG_PTR)HIBER_RESTORE_WINDOW, Buffer, Length);
+    return TRUE;
+}
+
+static
 VOID
 Amd64SetupGdt(PVOID GdtBase, ULONG64 TssBase)
 {
@@ -414,6 +474,9 @@ void WinLdrSetupMachineDependent(PLOADER_PARAMETER_BLOCK LoaderBlock)
     {
         // FIXME: bugcheck
     }
+
+    if (!WinLdrPrepareHiberMapping())
+        ERR("Failed to prepare the hibernation restore mapping\n");
 
     /* Map KI_USER_SHARED_DATA, Apic and HAL space */
     WinLdrMapSpecialPages();

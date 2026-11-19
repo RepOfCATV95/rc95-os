@@ -3,6 +3,7 @@ include_directories(include ${REACTOS_SOURCE_DIR}/drivers/bus/acpi/acpica/includ
 
 list(APPEND HAL_ACPI_SOURCE
     acpi/halacpi.c
+    acpi/sleep.c
     acpi/halpnpdd.c
     acpi/busemul.c
     acpi/madt.c

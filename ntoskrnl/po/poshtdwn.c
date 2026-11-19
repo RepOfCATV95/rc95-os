@@ -149,32 +149,67 @@ VOID
 NTAPI
 PopShutdownHandler(VOID)
 {
+    PKPRCB aPRCB = KeGetCurrentPrcb();
+
     /* Stop all interrupts */
     KeRaiseIrqlToDpcLevel();
     _disable();
-
-    /* Do we have boot video */
-    if (InbvIsBootDriverInstalled())
+    if (aPRCB->Number == 0)
     {
-        /* Yes we do, cleanup for shutdown screen */
-        if (!InbvCheckDisplayOwnership()) InbvAcquireDisplayOwnership();
-        InbvResetDisplay();
-        // InbvEnableDisplayString(TRUE);
-        DisplayShutdownBitmap();
-    }
-    else
-    {
-        /* Do it in text-mode */
-        DisplayShutdownText();
+        UCHAR PBColor;
+        PUCHAR Logo1, Logo2;
+
+        /* Assign a background color */
+        PBColor = BV_COLOR_DARK_GRAY;
+
+        /* Display the shutdown screen only if boot video is installed */
+        if (InbvBootDriverInstalled)
+        {
+            /* Yes we do, cleanup for shutdown screen*/
+            if (!InbvCheckDisplayOwnership()) InbvAcquireDisplayOwnership();
+            InbvResetDisplay();
+            InbvSolidColorFill(0,0,SCREEN_WIDTH-1,SCREEN_HEIGHT-1,PBColor);
+            InbvEnableDisplayString(TRUE);
+            InbvSetScrollRegion(0,0,SCREEN_WIDTH-1,SCREEN_HEIGHT-1);
+
+            Logo1 = InbvGetResourceAddress(IDB_SHUTDOWN_MSG);
+            if (SharedUserData->NtProductType == NtProductWinNt)
+            {
+                /* Professional */
+                Logo2 = InbvGetResourceAddress(IDB_SHUTDOWN_LOGO_PRO);
+            }
+            else
+            {
+                /* Server */
+                Logo2 = InbvGetResourceAddress(IDB_SHUTDOWN_LOGO_SERVER);
+            }
+
+            if ((Logo1) && (Logo2))
+            {
+                InbvBitBlt(Logo1, VID_SHUTDOWN_MSG_LEFT, VID_SHUTDOWN_MSG_TOP);
+                InbvBitBlt(Logo2, VID_SHUTDOWN_LOGO_LEFT, VID_SHUTDOWN_LOGO_TOP);
+            }
+        }
+        else
+        {
+            ULONG i;
+
+            for (i = 0; i < 25; ++i) InbvDisplayString("\r\n");
+            InbvDisplayString("                       ");
+            InbvDisplayString("The system may be powered off now.\r\n");
+        }
     }
 
-    /* Hang the system */
-    for (;;) HalHaltSystem();
+    /* Done, hang the system */
+    for (;;)
+    {
+        HalHaltSystem();
+    }
 }
 
 VOID
 NTAPI
-PopShutdownSystem(IN POWER_ACTION SystemAction)
+PopShutdownSystem(_In_ POWER_ACTION SystemAction)
 {
     /* Note should notify caller of NtPowerInformation(PowerShutdownNotification) */
 
@@ -229,7 +264,7 @@ PopShutdownSystem(IN POWER_ACTION SystemAction)
 
 VOID
 NTAPI
-PopGracefulShutdown(IN PVOID Context)
+PopGracefulShutdown(_In_opt_ PVOID Context)
 {
     PEPROCESS Process = NULL;
 
@@ -381,7 +416,7 @@ PoQueueShutdownWorkItem(
  */
 NTSTATUS
 NTAPI
-PoRequestShutdownEvent(OUT PVOID *Event)
+PoRequestShutdownEvent(_Out_opt_ PVOID *Event)
 {
     NTSTATUS Status;
     PAGED_CODE();

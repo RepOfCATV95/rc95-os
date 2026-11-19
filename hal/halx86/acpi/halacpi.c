@@ -12,6 +12,9 @@
 #define NDEBUG
 #include <debug.h>
 
+#undef HalSetWakeEnable
+#undef HalSetWakeAlarm
+
 /* GLOBALS ********************************************************************/
 
 LIST_ENTRY HalpAcpiTableCacheList;
@@ -818,6 +821,9 @@ HalpSetupAcpiPhase0(IN PLOADER_PARAMETER_BLOCK LoaderBlock)
 
     /* Copy it in the HAL static buffer */
     RtlCopyMemory(&HalpFixedAcpiDescTable, Fadt, TableLength);
+
+    HALPRIVATEDISPATCH->HalSetWakeEnable = HalpSetWakeEnable;
+    HALPRIVATEDISPATCH->HalSetWakeAlarm = HalpSetWakeAlarm;
 
     /* Anything special this HAL needs to do? */
     HalpAcpiDetectMachineSpecificActions(LoaderBlock, &HalpFixedAcpiDescTable);

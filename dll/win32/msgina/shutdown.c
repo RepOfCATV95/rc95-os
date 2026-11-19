@@ -792,6 +792,10 @@ SaveShutdownSelState(
             dwValue = WLX_SHUTDOWN_STATE_SLEEP;
             break;
 
+        case WLX_SAS_ACTION_SHUTDOWN_SLEEP2:
+            dwValue = WLX_SHUTDOWN_STATE_SLEEP2;
+            break;
+
         case WLX_SAS_ACTION_SHUTDOWN_HIBERNATE:
             dwValue = WLX_SHUTDOWN_STATE_HIBERNATE;
             break;

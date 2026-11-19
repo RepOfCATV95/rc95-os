@@ -528,7 +528,7 @@ PspExitThread(IN NTSTATUS ExitStatus)
     ExWaitForRundownProtectionRelease(&Thread->RundownProtect);
 
     /* Cleanup the power state */
-    PopCleanupPowerState((PPOWER_STATE)&Thread->Tcb.PowerState);
+    PopCleanupPowerState(&Thread->Tcb.PowerState);
 
     /* Call the WMI Callback for Threads */
     //WmiTraceThread(Thread, NULL, FALSE);
@@ -1119,7 +1119,7 @@ PspExitProcess(IN BOOLEAN LastThread,
     }
 
     /* Cleanup the power state */
-    PopCleanupPowerState((PPOWER_STATE)&Process->Pcb.PowerState);
+    PopCleanupPowerState(&Process->Pcb.PowerState);
 
     /* Clear the security port */
     if (!Process->SecurityPort)

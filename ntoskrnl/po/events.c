@@ -23,13 +23,23 @@ typedef struct _SYS_BUTTON_CONTEXT
     ULONG SysButton;
 } SYS_BUTTON_CONTEXT, *PSYS_BUTTON_CONTEXT;
 
+typedef struct _SYS_CAPS_WORK_ITEM
+{
+    WORK_QUEUE_ITEM WorkItem;
+    DEVICE_INTERFACE_CHANGE_NOTIFICATION Notification;
+    UNICODE_STRING SymbolicLinkName;
+    POP_POLICY_DEVICE_TYPE DeviceType;
+    WCHAR SymbolicLinkBuffer[ANYSIZE_ARRAY];
+} SYS_CAPS_WORK_ITEM, *PSYS_CAPS_WORK_ITEM;
+
 static VOID
 NTAPI
 PopGetSysButton(
-    IN PDEVICE_OBJECT DeviceObject,
-    IN PVOID Context);
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PVOID Context);
 
 PKWIN32_POWEREVENT_CALLOUT PopEventCallout;
+PKWIN32_POWERSTATE_CALLOUT PopStateCallout;
 extern PCALLBACK_OBJECT SetSystemTimeCallback;
 
 /* FUNCTIONS *****************************************************************/
@@ -57,9 +67,9 @@ PoNotifySystemTimeSet(VOID)
 static NTSTATUS
 NTAPI
 PopGetSysButtonCompletion(
-    IN PDEVICE_OBJECT DeviceObject,
-    IN PIRP Irp,
-    IN PVOID Context)
+    _In_opt_ PDEVICE_OBJECT DeviceObject,
+    _In_ PIRP Irp,
+    _In_ PVOID Context)
 {
     PSYS_BUTTON_CONTEXT SysButtonContext = Context;
     ULONG SysButton;
@@ -105,8 +115,8 @@ PopGetSysButtonCompletion(
 static VOID
 NTAPI
 PopGetSysButton(
-    IN PDEVICE_OBJECT DeviceObject,
-    IN PVOID Context)
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ PVOID Context)
 {
     PSYS_BUTTON_CONTEXT SysButtonContext = Context;
     PIO_WORKITEM CurrentWorkItem = SysButtonContext->WorkItem;
@@ -142,10 +152,10 @@ PopGetSysButton(
     IoFreeWorkItem(CurrentWorkItem);
 }
 
-NTSTATUS
-NTAPI
-PopAddRemoveSysCapsCallback(IN PVOID NotificationStructure,
-                            IN PVOID Context)
+static NTSTATUS
+PopHandleSysCapsNotification(
+    _In_ PVOID NotificationStructure,
+    _In_ PVOID Context)
 {
     PDEVICE_INTERFACE_CHANGE_NOTIFICATION Notification;
     PSYS_BUTTON_CONTEXT SysButtonContext;
@@ -301,4 +311,76 @@ PopAddRemoveSysCapsCallback(IN PVOID NotificationStructure,
         DPRINT1("Removal of a power capable device not implemented\n");
         return STATUS_NOT_IMPLEMENTED;
     }
+}
+
+static VOID
+NTAPI
+PopProcessSysCapsWorkItem(
+    _In_ PVOID Context)
+{
+    PSYS_CAPS_WORK_ITEM WorkItem = Context;
+
+    PopHandleSysCapsNotification(&WorkItem->Notification,
+                                 (PVOID)(ULONG_PTR)WorkItem->DeviceType);
+    ExFreePoolWithTag(WorkItem, 'pSwP');
+}
+
+NTSTATUS
+NTAPI
+PopAddRemoveSysCapsCallback(
+    _In_ PVOID NotificationStructure,
+    _In_ PVOID Context)
+{
+    PDEVICE_INTERFACE_CHANGE_NOTIFICATION Notification;
+    PSYS_CAPS_WORK_ITEM WorkItem;
+    ULONG AllocationSize;
+    USHORT NameLength;
+    POP_POLICY_DEVICE_TYPE DeviceType =
+        (POP_POLICY_DEVICE_TYPE)(ULONG_PTR)Context;
+
+    Notification = NotificationStructure;
+    if (Notification == NULL)
+        return STATUS_INVALID_PARAMETER;
+    if (Notification->Version != 1)
+        return STATUS_REVISION_MISMATCH;
+    if (Notification->Size != sizeof(*Notification) ||
+        Notification->SymbolicLinkName == NULL)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    NameLength = Notification->SymbolicLinkName->Length;
+    if (NameLength > MAXUSHORT - sizeof(WCHAR) ||
+        NameLength > Notification->SymbolicLinkName->MaximumLength ||
+        (NameLength & (sizeof(WCHAR) - 1)) != 0 ||
+        (NameLength != 0 && Notification->SymbolicLinkName->Buffer == NULL))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    AllocationSize = FIELD_OFFSET(SYS_CAPS_WORK_ITEM, SymbolicLinkBuffer) +
+                     NameLength + sizeof(WCHAR);
+    WorkItem = ExAllocatePoolWithTag(NonPagedPool, AllocationSize, 'pSwP');
+    if (WorkItem == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    WorkItem->Notification = *Notification;
+    WorkItem->DeviceType = DeviceType;
+    WorkItem->SymbolicLinkName = *Notification->SymbolicLinkName;
+    WorkItem->SymbolicLinkName.Buffer = WorkItem->SymbolicLinkBuffer;
+    WorkItem->SymbolicLinkName.MaximumLength = NameLength + sizeof(WCHAR);
+    if (NameLength != 0)
+    {
+        RtlCopyMemory(WorkItem->SymbolicLinkBuffer,
+                      Notification->SymbolicLinkName->Buffer,
+                      NameLength);
+    }
+    WorkItem->SymbolicLinkBuffer[NameLength / sizeof(WCHAR)] = UNICODE_NULL;
+    WorkItem->Notification.SymbolicLinkName = &WorkItem->SymbolicLinkName;
+
+    ExInitializeWorkItem(&WorkItem->WorkItem,
+                         PopProcessSysCapsWorkItem,
+                         WorkItem);
+    ExQueueWorkItem(&WorkItem->WorkItem, DelayedWorkQueue);
+    return STATUS_SUCCESS;
 }

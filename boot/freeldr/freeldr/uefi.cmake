@@ -26,13 +26,15 @@ list(APPEND UEFILDR_ARC_SOURCE
 if(ARCH STREQUAL "i386")
     list(APPEND UEFILDR_COMMON_ASM_SOURCE
         arch/uefi/i386/uefiasm.S
+        arch/i386/hibernate_resume.S
         arch/i386/i386trap.S)
     list(APPEND UEFILDR_ARC_SOURCE
         arch/i386/i386idt.c
         arch/hwpci.c)
 elseif(ARCH STREQUAL "amd64")
     list(APPEND UEFILDR_COMMON_ASM_SOURCE
-        arch/uefi/amd64/uefiasm.S)
+        arch/uefi/amd64/uefiasm.S
+        arch/amd64/hibernate_resume.S)
     list(APPEND UEFILDR_ARC_SOURCE
         arch/hwpci.c)
 elseif(ARCH STREQUAL "arm")
@@ -71,9 +73,11 @@ list(APPEND FREELDR_NTLDR_SOURCE
 
 if(ARCH STREQUAL "i386")
     list(APPEND FREELDR_NTLDR_SOURCE
+        ntldr/resume.c
         ntldr/arch/i386/winldr.c)
 elseif(ARCH STREQUAL "amd64")
     list(APPEND FREELDR_NTLDR_SOURCE
+        ntldr/resume.c
         ntldr/arch/amd64/winldr.c)
 elseif(ARCH STREQUAL "arm")
     list(APPEND FREELDR_NTLDR_SOURCE

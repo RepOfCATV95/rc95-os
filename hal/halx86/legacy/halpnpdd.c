@@ -402,6 +402,8 @@ HalpQueryCapabilities(IN PDEVICE_OBJECT DeviceObject,
 
         /* Fill out supported device states */
         Capabilities->DeviceState[PowerSystemWorking] = PowerDeviceD0;
+        Capabilities->DeviceState[PowerSystemSleeping1] = PowerDeviceD3;
+        Capabilities->DeviceState[PowerSystemSleeping2] = PowerDeviceD3;
         Capabilities->DeviceState[PowerSystemHibernate] = PowerDeviceD3;
         Capabilities->DeviceState[PowerSystemShutdown] = PowerDeviceD3;
         Capabilities->DeviceState[PowerSystemSleeping3] = PowerDeviceD3;
@@ -937,8 +939,11 @@ HalpDispatchPower(IN PDEVICE_OBJECT DeviceObject,
                   IN PIRP Irp)
 {
     PFDO_EXTENSION FdoExtension;
+    PIO_STACK_LOCATION IrpSp;
+    NTSTATUS Status;
 
     DPRINT1("HAL: PnP Driver Power!\n");
+    IrpSp = IoGetCurrentIrpStackLocation(Irp);
     FdoExtension = DeviceObject->DeviceExtension;
     if (FdoExtension->ExtensionType == FdoExtensionType)
     {
@@ -949,9 +954,21 @@ HalpDispatchPower(IN PDEVICE_OBJECT DeviceObject,
     else
     {
         PoStartNextPowerIrp(Irp);
-        Irp->IoStatus.Status = STATUS_SUCCESS;
+        switch (IrpSp->MinorFunction)
+        {
+            case IRP_MN_QUERY_POWER:
+            case IRP_MN_SET_POWER:
+                Status = STATUS_SUCCESS;
+                break;
+
+            default:
+                Status = STATUS_NOT_SUPPORTED;
+                break;
+        }
+
+        Irp->IoStatus.Status = Status;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        return STATUS_SUCCESS;
+        return Status;
     }
 }
 

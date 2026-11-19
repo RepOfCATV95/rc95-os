@@ -10,6 +10,7 @@
 /* INCLUDES ******************************************************************/
 
 #include <ntoskrnl.h>
+#include <acpiioct.h>
 #define NDEBUG
 #include <debug.h>
 
@@ -29,6 +30,85 @@ WORK_QUEUE_ITEM PopShutdownWorkItem;
 SYSTEM_POWER_CAPABILITIES PopCapabilities;
 
 /* PRIVATE FUNCTIONS *********************************************************/
+
+static
+NTSTATUS
+PopQuerySystemPowerCapabilities(VOID)
+{
+    PDEVICE_OBJECT DeviceObject;
+    PDEVICE_OBJECT TopDeviceObject;
+    ULONG SupportedStates = 0;
+    ULONG_PTR Information;
+    IO_STATUS_BLOCK IoStatusBlock;
+    KEVENT Event;
+    PIRP Irp;
+    NTSTATUS Status;
+
+    PopCapabilities.SystemS1 = FALSE;
+    PopCapabilities.SystemS2 = FALSE;
+    PopCapabilities.SystemS3 = FALSE;
+    PopCapabilities.SystemS4 = FALSE;
+    PopCapabilities.SystemS5 = FALSE;
+
+    if (!PopAcpiPresent)
+        return STATUS_SUCCESS;
+
+    Status = IopGetSystemPowerDeviceObject(&DeviceObject);
+    if (!NT_SUCCESS(Status))
+        return STATUS_SUCCESS;
+
+    TopDeviceObject = IoGetAttachedDeviceReference(DeviceObject);
+    if (TopDeviceObject == DeviceObject)
+    {
+        ObDereferenceObject(TopDeviceObject);
+        return STATUS_SUCCESS;
+    }
+
+    KeInitializeEvent(&Event, NotificationEvent, FALSE);
+    Irp = IoBuildDeviceIoControlRequest(IOCTL_ACPI_QUERY_SYSTEM_POWER_CAPABILITIES,
+                                        TopDeviceObject,
+                                        NULL,
+                                        0,
+                                        &SupportedStates,
+                                        sizeof(SupportedStates),
+                                        FALSE,
+                                        &Event,
+                                        &IoStatusBlock);
+    if (Irp == NULL)
+    {
+        ObDereferenceObject(TopDeviceObject);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    Status = IoCallDriver(TopDeviceObject, Irp);
+    if (Status == STATUS_PENDING)
+    {
+        KeWaitForSingleObject(&Event,
+                              Executive,
+                              KernelMode,
+                              FALSE,
+                              NULL);
+        Status = IoStatusBlock.Status;
+    }
+
+    Information = IoStatusBlock.Information;
+    ObDereferenceObject(TopDeviceObject);
+
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (Information != sizeof(SupportedStates))
+        return STATUS_DEVICE_DATA_ERROR;
+
+    PopCapabilities.SystemS1 =
+        BooleanFlagOn(SupportedStates, ACPI_SYSTEM_POWER_S1_SUPPORTED);
+    PopCapabilities.SystemS2 =
+        BooleanFlagOn(SupportedStates, ACPI_SYSTEM_POWER_S2_SUPPORTED);
+    PopCapabilities.SystemS5 =
+        BooleanFlagOn(SupportedStates, ACPI_SYSTEM_POWER_S5_SUPPORTED);
+    PopCapabilities.SystemS4 = PopAcpiPresent;
+
+    return STATUS_SUCCESS;
+}
 
 static WORKER_THREAD_ROUTINE PopPassivePowerCall;
 _Use_decl_annotations_
@@ -161,9 +241,9 @@ PopRequestPowerIrpCompletion(
 
 VOID
 NTAPI
-PopCleanupPowerState(IN PPOWER_STATE PowerState)
+PopCleanupPowerState(_Inout_ PUCHAR PowerState)
 {
-    //UNIMPLEMENTED;
+    *PowerState = 0;
 }
 
 NTSTATUS
@@ -277,11 +357,7 @@ PopQuerySystemPowerStateTraverse(PDEVICE_NODE DeviceNode,
     }
     ObDereferenceObject(TopDeviceObject);
 
-#if 0
     return Status;
-#else
-    return STATUS_SUCCESS;
-#endif
 }
 
 NTSTATUS
@@ -320,27 +396,82 @@ PopSetSystemPowerStateTraverse(PDEVICE_NODE DeviceNode,
 
     ObDereferenceObject(TopDeviceObject);
 
-#if 0
     return Status;
-#else
-    return STATUS_SUCCESS;
-#endif
+}
+
+static
+NTSTATUS
+PopTraverseSystemPowerState(
+    _In_ SYSTEM_POWER_STATE SystemPowerState,
+    _In_ POWER_ACTION PowerAction,
+    _In_opt_ PDEVICE_OBJECT PowerDevice)
+{
+    DEVICETREE_TRAVERSE_CONTEXT Context;
+    POWER_STATE_TRAVERSE_CONTEXT PowerContext;
+
+    PowerContext.PowerAction = PowerAction;
+    PowerContext.SystemPowerState = SystemPowerState;
+    PowerContext.PowerDevice = PowerDevice;
+
+    IopInitDeviceTreeTraverseContext(&Context,
+                                    IopRootDeviceNode,
+                                    PopSetSystemPowerStateTraverse,
+                                    &PowerContext);
+
+    return IopTraverseDeviceTree(&Context);
+}
+
+static
+NTSTATUS
+PopRestoreWorkingPowerState(
+    _In_ POWER_ACTION PowerAction,
+    _In_opt_ PDEVICE_OBJECT PowerDevice)
+{
+    NTSTATUS Status, DeviceStatus;
+
+    Status = STATUS_SUCCESS;
+    if (PowerDevice != NULL)
+    {
+        Status = PopSendSetSystemPowerState(PowerDevice,
+                                            PowerSystemWorking,
+                                            PowerAction);
+    }
+
+    DeviceStatus = PopTraverseSystemPowerState(PowerSystemWorking,
+                                               PowerAction,
+                                               PowerDevice);
+    if (NT_SUCCESS(Status))
+        Status = DeviceStatus;
+
+    return Status;
 }
 
 NTSTATUS
 NTAPI
-PopSetSystemPowerState(SYSTEM_POWER_STATE PowerState, POWER_ACTION PowerAction)
+PopSetSystemPowerState(
+    _In_ SYSTEM_POWER_STATE PowerState,
+    _In_ POWER_ACTION PowerAction)
 {
     PDEVICE_OBJECT DeviceObject;
     PDEVICE_OBJECT Fdo;
     NTSTATUS Status;
     DEVICETREE_TRAVERSE_CONTEXT Context;
     POWER_STATE_TRAVERSE_CONTEXT PowerContext;
+    NTSTATUS RestoreStatus;
+
+    if (PowerAction == PowerActionSleep && !PopAcpiPresent)
+    {
+        DPRINT1("Cannot enter a sleep state without ACPI support\n");
+        return STATUS_NOT_SUPPORTED;
+    }
 
     Status = IopGetSystemPowerDeviceObject(&DeviceObject);
     if (!NT_SUCCESS(Status))
     {
         DPRINT1("No system power driver available\n");
+        if (PowerAction == PowerActionSleep)
+            return Status;
+
         Fdo = NULL;
     }
     else
@@ -349,6 +480,7 @@ PopSetSystemPowerState(SYSTEM_POWER_STATE PowerState, POWER_ACTION PowerAction)
         if (Fdo == DeviceObject)
         {
             DPRINT("An FDO was not attached\n");
+            ObDereferenceObject(Fdo);
             return STATUS_UNSUCCESSFUL;
         }
     }
@@ -367,23 +499,59 @@ PopSetSystemPowerState(SYSTEM_POWER_STATE PowerState, POWER_ACTION PowerAction)
     Status = IopTraverseDeviceTree(&Context);
     if (!NT_SUCCESS(Status))
     {
-        DPRINT1("Query system power state failed; changing state anyway\n");
+        DPRINT1("Query system power state failed: 0x%lx\n", Status);
+        if (PowerAction == PowerActionSleep)
+        {
+            if (Fdo != NULL)
+                ObDereferenceObject(Fdo);
+            return Status;
+        }
     }
 
     /* Set system power change */
-    IopInitDeviceTreeTraverseContext(&Context,
-                                     IopRootDeviceNode,
-                                     PopSetSystemPowerStateTraverse,
-                                     &PowerContext);
+    Status = PopTraverseSystemPowerState(PowerState, PowerAction, Fdo);
+    if (!NT_SUCCESS(Status) && PowerAction == PowerActionSleep)
+    {
+        DPRINT1("Setting device power state failed: 0x%lx\n", Status);
+        RestoreStatus = PopTraverseSystemPowerState(PowerSystemWorking,
+                                                    PowerAction,
+                                                    Fdo);
+        if (!NT_SUCCESS(RestoreStatus))
+            DPRINT1("Restoring device power states failed: 0x%lx\n",
+                    RestoreStatus);
+        if (Fdo != NULL)
+            ObDereferenceObject(Fdo);
+        return Status;
+    }
 
-    IopTraverseDeviceTree(&Context);
-
-    if (!PopAcpiPresent) return STATUS_NOT_IMPLEMENTED;
+    if (!PopAcpiPresent)
+    {
+        if (Fdo != NULL)
+            ObDereferenceObject(Fdo);
+        return STATUS_NOT_IMPLEMENTED;
+    }
 
     if (Fdo != NULL)
     {
         if (PowerAction != PowerActionShutdownReset)
-            PopSendSetSystemPowerState(Fdo, PowerState, PowerAction);
+        {
+            Status = PopSendSetSystemPowerState(Fdo, PowerState, PowerAction);
+            if (!NT_SUCCESS(Status) && PowerAction != PowerActionSleep)
+                DPRINT1("Setting system power state failed: 0x%lx\n", Status);
+        }
+
+        if (PowerAction == PowerActionSleep)
+        {
+            if (!NT_SUCCESS(Status))
+                DPRINT1("Entering system power state failed: 0x%lx\n", Status);
+
+            RestoreStatus = PopRestoreWorkingPowerState(PowerAction, Fdo);
+            if (!NT_SUCCESS(RestoreStatus))
+                DPRINT1("Restoring working power state failed: 0x%lx\n",
+                        RestoreStatus);
+            else if (NT_SUCCESS(Status))
+                Status = RestoreStatus;
+        }
 
         ObDereferenceObject(Fdo);
     }
@@ -394,7 +562,7 @@ PopSetSystemPowerState(SYSTEM_POWER_STATE PowerState, POWER_ACTION PowerAction)
 CODE_SEG("INIT")
 BOOLEAN
 NTAPI
-PoInitSystem(IN ULONG BootPhase)
+PoInitSystem(_In_ ULONG BootPhase)
 {
     PVOID NotificationEntry;
     PCHAR CommandLine;
@@ -480,17 +648,17 @@ PoInitSystem(IN ULONG BootPhase)
 
 VOID
 NTAPI
-PopPerfIdle(PPROCESSOR_POWER_STATE PowerState)
+PopPerfIdle(_In_ PPROCESSOR_POWER_STATE PowerState)
 {
     DPRINT1("PerfIdle function: %p\n", PowerState);
 }
 
 VOID
 NTAPI
-PopPerfIdleDpc(IN PKDPC Dpc,
-               IN PVOID DeferredContext,
-               IN PVOID SystemArgument1,
-               IN PVOID SystemArgument2)
+PopPerfIdleDpc(_In_ PKDPC Dpc,
+               _In_ PVOID DeferredContext,
+               _In_ PVOID SystemArgument1,
+               _In_ PVOID SystemArgument2)
 {
     /* Call the Perf Idle function */
     PopPerfIdle(&((PKPRCB)DeferredContext)->PowerState);
@@ -498,7 +666,7 @@ PopPerfIdleDpc(IN PKDPC Dpc,
 
 VOID
 FASTCALL
-PopIdle0(IN PPROCESSOR_POWER_STATE PowerState)
+PopIdle0(_In_ PPROCESSOR_POWER_STATE PowerState)
 {
     /* FIXME: Extremly naive implementation */
     HalProcessorIdle();
@@ -507,7 +675,7 @@ PopIdle0(IN PPROCESSOR_POWER_STATE PowerState)
 CODE_SEG("INIT")
 VOID
 NTAPI
-PoInitializePrcb(IN PKPRCB Prcb)
+PoInitializePrcb(_In_ PKPRCB Prcb)
 {
     /* Initialize the Power State */
     RtlZeroMemory(&Prcb->PowerState, sizeof(Prcb->PowerState));
@@ -529,7 +697,7 @@ PoInitializePrcb(IN PKPRCB Prcb)
  */
 NTSTATUS
 NTAPI
-PoCancelDeviceNotify(IN PVOID NotifyBlock)
+PoCancelDeviceNotify(_In_ PVOID NotifyBlock)
 {
     UNIMPLEMENTED;
     return STATUS_NOT_IMPLEMENTED;
@@ -540,12 +708,12 @@ PoCancelDeviceNotify(IN PVOID NotifyBlock)
  */
 NTSTATUS
 NTAPI
-PoRegisterDeviceNotify(OUT PVOID Unknown0,
-                       IN ULONG Unknown1,
-                       IN ULONG Unknown2,
-                       IN ULONG Unknown3,
-                       IN PVOID Unknown4,
-                       IN PVOID Unknown5)
+PoRegisterDeviceNotify(_Out_ PVOID Unknown0,
+                       _In_ ULONG Unknown1,
+                       _In_ ULONG Unknown2,
+                       _In_ ULONG Unknown3,
+                       _In_ PVOID Unknown4,
+                       _In_ PVOID Unknown5)
 {
     UNIMPLEMENTED;
     return STATUS_NOT_IMPLEMENTED;
@@ -556,12 +724,12 @@ PoRegisterDeviceNotify(OUT PVOID Unknown0,
  */
 VOID
 NTAPI
-PoShutdownBugCheck(IN BOOLEAN LogError,
-                   IN ULONG BugCheckCode,
-                   IN ULONG_PTR BugCheckParameter1,
-                   IN ULONG_PTR BugCheckParameter2,
-                   IN ULONG_PTR BugCheckParameter3,
-                   IN ULONG_PTR BugCheckParameter4)
+PoShutdownBugCheck(_In_ BOOLEAN LogError,
+                   _In_ ULONG BugCheckCode,
+                   _In_ ULONG_PTR BugCheckParameter1,
+                   _In_ ULONG_PTR BugCheckParameter2,
+                   _In_ ULONG_PTR BugCheckParameter3,
+                   _In_ ULONG_PTR BugCheckParameter4)
 {
     DPRINT1("PoShutdownBugCheck called\n");
 
@@ -587,7 +755,37 @@ PoSetHiberRange(IN PVOID HiberContext,
                 IN ULONG Length,
                 IN ULONG PageTag)
 {
-    UNIMPLEMENTED;
+    PPOP_HIBER_CONTEXT Context = HiberContext;
+    PPO_MEMORY_RANGE_ARRAY RangeArray;
+
+    UNREFERENCED_PARAMETER(PageTag);
+
+    if (Context == NULL)
+    {
+        Context = PopHiberContext;
+    }
+
+    if (Context == NULL || Length == 0 || StartPage == NULL)
+        return;
+
+    RangeArray = ExAllocatePoolWithTag(NonPagedPool,
+                                       sizeof(*RangeArray),
+                                       'RbiH');
+    if (RangeArray == NULL)
+        return;
+
+    RangeArray->Range.PageNo = (PFN_NUMBER)(ULONG_PTR)StartPage;
+    RangeArray->Range.StartPage = RangeArray->Range.PageNo;
+    RangeArray->Range.EndPage = RangeArray->Range.PageNo + Length;
+    RangeArray->Range.CheckSum = Flags ^ PageTag ^ Length;
+    Context->NoRanges++;
+
+    DPRINT("PoSetHiberRange: range %I64x-%I64x flags %lx\n",
+           (ULONGLONG)RangeArray->Range.StartPage,
+           (ULONGLONG)RangeArray->Range.EndPage,
+           Flags);
+
+    ExFreePool(RangeArray);
     return;
 }
 
@@ -630,10 +828,10 @@ PoCallDriver(
  */
 PULONG
 NTAPI
-PoRegisterDeviceForIdleDetection(IN PDEVICE_OBJECT DeviceObject,
-                                 IN ULONG ConservationIdleTime,
-                                 IN ULONG PerformanceIdleTime,
-                                 IN DEVICE_POWER_STATE State)
+PoRegisterDeviceForIdleDetection(_In_ PDEVICE_OBJECT DeviceObject,
+                                 _In_ ULONG ConservationIdleTime,
+                                 _In_ ULONG PerformanceIdleTime,
+                                 _In_ DEVICE_POWER_STATE State)
 {
     UNIMPLEMENTED;
     return NULL;
@@ -644,8 +842,8 @@ PoRegisterDeviceForIdleDetection(IN PDEVICE_OBJECT DeviceObject,
  */
 PVOID
 NTAPI
-PoRegisterSystemState(IN PVOID StateHandle,
-                      IN EXECUTION_STATE Flags)
+PoRegisterSystemState(_In_opt_ PVOID StateHandle,
+                      _In_ EXECUTION_STATE Flags)
 {
     UNIMPLEMENTED;
     return NULL;
@@ -726,9 +924,9 @@ PoRequestPowerIrp(
  */
 POWER_STATE
 NTAPI
-PoSetPowerState(IN PDEVICE_OBJECT DeviceObject,
-                IN POWER_STATE_TYPE Type,
-                IN POWER_STATE State)
+PoSetPowerState(_In_ PDEVICE_OBJECT DeviceObject,
+                _In_ POWER_STATE_TYPE Type,
+                _In_ POWER_STATE State)
 {
     POWER_STATE ps;
 
@@ -745,7 +943,7 @@ PoSetPowerState(IN PDEVICE_OBJECT DeviceObject,
  */
 VOID
 NTAPI
-PoSetSystemState(IN EXECUTION_STATE Flags)
+PoSetSystemState(_In_ EXECUTION_STATE Flags)
 {
     UNIMPLEMENTED;
 }
@@ -755,7 +953,7 @@ PoSetSystemState(IN EXECUTION_STATE Flags)
  */
 VOID
 NTAPI
-PoStartNextPowerIrp(IN PIRP Irp)
+PoStartNextPowerIrp(_In_ PIRP Irp)
 {
     UNIMPLEMENTED_ONCE;
 }
@@ -765,7 +963,7 @@ PoStartNextPowerIrp(IN PIRP Irp)
  */
 VOID
 NTAPI
-PoUnregisterSystemState(IN PVOID StateHandle)
+PoUnregisterSystemState(_In_ PVOID StateHandle)
 {
     UNIMPLEMENTED;
 }
@@ -775,13 +973,13 @@ PoUnregisterSystemState(IN PVOID StateHandle)
  */
 NTSTATUS
 NTAPI
-NtInitiatePowerAction(IN POWER_ACTION SystemAction,
-                      IN SYSTEM_POWER_STATE MinSystemState,
-                      IN ULONG Flags,
-                      IN BOOLEAN Asynchronous)
+NtInitiatePowerAction(_In_ POWER_ACTION SystemAction,
+                      _In_ SYSTEM_POWER_STATE MinSystemState,
+                      _In_ ULONG Flags,
+                      _In_ BOOLEAN Asynchronous)
 {
-    UNIMPLEMENTED;
-    return STATUS_NOT_IMPLEMENTED;
+    UNREFERENCED_PARAMETER(Asynchronous);
+    return NtSetSystemPowerState(SystemAction, MinSystemState, Flags);
 }
 
 static
@@ -898,11 +1096,11 @@ Exit:
  */
 NTSTATUS
 NTAPI
-NtPowerInformation(IN POWER_INFORMATION_LEVEL PowerInformationLevel,
-                   IN PVOID InputBuffer  OPTIONAL,
-                   IN ULONG InputBufferLength,
-                   OUT PVOID OutputBuffer  OPTIONAL,
-                   IN ULONG OutputBufferLength)
+NtPowerInformation(_In_ POWER_INFORMATION_LEVEL PowerInformationLevel,
+                   _In_reads_bytes_opt_(InputBufferLength) PVOID InputBuffer,
+                   _In_ ULONG InputBufferLength,
+                   _Out_writes_bytes_opt_(OutputBufferLength) PVOID OutputBuffer,
+                   _In_ ULONG OutputBufferLength)
 {
     NTSTATUS Status;
     KPROCESSOR_MODE PreviousMode = KeGetPreviousMode();
@@ -981,6 +1179,10 @@ NtPowerInformation(IN POWER_INFORMATION_LEVEL PowerInformationLevel,
             if (OutputBufferLength < sizeof(SYSTEM_POWER_CAPABILITIES))
                 return STATUS_BUFFER_TOO_SMALL;
 
+            Status = PopQuerySystemPowerCapabilities();
+            if (!NT_SUCCESS(Status))
+                return Status;
+
             _SEH2_TRY
             {
                 RtlCopyMemory(PowerCapabilities,
@@ -1042,8 +1244,8 @@ NtPowerInformation(IN POWER_INFORMATION_LEVEL PowerInformationLevel,
 
 NTSTATUS
 NTAPI
-NtGetDevicePowerState(IN HANDLE Device,
-                      IN PDEVICE_POWER_STATE PowerState)
+NtGetDevicePowerState(_In_ HANDLE Device,
+                      _Out_ PDEVICE_POWER_STATE PowerState)
 {
     UNIMPLEMENTED;
     return STATUS_NOT_IMPLEMENTED;
@@ -1059,7 +1261,7 @@ NtIsSystemResumeAutomatic(VOID)
 
 NTSTATUS
 NTAPI
-NtRequestWakeupLatency(IN LATENCY_TIME Latency)
+NtRequestWakeupLatency(_In_ LATENCY_TIME Latency)
 {
     UNIMPLEMENTED;
     return STATUS_NOT_IMPLEMENTED;
@@ -1067,8 +1269,8 @@ NtRequestWakeupLatency(IN LATENCY_TIME Latency)
 
 NTSTATUS
 NTAPI
-NtSetThreadExecutionState(IN EXECUTION_STATE esFlags,
-                          OUT EXECUTION_STATE *PreviousFlags)
+NtSetThreadExecutionState(_In_ EXECUTION_STATE esFlags,
+                          _Out_ EXECUTION_STATE *PreviousFlags)
 {
     PKTHREAD Thread = KeGetCurrentThread();
     KPROCESSOR_MODE PreviousMode = KeGetPreviousMode();
@@ -1124,9 +1326,9 @@ NtSetThreadExecutionState(IN EXECUTION_STATE esFlags,
 
 NTSTATUS
 NTAPI
-NtSetSystemPowerState(IN POWER_ACTION SystemAction,
-                      IN SYSTEM_POWER_STATE MinSystemState,
-                      IN ULONG Flags)
+NtSetSystemPowerState(_In_ POWER_ACTION SystemAction,
+                      _In_ SYSTEM_POWER_STATE MinSystemState,
+                      _In_ ULONG Flags)
 {
     KPROCESSOR_MODE PreviousMode = KeGetPreviousMode();
     POP_POWER_ACTION Action = {0};
@@ -1153,6 +1355,13 @@ NtSetSystemPowerState(IN POWER_ACTION SystemAction,
         return STATUS_INVALID_PARAMETER;
     }
 
+    if (SystemAction == PowerActionSleep &&
+        (MinSystemState < PowerSystemSleeping1 ||
+         MinSystemState > PowerSystemSleeping3))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     /* Check for user caller */
     if (PreviousMode != KernelMode)
     {
@@ -1168,6 +1377,51 @@ NtSetSystemPowerState(IN POWER_ACTION SystemAction,
         return ZwSetSystemPowerState(SystemAction, MinSystemState, Flags);
     }
 
+    if (SystemAction == PowerActionSleep)
+    {
+        Status = PopQuerySystemPowerCapabilities();
+        if (!NT_SUCCESS(Status))
+            return Status;
+
+        if ((MinSystemState == PowerSystemSleeping1 &&
+             !PopCapabilities.SystemS1) ||
+            (MinSystemState == PowerSystemSleeping2 &&
+             !PopCapabilities.SystemS2) ||
+            (MinSystemState == PowerSystemSleeping3 &&
+             !PopCapabilities.SystemS3))
+        {
+            return STATUS_NOT_SUPPORTED;
+        }
+    }
+
+    if (SystemAction == PowerActionSleep && PopStateCallout != NULL)
+    {
+        WIN32_POWERSTATE_PARAMETERS Parameters = {0};
+
+        Parameters.SystemAction = SystemAction;
+        Parameters.MinSystemState = MinSystemState;
+        Parameters.Flags = Flags;
+        Parameters.PowerStateTask = PowerState_QueryApps;
+        Status = PopStateCallout(&Parameters);
+        if (!NT_SUCCESS(Status))
+        {
+            Parameters.PowerStateTask = PowerState_QueryAppsFailed;
+            (VOID)PopStateCallout(&Parameters);
+            return Status;
+        }
+
+        Parameters.PowerStateTask = PowerState_QueryServices;
+        Status = PopStateCallout(&Parameters);
+        if (!NT_SUCCESS(Status))
+        {
+            Parameters.PowerStateTask = PowerState_QueryAppsFailed;
+            (VOID)PopStateCallout(&Parameters);
+            Parameters.PowerStateTask = PowerState_QueryServicesFailed;
+            (VOID)PopStateCallout(&Parameters);
+            return Status;
+        }
+    }
+
     /* Read policy settings (partial shutdown vs. full shutdown) */
     if (SystemAction == PowerActionShutdown) PopReadShutdownPolicy();
 
@@ -1178,6 +1432,7 @@ NtSetSystemPowerState(IN POWER_ACTION SystemAction,
     /* Setup the power action */
     Action.Action = SystemAction;
     Action.Flags = Flags;
+    Action.SystemState = MinSystemState;
 
     /* Notify callbacks */
     DPRINT("Notifying callbacks\n");
@@ -1231,6 +1486,124 @@ NtSetSystemPowerState(IN POWER_ACTION SystemAction,
 
         /* Set IRP for drivers */
         PopAction.IrpMinor = IRP_MN_SET_POWER;
+        if (PopAction.Action == PowerActionHibernate)
+        {
+            Status = PopHiberOpenFile(0);
+            if (!NT_SUCCESS(Status))
+            {
+                DPRINT1("Could not open the hibernation file: 0x%lx\n", Status);
+                break;
+            }
+
+            Status = PopHiberSystemHandler(PopHiberContext);
+            if (!NT_SUCCESS(Status))
+            {
+                PopHiberCloseFile();
+                break;
+            }
+
+            if (PopHiberContext->ResumeFlag)
+            {
+                NTSTATUS InvalidateStatus;
+
+                PopHiberContext->ResumeFlag = 0;
+                Status = PopSetSystemPowerState(PowerSystemWorking,
+                                                PowerActionHibernate);
+
+                PopHiberContext->ImageHeader.Flags &=
+                    ~HIBERFILE_FLAG_IMAGE_COMPLETE;
+                InvalidateStatus =
+                    PopHiberWriteImageHeader(PopHiberContext);
+                if (!NT_SUCCESS(InvalidateStatus))
+                {
+                    DPRINT1("Could not invalidate the resumed hibernation image: 0x%lx\n",
+                            InvalidateStatus);
+                    if (NT_SUCCESS(Status))
+                        Status = InvalidateStatus;
+                }
+
+                PopHiberCloseFile();
+                break;
+            }
+
+            if (!(PopHiberContext->ImageHeader.Flags &
+                  HIBERFILE_FLAG_IMAGE_COMPLETE))
+            {
+                DPRINT1("Hibernation image is incomplete; refusing to power off\n");
+                Status = STATUS_NOT_SUPPORTED;
+                PopHiberCloseFile();
+                break;
+            }
+
+            DPRINT("Entering system hibernation state\n");
+            Status = PopSetSystemPowerState(PowerSystemHibernate,
+                                            PowerActionHibernate);
+
+            /* Reaching this point means the system did not remain in S4. */
+            PopHiberContext->ImageHeader.Flags &=
+                ~HIBERFILE_FLAG_IMAGE_COMPLETE;
+            {
+                NTSTATUS InvalidateStatus;
+
+                InvalidateStatus = PopHiberWriteImageHeader(PopHiberContext);
+                if (!NT_SUCCESS(InvalidateStatus))
+                {
+                    DPRINT1("Could not invalidate the hibernation image: 0x%lx\n",
+                            InvalidateStatus);
+                    if (NT_SUCCESS(Status))
+                        Status = InvalidateStatus;
+                }
+            }
+
+            Status = PopHiberFinished(Status);
+            PopHiberCloseFile();
+            break;
+        }
+
+        if (PopAction.Action == PowerActionSleep)
+        {
+            if ((PopAction.SystemState < PowerSystemSleeping1) ||
+                (PopAction.SystemState > PowerSystemSleeping3))
+            {
+                Status = STATUS_INVALID_PARAMETER;
+                break;
+            }
+
+            DPRINT("Entering system sleep state %u\n", PopAction.SystemState);
+            if (PopStateCallout != NULL)
+            {
+                WIN32_POWERSTATE_PARAMETERS Parameters = {0};
+
+                Parameters.SystemAction = PopAction.Action;
+                Parameters.MinSystemState = PopAction.SystemState;
+                Parameters.Flags = PopAction.Flags;
+                Parameters.PowerStateTask = PowerState_SuspendApps;
+                Status = PopStateCallout(&Parameters);
+                if (!NT_SUCCESS(Status))
+                    DPRINT1("Suspend-app notification failed: 0x%lx\n", Status);
+
+                Parameters.PowerStateTask = PowerState_SuspendServices;
+                Status = PopStateCallout(&Parameters);
+                if (!NT_SUCCESS(Status))
+                    DPRINT1("Suspend-service notification failed: 0x%lx\n", Status);
+            }
+
+            Status = PopEnterSleepState(PopAction.SystemState);
+            if (PopStateCallout != NULL)
+            {
+                WIN32_POWERSTATE_PARAMETERS Parameters = {0};
+
+                Parameters.SystemAction = PopAction.Action;
+                Parameters.MinSystemState = PopAction.SystemState;
+                Parameters.Flags = PopAction.Flags;
+                Parameters.PowerStateTask = PowerState_ResumeServices;
+                (VOID)PopStateCallout(&Parameters);
+                Parameters.PowerStateTask = PowerState_ResumeApps;
+                (VOID)PopStateCallout(&Parameters);
+            }
+            break;
+        }
+
         if (PopAction.Shutdown)
         {
             DPRINT("Queueing shutdown thread\n");
@@ -1264,6 +1637,12 @@ NtSetSystemPowerState(IN POWER_ACTION SystemAction,
     }
 
 Exit:
+    if (SystemAction == PowerActionSleep)
+    {
+        /* Sleeping temporarily disables lazy registry flushing. */
+        CmSetLazyFlushState(TRUE);
+    }
+
     /* We're done, return */
     return Status;
 }

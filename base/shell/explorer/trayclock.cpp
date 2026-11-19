@@ -55,6 +55,8 @@ class CTrayClockWnd :
     RECT rcText;
     SYSTEMTIME LocalTime;
     CTooltips m_tooltip;
+    CComPtr<IUnknown> m_clockFlyout;
+    HWND m_hwndClockFlyout;
 
     union
     {
@@ -101,6 +103,7 @@ private:
     LRESULT OnSize(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled);
     LRESULT OnTaskbarSettingsChanged(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled);
     LRESULT OnLButtonDblClick(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled);
+    LRESULT OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled);
     VOID PaintLine(IN HDC hDC, IN OUT RECT *rcClient, IN UINT LineNumber, IN UINT szLinesIndex);
 
 public:
@@ -144,6 +147,7 @@ public:
         MESSAGE_HANDLER(TNWM_GETMINIMUMSIZE, OnGetMinimumSize)
         MESSAGE_HANDLER(TWM_SETTINGSCHANGED, OnTaskbarSettingsChanged)
         MESSAGE_HANDLER(WM_LBUTTONDBLCLK, OnLButtonDblClick)
+        MESSAGE_HANDLER(WM_LBUTTONUP, OnLButtonUp)
     END_MSG_MAP()
 
     HRESULT Initialize(IN HWND hWndParent);
@@ -158,6 +162,7 @@ public:
 CTrayClockWnd::CTrayClockWnd() :
         hFont(NULL),
         textColor(0),
+        m_hwndClockFlyout(NULL),
         dwFlags(0),
         LineSpacing(0),
         VisibleLines(0)
@@ -507,6 +512,10 @@ LRESULT CTrayClockWnd::OnDestroy(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& 
         KillTimer(ID_TRAYCLOCK_TIMER_INIT);
     }
 
+    CTrayClockFlyout_Hide(m_hwndClockFlyout);
+    m_clockFlyout.Release();
+    m_hwndClockFlyout = NULL;
+
     return TRUE;
 }
 
@@ -666,6 +675,10 @@ LRESULT CTrayClockWnd::OnCreate(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& b
 
     m_tooltip.AddTool(&ti);
 
+    HRESULT hr = CTrayClockFlyout_CreateInstance(m_hWnd, IID_PPV_ARG(IUnknown, &m_clockFlyout));
+    if (SUCCEEDED(hr))
+        IUnknown_GetWindow(m_clockFlyout, &m_hwndClockFlyout);
+
     if (!GetHideClock())
     {
         ResetTime();
@@ -755,6 +768,16 @@ LRESULT CTrayClockWnd::OnLButtonDblClick(UINT uMsg, WPARAM wParam, LPARAM lParam
     if (IsWindowVisible())
     {
         ShellExecuteW(m_hWnd, NULL, L"timedate.cpl", NULL, NULL, SW_NORMAL);
+    }
+    return TRUE;
+}
+
+LRESULT CTrayClockWnd::OnLButtonUp(UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled)
+{
+    if (IsWindowVisible() && m_hwndClockFlyout)
+    {
+        CTrayClockFlyout_Show(m_hwndClockFlyout);
+        bHandled = TRUE;
     }
     return TRUE;
 }

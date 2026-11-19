@@ -889,6 +889,12 @@ IoBuildAsynchronousFsdRequest(IN ULONG MajorFunction,
             StackPtr->Parameters.Write.ByteOffset = *StartingOffset;
         }
     }
+    else if (MajorFunction == IRP_MJ_POWER)
+    {
+        /* Fail power requests unless a driver explicitly accepts them. */
+        Irp->IoStatus.Status = STATUS_NOT_SUPPORTED;
+        Irp->IoStatus.Information = 0;
+    }
 
     /* Set the Current Thread and IOSB */
     Irp->UserIosb = IoStatusBlock;

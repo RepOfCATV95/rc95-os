@@ -1735,7 +1735,13 @@ co_IntSendMessageTimeout( HWND hWnd,
     if (hWnd != HWND_TOPMOST)
     {
        /* Send message to the desktop window too! */
-       co_IntSendMessageTimeoutSingle(UserHMGetHandle(DesktopWindow), Msg, wParam, lParam, uFlags, uTimeout, uResult);
+       co_IntSendMessageTimeoutSingle(UserHMGetHandle(DesktopWindow),
+                                      Msg,
+                                      wParam,
+                                      lParam,
+                                      uFlags,
+                                      uTimeout,
+                                      uResult);
     }
 
     Children = IntWinListChildren(DesktopWindow);
@@ -1753,7 +1759,13 @@ co_IntSendMessageTimeout( HWND hWnd,
              pwnd->pcls->atomClassName == gpsi->atomSysClass[ICLS_SWITCH] )
            continue;
 
-        co_IntSendMessageTimeoutSingle(*Child, Msg, wParam, lParam, uFlags, uTimeout, uResult);
+        co_IntSendMessageTimeoutSingle(*Child,
+                                       Msg,
+                                       wParam,
+                                       lParam,
+                                       uFlags,
+                                       uTimeout,
+                                       uResult);
     }
 
     ExFreePoolWithTag(Children, USERTAG_WINDOWLIST);

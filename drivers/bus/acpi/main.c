@@ -324,8 +324,43 @@ ACPIDispatchDeviceControl(
               break;
        }
     }
+    else if (irpStack->Parameters.DeviceIoControl.IoControlCode ==
+             IOCTL_ACPI_QUERY_SYSTEM_POWER_CAPABILITIES)
+    {
+       ULONG SupportedStates = 0;
+       UINT8 SleepTypeA, SleepTypeB;
+
+       if (irpStack->Parameters.DeviceIoControl.OutputBufferLength <
+           sizeof(SupportedStates))
+       {
+           status = STATUS_BUFFER_TOO_SMALL;
+       }
+       else
+       {
+           if (ACPI_SUCCESS(AcpiGetSleepTypeData(ACPI_STATE_S1,
+                                                  &SleepTypeA,
+                                                  &SleepTypeB)))
+           {
+               SupportedStates |= ACPI_SYSTEM_POWER_S1_SUPPORTED;
+           }
+           /* S2 and S3 need processor-state restoration that is not implemented. */
+           if (ACPI_SUCCESS(AcpiGetSleepTypeData(ACPI_STATE_S5,
+                                                  &SleepTypeA,
+                                                  &SleepTypeB)))
+           {
+               SupportedStates |= ACPI_SYSTEM_POWER_S5_SUPPORTED;
+           }
+
+           RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer,
+                         &SupportedStates,
+                         sizeof(SupportedStates));
+           Irp->IoStatus.Information = sizeof(SupportedStates);
+           status = STATUS_SUCCESS;
+       }
+    }
     else
-       DPRINT1("IOCTL sent to the ACPI FDO! Kill the caller!\n");
+       DPRINT1("Unsupported IOCTL sent to the ACPI FDO: %lx\n",
+               irpStack->Parameters.DeviceIoControl.IoControlCode);
 
     if (status != STATUS_PENDING)
     {

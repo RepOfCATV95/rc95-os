@@ -3,6 +3,44 @@
 #define NDEBUG
 #include <debug.h>
 
+static
+NTSTATUS
+BusValidateSystemPowerState(
+    SYSTEM_POWER_STATE SystemState)
+{
+    UINT8 AcpiState;
+    UINT8 SleepTypeA, SleepTypeB;
+
+    switch (SystemState)
+    {
+        case PowerSystemWorking:
+            return STATUS_SUCCESS;
+
+        case PowerSystemSleeping1:
+            AcpiState = ACPI_STATE_S1;
+            break;
+
+        case PowerSystemSleeping2:
+        case PowerSystemSleeping3:
+            return STATUS_NOT_SUPPORTED;
+
+        case PowerSystemShutdown:
+            AcpiState = ACPI_STATE_S5;
+            break;
+
+        case PowerSystemHibernate:
+            return STATUS_NOT_IMPLEMENTED;
+
+        default:
+            return STATUS_INVALID_PARAMETER;
+    }
+
+    return ACPI_SUCCESS(AcpiGetSleepTypeData(AcpiState,
+                                              &SleepTypeA,
+                                              &SleepTypeB)) ?
+           STATUS_SUCCESS : STATUS_NOT_SUPPORTED;
+}
+
 NTSTATUS
 NTAPI
 Bus_Power (
@@ -71,43 +109,68 @@ Bus_FDO_Power (
                DbgSystemPowerString(powerState.SystemState) :\
                DbgDevicePowerString(powerState.DeviceState)));
 
-  if (powerType == SystemPowerState)
-  {
-    switch (powerState.SystemState) {
-    case PowerSystemSleeping1:
-      AcpiState = ACPI_STATE_S1;
-      break;
-    case PowerSystemSleeping2:
-      AcpiState = ACPI_STATE_S2;
-      break;
-    case PowerSystemSleeping3:
-      AcpiState = ACPI_STATE_S3;
-      break;
-    case PowerSystemHibernate:
-      AcpiState = ACPI_STATE_S4;
-      break;
-    case PowerSystemShutdown:
-      AcpiState = ACPI_STATE_S5;
-      break;
-    default:
-      AcpiState = ACPI_STATE_UNKNOWN;
-      ASSERT(FALSE);
-      break;
+        if (powerType == SystemPowerState)
+        {
+            status = BusValidateSystemPowerState(powerState.SystemState);
+            if (!NT_SUCCESS(status))
+                goto CompletePowerIrp;
+
+            switch (powerState.SystemState)
+            {
+                case PowerSystemWorking:
+                    Data->Common.SystemPowerState = PowerSystemWorking;
+                    break;
+
+                case PowerSystemSleeping1:
+                    AcpiState = ACPI_STATE_S1;
+                    goto EnterSystemSleepState;
+
+                case PowerSystemSleeping2:
+                case PowerSystemSleeping3:
+                    status = STATUS_NOT_SUPPORTED;
+                    goto CompletePowerIrp;
+
+                case PowerSystemHibernate:
+                    status = STATUS_NOT_IMPLEMENTED;
+                    goto CompletePowerIrp;
+
+                case PowerSystemShutdown:
+                    AcpiState = ACPI_STATE_S5;
+                    goto EnterSystemSleepState;
+
+                default:
+                    status = STATUS_INVALID_PARAMETER;
+                    goto CompletePowerIrp;
+            }
+
+EnterSystemSleepState:
+            oldPowerState = Data->Common.SystemPowerState;
+            Data->Common.SystemPowerState = powerState.SystemState;
+            AcpiStatus = acpi_suspend(AcpiState);
+            if (!ACPI_SUCCESS(AcpiStatus))
+            {
+                DPRINT1("Failed to enter sleep state %d (Status 0x%X)\n",
+                        AcpiState,
+                        AcpiStatus);
+                Data->Common.SystemPowerState = oldPowerState;
+                status = (AcpiStatus == AE_NOT_FOUND || AcpiStatus == AE_SUPPORT ||
+                          AcpiStatus == AE_NOT_IMPLEMENTED) ?
+                         STATUS_NOT_SUPPORTED : STATUS_UNSUCCESSFUL;
+                goto CompletePowerIrp;
+            }
+        }
     }
-      oldPowerState = Data->Common.SystemPowerState;
-      Data->Common.SystemPowerState = powerState.SystemState;
-      AcpiStatus = acpi_suspend(AcpiState);
-      if (!ACPI_SUCCESS(AcpiStatus)) {
-        DPRINT1("Failed to enter sleep state %d (Status 0x%X)\n",
-          AcpiState, AcpiStatus);
-        Data->Common.SystemPowerState = oldPowerState;
-        status = STATUS_UNSUCCESSFUL;
-      }
-  }
-    }
+
     PoStartNextPowerIrp (Irp);
     IoSkipCurrentIrpStackLocation(Irp);
-    status =  PoCallDriver (Data->NextLowerDriver, Irp);
+    status = PoCallDriver (Data->NextLowerDriver, Irp);
+    return status;
+
+CompletePowerIrp:
+    PoStartNextPowerIrp(Irp);
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
 }
 
@@ -139,6 +202,13 @@ Bus_PDO_Power (
 
         switch (powerType) {
             case DevicePowerState:
+                if (powerState.DeviceState < PowerDeviceD0 ||
+                    powerState.DeviceState > PowerDeviceD3)
+                {
+                    status = STATUS_INVALID_PARAMETER;
+                    break;
+                }
+
                 if (!PdoData->AcpiHandle || !acpi_bus_power_manageable(PdoData->AcpiHandle))
                 {
                     PoSetPowerState(PdoData->Common.Self, DevicePowerState, powerState);
@@ -166,7 +236,7 @@ Bus_PDO_Power (
                       break;
 
                     default:
-                      error = 0;
+                      error = AE_BAD_PARAMETER;
                       break;
                 }
 
@@ -181,18 +251,33 @@ Bus_PDO_Power (
                 break;
 
             case SystemPowerState:
+                status = BusValidateSystemPowerState(powerState.SystemState);
+                if (!NT_SUCCESS(status))
+                    break;
                 PdoData->Common.SystemPowerState = powerState.SystemState;
-                status = STATUS_SUCCESS;
                 break;
 
             default:
-                status = STATUS_NOT_SUPPORTED;
+                status = STATUS_INVALID_PARAMETER;
                 break;
         }
         break;
 
     case IRP_MN_QUERY_POWER:
-        status = STATUS_SUCCESS;
+        if (powerType == SystemPowerState)
+        {
+            status = BusValidateSystemPowerState(powerState.SystemState);
+        }
+        else if (powerType == DevicePowerState &&
+                 powerState.DeviceState >= PowerDeviceD0 &&
+                 powerState.DeviceState <= PowerDeviceD3)
+        {
+            status = STATUS_SUCCESS;
+        }
+        else
+        {
+            status = STATUS_INVALID_PARAMETER;
+        }
         break;
 
     case IRP_MN_WAIT_WAKE:

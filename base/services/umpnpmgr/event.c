@@ -29,6 +29,7 @@
 /* INCLUDES *****************************************************************/
 
 #include "precomp.h"
+#include <winuser.h>
 
 #define NDEBUG
 #include <debug.h>
@@ -232,6 +233,142 @@ ProcessDeviceInstallEvent(
     }
 }
 
+static
+BOOL
+ProcessPowerEventService(
+    _In_ PPLUGPLAY_EVENT_BLOCK PnpEvent,
+    _In_ LPENUM_SERVICE_STATUS_PROCESSW Service)
+{
+    SERVICE_STATUS_HANDLE ServiceStatus;
+    DWORD Error;
+
+    if (!(Service->ServiceStatusProcess.dwControlsAccepted & SERVICE_ACCEPT_POWEREVENT))
+        return TRUE;
+
+    Error = I_ScValidatePnpService(NULL,
+                                   Service->lpServiceName,
+                                   &ServiceStatus);
+    if (Error != ERROR_SUCCESS)
+        return TRUE;
+
+    if (!I_ScSendPnPMessage(ServiceStatus,
+                            SERVICE_CONTROL_POWEREVENT,
+                            PnpEvent->PowerNotification.NotificationCode,
+                            NULL))
+    {
+        Error = GetLastError();
+        DPRINT1("Failed to send power event 0x%lx to service %S (Error %lu)\n",
+                PnpEvent->PowerNotification.NotificationCode,
+                Service->lpServiceName,
+                Error);
+        return Error != BROADCAST_QUERY_DENY;
+    }
+
+    return TRUE;
+}
+
+static
+BOOL
+ProcessPowerEvent(
+    _In_ PPLUGPLAY_EVENT_BLOCK PnpEvent)
+{
+    SC_HANDLE Manager;
+    LPENUM_SERVICE_STATUS_PROCESSW Services = NULL;
+    DWORD BufferSize = 0;
+    DWORD Needed;
+    DWORD Count;
+    DWORD ResumeHandle = 0;
+    DWORD EnumError;
+    DWORD Index;
+    BOOL CanSuspend = TRUE;
+    BOOL IsQuery =
+        PnpEvent->PowerNotification.NotificationCode == PBT_APMQUERYSUSPEND;
+
+    DPRINT("ProcessPowerEvent(0x%lx)\n",
+           PnpEvent->PowerNotification.NotificationCode);
+
+    Manager = OpenSCManagerW(NULL,
+                             SERVICES_ACTIVE_DATABASEW,
+                             SC_MANAGER_ENUMERATE_SERVICE | SC_MANAGER_CONNECT);
+    if (Manager == NULL)
+    {
+        DPRINT1("OpenSCManagerW() failed (Error %lu)\n", GetLastError());
+        return !IsQuery;
+    }
+
+    do
+    {
+        Needed = 0;
+        Count = 0;
+        EnumError = ERROR_SUCCESS;
+
+        if (!EnumServicesStatusExW(Manager,
+                                   SC_ENUM_PROCESS_INFO,
+                                   SERVICE_WIN32,
+                                   SERVICE_ACTIVE,
+                                   (LPBYTE)Services,
+                                   BufferSize,
+                                   &Needed,
+                                   &Count,
+                                   &ResumeHandle,
+                                   NULL))
+        {
+            EnumError = GetLastError();
+            if (EnumError != ERROR_MORE_DATA)
+            {
+                DPRINT1("EnumServicesStatusExW() failed (Error %lu)\n", EnumError);
+                break;
+            }
+        }
+
+        for (Index = 0; Index < Count; Index++)
+        {
+            if (!ProcessPowerEventService(PnpEvent, &Services[Index]))
+                CanSuspend = FALSE;
+        }
+
+        if (Needed > BufferSize)
+        {
+            LPENUM_SERVICE_STATUS_PROCESSW NewServices;
+
+            if (Services == NULL)
+                NewServices = HeapAlloc(GetProcessHeap(), 0, Needed);
+            else
+                NewServices = HeapReAlloc(GetProcessHeap(), 0, Services, Needed);
+            if (NewServices == NULL)
+            {
+                if (Services == NULL)
+                    DPRINT1("Failed to allocate service enumeration buffer\n");
+                else
+                    DPRINT1("Failed to resize service enumeration buffer\n");
+                if (IsQuery)
+                    CanSuspend = FALSE;
+                break;
+            }
+
+            Services = NewServices;
+            BufferSize = Needed;
+            continue;
+        }
+
+        if (EnumError == ERROR_MORE_DATA && Count == 0 && Needed <= BufferSize)
+        {
+            DPRINT1("EnumServicesStatusExW() made no progress while enumerating services\n");
+            if (IsQuery)
+                CanSuspend = FALSE;
+            break;
+        }
+
+    } while (EnumError == ERROR_MORE_DATA);
+
+    if (EnumError != ERROR_SUCCESS && IsQuery)
+        CanSuspend = FALSE;
+
+    if (Services != NULL)
+        HeapFree(GetProcessHeap(), 0, Services);
+    CloseServiceHandle(Manager);
+    return CanSuspend;
+}
 
 DWORD
 WINAPI
@@ -280,6 +417,7 @@ PnpEventThread(
 
         /* Process the PnP event */
         DPRINT("Received PnP Event\n");
+        ResponseData.Status = STATUS_SUCCESS;
         switch (PnpEvent->EventCategory)
         {
 //            case HardwareProfileChangeEvent:
@@ -296,6 +434,15 @@ PnpEventThread(
 
             case DeviceInstallEvent:
                 ProcessDeviceInstallEvent(PnpEvent);
+                break;
+
+            case PowerEvent:
+                if (!ProcessPowerEvent(PnpEvent) &&
+                    PnpEvent->PowerNotification.NotificationCode ==
+                        PBT_APMQUERYSUSPEND)
+                {
+                    ResponseData.Status = STATUS_CANCELLED;
+                }
                 break;
 
 //            case DeviceArrivalEvent:

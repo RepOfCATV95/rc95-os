@@ -150,6 +150,177 @@ IntGetNextPowerCallout(
     return pPowerCalloutEntry;
 }
 
+static
+NTSTATUS
+IntQueryApplicationsForSuspend(VOID)
+{
+    PWND DesktopWindow;
+    PWND WindowObject;
+    HWND DesktopHandle;
+    HWND *Windows, *Window, *WriteWindow;
+    ULONG_PTR MessageResult;
+    LRESULT SendResult;
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    DesktopWindow = UserGetDesktopWindow();
+    if (DesktopWindow == NULL)
+        return STATUS_UNSUCCESSFUL;
+
+    DesktopHandle = UserHMGetHandle(DesktopWindow);
+    Windows = IntWinListChildren(DesktopWindow);
+    if (Windows == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    WriteWindow = Windows;
+    for (Window = Windows; *Window != NULL; Window++)
+    {
+        WindowObject = UserGetWindowObject(*Window);
+        if (WindowObject == NULL ||
+            WindowObject->pcls == NULL ||
+            WindowObject->fnid == FNID_MENU ||
+            WindowObject->pcls->atomClassName ==
+                gpsi->atomSysClass[ICLS_SWITCH])
+        {
+            continue;
+        }
+
+        *WriteWindow++ = *Window;
+    }
+    *WriteWindow = NULL;
+
+    UserLeave();
+
+    MessageResult = 0;
+    SendResult = co_IntSendMessageTimeout(DesktopHandle,
+                                          WM_POWERBROADCAST,
+                                          PBT_APMQUERYSUSPEND,
+                                          0,
+                                          SMTO_ABORTIFHUNG,
+                                          2000,
+                                          &MessageResult);
+    if (MessageResult == BROADCAST_QUERY_DENY ||
+        (!SendResult && EngGetLastError() == ERROR_TIMEOUT))
+    {
+        Status = STATUS_CANCELLED;
+    }
+
+    for (Window = Windows; *Window != NULL; Window++)
+    {
+        MessageResult = 0;
+        SendResult = co_IntSendMessageTimeout(*Window,
+                                              WM_POWERBROADCAST,
+                                              PBT_APMQUERYSUSPEND,
+                                              0,
+                                              SMTO_ABORTIFHUNG,
+                                              2000,
+                                              &MessageResult);
+        if (MessageResult == BROADCAST_QUERY_DENY ||
+            (!SendResult && EngGetLastError() == ERROR_TIMEOUT))
+        {
+            Status = STATUS_CANCELLED;
+        }
+    }
+
+    UserEnterExclusive();
+    ExFreePoolWithTag(Windows, USERTAG_WINDOWLIST);
+    return Status;
+}
+
+static
+NTSTATUS
+IntHandlePowerStateWorker(
+    _In_ PWIN32_POWERSTATE_PARAMETERS pParameters)
+{
+    ULONG NotificationResult;
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    switch (pParameters->PowerStateTask)
+    {
+        case PowerState_QueryApps:
+            Status = IntQueryApplicationsForSuspend();
+            break;
+
+        case PowerState_QueryAppsFailed:
+            UserSendNotifyMessage(HWND_BROADCAST,
+                                  WM_POWERBROADCAST,
+                                  PBT_APMQUERYSUSPENDFAILED,
+                                  0);
+            break;
+
+        case PowerState_SuspendApps:
+            UserSendNotifyMessage(HWND_BROADCAST,
+                                  WM_POWERBROADCAST,
+                                  PBT_APMSUSPEND,
+                                  0);
+            break;
+
+        case PowerState_ResumeApps:
+            UserSendNotifyMessage(HWND_BROADCAST,
+                                  WM_POWERBROADCAST,
+                                  PBT_APMRESUMEAUTOMATIC,
+                                  0);
+            UserSendNotifyMessage(HWND_BROADCAST,
+                                  WM_POWERBROADCAST,
+                                  PBT_APMRESUMESUSPEND,
+                                  0);
+            break;
+
+        case PowerState_QueryServices:
+            UserLeave();
+            NotificationResult = IoPnPDeliverServicePowerNotification(
+                                     pParameters->SystemAction,
+                                     PBT_APMQUERYSUSPEND,
+                                     0,
+                                     TRUE);
+            UserEnterExclusive();
+            if (!NotificationResult)
+            {
+                TRACE("Services did not acknowledge the suspend query\n");
+                Status = STATUS_CANCELLED;
+            }
+            break;
+
+        case PowerState_QueryServicesFailed:
+            UserLeave();
+            IoPnPDeliverServicePowerNotification(pParameters->SystemAction,
+                                                 PBT_APMQUERYSUSPENDFAILED,
+                                                 0,
+                                                 FALSE);
+            UserEnterExclusive();
+            break;
+
+        case PowerState_SuspendServices:
+            UserLeave();
+            NotificationResult = IoPnPDeliverServicePowerNotification(
+                                     pParameters->SystemAction,
+                                     PBT_APMSUSPEND,
+                                     0,
+                                     TRUE);
+            UserEnterExclusive();
+            if (!NotificationResult)
+                TRACE("Services did not acknowledge the suspend notification\n");
+            break;
+
+        case PowerState_ResumeServices:
+            UserLeave();
+            IoPnPDeliverServicePowerNotification(pParameters->SystemAction,
+                                                 PBT_APMRESUMEAUTOMATIC,
+                                                 0,
+                                                 FALSE);
+            IoPnPDeliverServicePowerNotification(pParameters->SystemAction,
+                                                 PBT_APMRESUMESUSPEND,
+                                                 0,
+                                                 FALSE);
+            UserEnterExclusive();
+            break;
+
+        default:
+            break;
+    }
+
+    return Status;
+}
+
 /**
  * @brief
  * Deploys all pending power callouts to appropriate power
@@ -178,7 +349,7 @@ IntDeployPowerCallout(VOID)
     IntAcquirePowerCalloutLock();
     for (pWin32PwrCallout = IntGetNextPowerCallout(NULL);
          pWin32PwrCallout != NULL;
-         pWin32PwrCallout = IntGetNextPowerCallout(pWin32PwrCallout))
+         pWin32PwrCallout = IntGetNextPowerCallout(NULL))
     {
         if (pWin32PwrCallout->Type == POWER_CALLOUT_EVENT)
         {
@@ -186,11 +357,17 @@ IntDeployPowerCallout(VOID)
         }
         else // POWER_CALLOUT_STATE
         {
-            ERR("Power state callout management is currently not implemented!\n");
+            pWin32PwrCallout->Status =
+                IntHandlePowerStateWorker(&pWin32PwrCallout->StateParams);
+            KeSetEvent(&pWin32PwrCallout->CompletionEvent,
+                       IO_NO_INCREMENT,
+                       FALSE);
         }
 
-        /* We are done with this power callout */
-        ExFreePoolWithTag(pWin32PwrCallout, USERTAG_POWER);
+        if (pWin32PwrCallout->Type == POWER_CALLOUT_EVENT)
+        {
+            ExFreePoolWithTag(pWin32PwrCallout, USERTAG_POWER);
+        }
     }
 
     /* Release what we locked */
@@ -326,12 +503,24 @@ IntWin32PowerManagementCleanup(VOID)
      * apart during Win32k cleanup, so future power callouts would not
      * be allowed anyway, therefore we are safe.
      */
+    IntAcquirePowerCalloutLock();
     for (pWin32PwrCallout = IntGetNextPowerCallout(NULL);
          pWin32PwrCallout != NULL;
-         pWin32PwrCallout = IntGetNextPowerCallout(pWin32PwrCallout))
+         pWin32PwrCallout = IntGetNextPowerCallout(NULL))
     {
-        ExFreePoolWithTag(pWin32PwrCallout, USERTAG_POWER);
+        if (pWin32PwrCallout->Type == POWER_CALLOUT_STATE)
+        {
+            pWin32PwrCallout->Status = STATUS_UNSUCCESSFUL;
+            KeSetEvent(&pWin32PwrCallout->CompletionEvent,
+                       IO_NO_INCREMENT,
+                       FALSE);
+        }
+        else
+        {
+            ExFreePoolWithTag(pWin32PwrCallout, USERTAG_POWER);
+        }
     }
+    IntReleasePowerCalloutLock();
 
     /* Tear apart the power callout lock mutex */
     ExFreePoolWithTag(gpPowerCalloutMutexLock, USERTAG_POWER);
@@ -419,9 +608,41 @@ NTAPI
 IntHandlePowerState(
     _In_ PWIN32_POWERSTATE_PARAMETERS pWin32PwrStateParams)
 {
-    /* FIXME */
-    ERR("IntHandlePowerState is UNIMPLEMENTED\n");
-    return STATUS_NOT_IMPLEMENTED;
+    PWIN32POWERCALLOUT pWin32PwrCallout;
+    NTSTATUS Status;
+
+    if (!gpepCSRSS)
+    {
+        TRACE("CSRSS is not running, bailing out\n");
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    pWin32PwrCallout = ExAllocatePoolZero(NonPagedPool,
+                                          sizeof(WIN32POWERCALLOUT),
+                                          USERTAG_POWER);
+    if (pWin32PwrCallout == NULL)
+    {
+        ERR("Allocating memory for Win32 power state callout failed\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    pWin32PwrCallout->Type = POWER_CALLOUT_STATE;
+    pWin32PwrCallout->StateParams = *pWin32PwrStateParams;
+    pWin32PwrCallout->Status = STATUS_PENDING;
+    KeInitializeEvent(&pWin32PwrCallout->CompletionEvent,
+                      NotificationEvent,
+                      FALSE);
+
+    IntEnlistPowerCallout(pWin32PwrCallout);
+    KeWaitForSingleObject(&pWin32PwrCallout->CompletionEvent,
+                          Executive,
+                          KernelMode,
+                          FALSE,
+                          NULL);
+
+    Status = pWin32PwrCallout->Status;
+    ExFreePoolWithTag(pWin32PwrCallout, USERTAG_POWER);
+    return Status;
 }
 
 /* EOF */

@@ -124,3 +124,120 @@ MmGetPhysicalMemoryRanges(VOID)
     MiReleasePfnLock(OldIrql);
     return Buffer;
 }
+
+/*
+ * Stream caller-selected physical memory ranges to a synchronous consumer.
+ * No allocation or physical mapping is performed by this routine.
+ */
+NTSTATUS
+NTAPI
+MiSerializePhysicalMemory(
+    _In_reads_(RangeCount) PPHYSICAL_MEMORY_RANGE Ranges,
+    _In_ ULONG RangeCount,
+    _In_ ULONG ChunkSize,
+    _In_ PMI_MEMORY_SERIALIZATION_MAP_ROUTINE MapRoutine,
+    _In_ PMI_MEMORY_SERIALIZATION_UNMAP_ROUTINE UnmapRoutine,
+    _In_ PMI_MEMORY_SERIALIZATION_CALLBACK Callback,
+    _In_opt_ PVOID Context,
+    _Out_ PULONGLONG PagesSerialized,
+    _Out_ PULONGLONG BytesSerialized
+)
+{
+    ULONGLONG PageCount = 0;
+    ULONGLONG ByteCount = 0;
+    ULONGLONG TotalPages = 0;
+    ULONGLONG TotalBytes = 0;
+    ULONG RangeIndex;
+
+    if (Ranges == NULL || MapRoutine == NULL || UnmapRoutine == NULL ||
+        Callback == NULL || PagesSerialized == NULL || BytesSerialized == NULL ||
+        ChunkSize == 0 || (ChunkSize & (PAGE_SIZE - 1)) != 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *PagesSerialized = 0;
+    *BytesSerialized = 0;
+
+    for (RangeIndex = 0; RangeIndex < RangeCount; RangeIndex++)
+    {
+        ULONGLONG PhysicalAddress;
+        ULONGLONG RangeBytes;
+
+        if (Ranges[RangeIndex].BaseAddress.QuadPart < 0 ||
+            Ranges[RangeIndex].NumberOfBytes.QuadPart <= 0)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        PhysicalAddress = (ULONGLONG)Ranges[RangeIndex].BaseAddress.QuadPart;
+        RangeBytes = (ULONGLONG)Ranges[RangeIndex].NumberOfBytes.QuadPart;
+
+        if ((PhysicalAddress & (PAGE_SIZE - 1)) != 0 ||
+            (RangeBytes & (PAGE_SIZE - 1)) != 0 ||
+            RangeBytes > (ULONGLONG)~0ULL - PhysicalAddress)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        if (TotalPages > (ULONGLONG)~0ULL - (RangeBytes >> PAGE_SHIFT) ||
+            TotalBytes > (ULONGLONG)~0ULL - RangeBytes)
+        {
+            return STATUS_INTEGER_OVERFLOW;
+        }
+
+        TotalPages += RangeBytes >> PAGE_SHIFT;
+        TotalBytes += RangeBytes;
+    }
+
+    for (RangeIndex = 0; RangeIndex < RangeCount; RangeIndex++)
+    {
+        ULONGLONG PhysicalAddress;
+        ULONGLONG RemainingBytes;
+
+        PhysicalAddress = (ULONGLONG)Ranges[RangeIndex].BaseAddress.QuadPart;
+        RemainingBytes = (ULONGLONG)Ranges[RangeIndex].NumberOfBytes.QuadPart;
+
+        while (RemainingBytes != 0)
+        {
+            PHYSICAL_ADDRESS ChunkAddress;
+            ULONG CurrentChunkSize;
+            PVOID Mapping = NULL;
+            NTSTATUS Status;
+
+            CurrentChunkSize = RemainingBytes > ChunkSize ?
+                               ChunkSize :
+                               (ULONG)RemainingBytes;
+            ChunkAddress.QuadPart = PhysicalAddress;
+            Status = MapRoutine(Context,
+                                ChunkAddress,
+                                CurrentChunkSize,
+                                &Mapping);
+            if (!NT_SUCCESS(Status))
+            {
+                if (Mapping != NULL)
+                    UnmapRoutine(Context, Mapping, CurrentChunkSize);
+                return Status;
+            }
+            if (Mapping == NULL)
+                return STATUS_UNSUCCESSFUL;
+
+            Status = Callback(Context,
+                              ChunkAddress,
+                              Mapping,
+                              CurrentChunkSize);
+            UnmapRoutine(Context, Mapping, CurrentChunkSize);
+            if (!NT_SUCCESS(Status))
+                return Status;
+
+            PageCount += CurrentChunkSize >> PAGE_SHIFT;
+            ByteCount += CurrentChunkSize;
+            *PagesSerialized = PageCount;
+            *BytesSerialized = ByteCount;
+            PhysicalAddress += CurrentChunkSize;
+            RemainingBytes -= CurrentChunkSize;
+        }
+    }
+
+    return STATUS_SUCCESS;
+}

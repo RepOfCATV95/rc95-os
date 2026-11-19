@@ -12,6 +12,7 @@
 /* INCLUDES ******************************************************************/
 
 #include <advapi32.h>
+#include <winuser.h>
 #include <pseh/pseh2.h>
 
 WINE_DEFAULT_DEBUG_CHANNEL(advapi);
@@ -553,6 +554,9 @@ ScControlService(PACTIVE_SERVICE lpService,
     DWORD dwError = ERROR_SUCCESS;
     DWORD dwControl;
     DWORD dwEventType = 0;
+    DWORD dwEventDataSize = 0;
+    DWORD dwEventDataOffset = sizeof(SCM_CONTROL_PACKET) + sizeof(DWORD);
+    DWORD dwHandlerResult;
     PVOID pEventData = NULL;
 
     TRACE("ScControlService(%p %p)\n",
@@ -562,6 +566,14 @@ ScControlService(PACTIVE_SERVICE lpService,
         return ERROR_INVALID_PARAMETER;
 
     TRACE("Size: %lu\n", ControlPacket->dwSize);
+
+    if (ControlPacket->dwSize < sizeof(SCM_CONTROL_PACKET) ||
+        ControlPacket->dwServiceNameOffset < sizeof(SCM_CONTROL_PACKET) ||
+        ControlPacket->dwServiceNameOffset >= ControlPacket->dwSize)
+    {
+        return ERROR_INVALID_DATA;
+    }
+
     TRACE("Service: %S\n", (PWSTR)((ULONG_PTR)ControlPacket + ControlPacket->dwServiceNameOffset));
 
     /* Set service tag */
@@ -591,24 +603,60 @@ ScControlService(PACTIVE_SERVICE lpService,
     }
     else if (lpService->HandlerFunctionEx)
     {
-        if (dwControl == SERVICE_CONTROL_DEVICEEVENT)
+        if (dwControl == SERVICE_CONTROL_DEVICEEVENT ||
+            dwControl == SERVICE_CONTROL_HARDWAREPROFILECHANGE ||
+            dwControl == SERVICE_CONTROL_POWEREVENT ||
+            dwControl == SERVICE_CONTROL_SESSIONCHANGE)
         {
+            if (ControlPacket->dwSize < dwEventDataOffset)
+            {
+                NtCurrentTeb()->SubProcessTag = 0;
+                return ERROR_INVALID_DATA;
+            }
+
             dwEventType = *(LPDWORD)((ULONG_PTR)ControlPacket + sizeof(SCM_CONTROL_PACKET));
-            pEventData = (PVOID)((ULONG_PTR)ControlPacket + sizeof(SCM_CONTROL_PACKET) + sizeof(DWORD));
+            dwEventDataSize = ControlPacket->dwArgumentsCount;
+            if (dwEventDataSize > ControlPacket->dwSize - dwEventDataOffset)
+            {
+                NtCurrentTeb()->SubProcessTag = 0;
+                return ERROR_INVALID_DATA;
+            }
+
+            if (dwEventDataSize != 0)
+                pEventData = (PVOID)((ULONG_PTR)ControlPacket + dwEventDataOffset);
+
+            if (dwControl == SERVICE_CONTROL_DEVICEEVENT &&
+                (pEventData == NULL ||
+                 dwEventDataSize < sizeof(DEV_BROADCAST_HDR) ||
+                 ((PDEV_BROADCAST_HDR)pEventData)->dbch_size < sizeof(DEV_BROADCAST_HDR) ||
+                 ((PDEV_BROADCAST_HDR)pEventData)->dbch_size > dwEventDataSize))
+            {
+                NtCurrentTeb()->SubProcessTag = 0;
+                return ERROR_INVALID_DATA;
+            }
         }
 
         _SEH2_TRY
         {
-            (lpService->HandlerFunctionEx)(dwControl,
-                                           dwEventType,
-                                           pEventData,
-                                           lpService->HandlerContext);
+            dwHandlerResult = (lpService->HandlerFunctionEx)(
+                                  dwControl,
+                                  dwEventType,
+                                  pEventData,
+                                  lpService->HandlerContext);
         }
         _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER)
         {
             dwError = ERROR_EXCEPTION_IN_SERVICE;
         }
         _SEH2_END;
+
+        if (dwError == ERROR_SUCCESS &&
+            dwControl == SERVICE_CONTROL_POWEREVENT &&
+            dwEventType == PBT_APMQUERYSUSPEND &&
+            dwHandlerResult == BROADCAST_QUERY_DENY)
+        {
+            dwError = BROADCAST_QUERY_DENY;
+        }
     }
     else
     {
@@ -630,6 +678,8 @@ ScServiceDispatcher(HANDLE hPipe,
                     DWORD dwBufferSize)
 {
     DWORD Count;
+    DWORD NameLength;
+    DWORD NameChars;
     BOOL bResult;
     BOOL bRunning = TRUE;
     LPWSTR lpServiceName;
@@ -657,7 +707,31 @@ ScServiceDispatcher(HANDLE hPipe,
             return FALSE;
         }
 
+        if (Count < sizeof(SCM_CONTROL_PACKET) ||
+            ControlPacket->dwSize < sizeof(SCM_CONTROL_PACKET) ||
+            ControlPacket->dwSize > Count ||
+            ControlPacket->dwServiceNameOffset < sizeof(SCM_CONTROL_PACKET) ||
+            ControlPacket->dwServiceNameOffset >= ControlPacket->dwSize ||
+            ((ControlPacket->dwSize - ControlPacket->dwServiceNameOffset) % sizeof(WCHAR)) != 0)
+        {
+            ERR("Invalid service control packet\n");
+            return FALSE;
+        }
+
+        NameChars = (ControlPacket->dwSize - ControlPacket->dwServiceNameOffset) / sizeof(WCHAR);
         lpServiceName = (LPWSTR)((PBYTE)ControlPacket + ControlPacket->dwServiceNameOffset);
+        for (NameLength = 0; NameLength < NameChars; NameLength++)
+        {
+            if (lpServiceName[NameLength] == UNICODE_NULL)
+                break;
+        }
+
+        if (NameLength == NameChars)
+        {
+            ERR("Service control packet has an unterminated service name\n");
+            return FALSE;
+        }
+
         TRACE("Service: %S\n", lpServiceName);
 
         if ((ControlPacket->dwControl == SERVICE_CONTROL_STOP) &&

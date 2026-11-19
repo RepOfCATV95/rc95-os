@@ -273,7 +273,7 @@ typedef enum _PLUGPLAY_EVENT_CATEGORY
     CustomDeviceEvent,
     DeviceInstallEvent,
     DeviceArrivalEvent,
-#if (NTDDI_VERSION < NTDDI_WIN7) && !defined(__REACTOS__)
+#if (NTDDI_VERSION < NTDDI_WIN7) || defined(__REACTOS__)
     PowerEvent,
 #endif
     VetoEvent,
@@ -510,10 +510,8 @@ typedef struct _PLUGPLAY_CONTROL_QUERY_REMOVE_DATA
 // PlugPlayControlUserResponse (0x07)
 typedef struct _PLUGPLAY_CONTROL_USER_RESPONSE_DATA
 {
-    ULONG Unknown1;
-    ULONG Unknown2;
-    ULONG Unknown3;
-    ULONG Unknown4;
+    NTSTATUS Status;
+    ULONG Reserved[3];
 } PLUGPLAY_CONTROL_USER_RESPONSE_DATA, *PPLUGPLAY_CONTROL_USER_RESPONSE_DATA;
 
 // PlugPlayControlGetInterfaceDeviceList (0x09)

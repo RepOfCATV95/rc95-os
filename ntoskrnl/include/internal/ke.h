@@ -618,6 +618,12 @@ KeFreezeAllThreads(
     VOID
 );
 
+VOID
+__cdecl
+KeSaveStateForHibernate(
+    _Inout_ PKPROCESSOR_STATE State
+);
+
 BOOLEAN
 NTAPI
 KeDisableThreadApcQueueing(IN PKTHREAD Thread);

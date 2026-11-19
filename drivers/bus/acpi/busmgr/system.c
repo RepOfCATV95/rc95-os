@@ -313,27 +313,11 @@ ACPI_STATUS
 acpi_system_suspend(
 	UINT32		state)
 {
-	ACPI_STATUS		status = AE_ERROR;
-	//unsigned long		flags = 0;
+	if (state != ACPI_STATE_S1 &&
+	    state != ACPI_STATE_S5)
+		return AE_NOT_IMPLEMENTED;
 
-	//local_irq_save(flags);
-	/* kernel_fpu_begin(); */
-
-	switch (state) {
-	case ACPI_STATE_S1:
-	case ACPI_STATE_S5:
-		//barrier();
-		status = AcpiEnterSleepState(state);
-		break;
-	case ACPI_STATE_S4:
-		//do_suspend_lowlevel_s4bios(0);
-		break;
-	}
-
-	/* kernel_fpu_end(); */
-	//local_irq_restore(flags);
-
-	return status;
+	return AcpiEnterSleepState(state);
 }
 
 
@@ -348,51 +332,33 @@ acpi_suspend (
 	UINT32			state)
 {
 	ACPI_STATUS status;
+	ACPI_STATUS wakeStatus;
+	ACPI_STATUS leaveStatus;
 
-	/* only support S1 and S5 on kernel 2.4 */
-	//if (state != ACPI_STATE_S1 && state != ACPI_STATE_S4
-	//    && state != ACPI_STATE_S5)
-	//	return AE_ERROR;
+	if (state != ACPI_STATE_S1 &&
+	    state != ACPI_STATE_S5)
+		return AE_NOT_IMPLEMENTED;
 
-
-	//if (ACPI_STATE_S4 == state) {
-	//	/* For s4bios, we need a wakeup address. */
-	//	if (1 == AcpiGbl_FACS->S4bios_f &&
-	//	    0 != AcpiGbl_FADT->smi_cmd) {
-	//		if (!acpi_wakeup_address)
-	//			return AE_ERROR;
-	//		AcpiSetFirmwareWakingVector((acpi_physical_address) acpi_wakeup_address);
-	//	} else
-	//		/* We don't support S4 under 2.4.  Give up */
-	//		return AE_ERROR;
-	//}
-	AcpiEnterSleepStatePrep(state);
-
-	status = AcpiEnterSleepState(state);
-	if (!ACPI_SUCCESS(status) && state != ACPI_STATE_S5)
+	status = AcpiEnterSleepStatePrep((UINT8)state);
+	if (ACPI_FAILURE(status))
 		return status;
 
-	/* disable interrupts and flush caches */
+	/* AcpiEnterSleepState requires interrupts disabled. */
 	_disable();
-	ACPI_FLUSH_CPU_CACHE();
-
-	/* perform OS-specific sleep actions */
 	status = acpi_system_suspend(state);
-
-	/* Even if we failed to go to sleep, all of the devices are in an suspended
-	 * mode. So, we run these unconditionally to make sure we have a usable system
-	 * no matter what.
-	 */
-	AcpiLeaveSleepState(state);
-	acpi_system_restore_state(state);
-
-	/* make sure interrupts are enabled */
+	wakeStatus = AcpiLeaveSleepStatePrep((UINT8)state);
 	_enable();
 
-	/* reset firmware waking vector */
-	AcpiSetFirmwareWakingVector(0, 0);
+	leaveStatus = AcpiLeaveSleepState((UINT8)state);
+	if (state > ACPI_STATE_S1)
+		acpi_system_restore_state(state);
 
-	return status;
+	if (ACPI_FAILURE(status))
+		return status;
+	if (ACPI_FAILURE(wakeStatus))
+		return wakeStatus;
+
+	return leaveStatus;
 }
 
 int

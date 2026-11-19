@@ -31,7 +31,7 @@ KSPIN_LOCK PopDopeGlobalLock;
 
 PDEVICE_OBJECT_POWER_EXTENSION
 NTAPI
-PopGetDope(IN PDEVICE_OBJECT DeviceObject)
+PopGetDope(_In_ PDEVICE_OBJECT DeviceObject)
 {
     PEXTENDED_DEVOBJ_EXTENSION DeviceExtension;
     PDEVICE_OBJECT_POWER_EXTENSION Dope;
@@ -78,7 +78,7 @@ Return:
 
 VOID
 NTAPI
-PoVolumeDevice(IN PDEVICE_OBJECT DeviceObject)
+PoVolumeDevice(_In_ PDEVICE_OBJECT DeviceObject)
 {
     PDEVICE_OBJECT_POWER_EXTENSION Dope;
     PAGED_CODE();
@@ -100,7 +100,7 @@ PoVolumeDevice(IN PDEVICE_OBJECT DeviceObject)
 
 VOID
 NTAPI
-PoRemoveVolumeDevice(IN PDEVICE_OBJECT DeviceObject)
+PoRemoveVolumeDevice(_In_ PDEVICE_OBJECT DeviceObject)
 {
     PDEVICE_OBJECT_POWER_EXTENSION Dope;
     PEXTENDED_DEVOBJ_EXTENSION DeviceExtension;
@@ -145,7 +145,7 @@ PoRemoveVolumeDevice(IN PDEVICE_OBJECT DeviceObject)
 
 VOID
 NTAPI
-PopFlushVolumeWorker(IN PVOID Context)
+PopFlushVolumeWorker(_In_ PVOID Context)
 {
     PPOP_FLUSH_VOLUME FlushContext = (PPOP_FLUSH_VOLUME)Context;
     PDEVICE_OBJECT_POWER_EXTENSION Dope;
@@ -224,7 +224,7 @@ PopFlushVolumeWorker(IN PVOID Context)
 
 VOID
 NTAPI
-PopFlushVolumes(IN BOOLEAN ShuttingDown)
+PopFlushVolumes(_In_ BOOLEAN ShuttingDown)
 {
     POP_FLUSH_VOLUME FlushContext = {{0}};
     ULONG FlushPolicy;
@@ -358,7 +358,7 @@ PopFlushVolumes(IN BOOLEAN ShuttingDown)
 
 VOID
 NTAPI
-PoInitializeDeviceObject(IN OUT PDEVOBJ_EXTENSION DeviceObjectExtension)
+PoInitializeDeviceObject(_Inout_ PDEVOBJ_EXTENSION DeviceObjectExtension)
 {
     PEXTENDED_DEVOBJ_EXTENSION DeviceExtension = (PVOID)DeviceObjectExtension;
     PAGED_CODE();

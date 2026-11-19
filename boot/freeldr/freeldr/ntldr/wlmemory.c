@@ -122,7 +122,6 @@ MempSetupPagingForRegion(
         /* Pages used by the kernel */
         case LoaderExceptionBlock:
         case LoaderSystemBlock:
-        case LoaderFirmwarePermanent:
         case LoaderSystemCode:
         case LoaderHalCode:
         case LoaderBootDriver:
@@ -145,6 +144,10 @@ MempSetupPagingForRegion(
         /* Pages not in use */
         case LoaderFree:
         case LoaderBad:
+            break;
+
+        case LoaderFirmwarePermanent:
+            Status = MempSetupPaging(BasePage, PageCount, TRUE);
             break;
 
         /* Invisible to kernel */
@@ -222,6 +225,27 @@ WinLdrSetupMemoryLayout(IN OUT PLOADER_PARAMETER_BLOCK LoaderBlock)
     MemoryMapSizeInPages = (NoEntries * sizeof(PAGE_LOOKUP_TABLE_ITEM) + MM_PAGE_SIZE - 1) / MM_PAGE_SIZE;
 
     TRACE("Got memory map with %d entries\n", NoEntries);
+
+    /*
+     * The resume reader runs after the loader has established paging. Keep its
+     * code, stack, heap, file-system state, and page tables out of the image.
+     */
+    for (i = 0; i < NoEntries; i++)
+    {
+        switch (MemoryMap[i].PageAllocated)
+        {
+            case LoaderLoadedProgram:
+            case LoaderFirmwareTemporary:
+            case LoaderOsloaderHeap:
+            case LoaderOsloaderStack:
+            case LoaderMemoryData:
+                MemoryMap[i].PageAllocated = LoaderFirmwarePermanent;
+                break;
+
+            default:
+                break;
+        }
+    }
 
     // Always map first page of memory
     Status = MempSetupPaging(0, 1, FALSE);
