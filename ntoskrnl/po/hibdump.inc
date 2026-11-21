@@ -17,13 +17,21 @@
  *    queried (FSCTL_GET_RETRIEVAL_POINTERS) and translated to disk sectors.
  *  - A polled ATA (PIO, LBA28/LBA48) writer for the legacy IDE ports.
  *
+ * The dump stack is only for disks on a legacy IDE channel, that is an IDE
+ * controller (also a SATA one in IDE mode) in compatibility mode, which
+ * decodes the fixed ports 1F0h/3F6h and 170h/376h. This is checked first,
+ * from the PCI class code and programming interface of the controllers;
+ * without such a channel nothing is touched and the image is written the
+ * usual way, at PASSIVE_LEVEL through the file system. The same goes for
+ * disks on any other kind of controller (AHCI, NVMe, SCSI, USB, native mode
+ * IDE, ...), and for volumes that are not directly on such a disk.
+ *
  * The disk is not taken from the storage stack. Instead, unique test data is
- * written to the file the normal way, flushed, and the legacy ATA devices are
- * searched for the one that returns the same data at the computed sectors.
- * Only a device that passes this test is ever written to. If anything does
- * not check out (no legacy IDE disk, AHCI, a file system that can't report
- * extents, ...) the dump stack is not used and the image is written the
- * usual way.
+ * written to the file the normal way, flushed, and the devices of the legacy
+ * channels are searched for the one that returns the same data at the
+ * computed sectors. Only a device that passes this test is ever written to.
+ * If anything does not check out (a file system that can't report extents,
+ * ...) the dump stack is not used either.
  *
  * Limits: 512-byte sectors, legacy IDE ports, one disk per volume, a file
  * whose clusters are all allocated. Windows' dump stack loads a port and a
@@ -388,6 +396,87 @@ PopAtaIdentify(
     }
 
     return Stack->TotalSectors != 0 ? STATUS_SUCCESS : STATUS_NO_SUCH_DEVICE;
+}
+
+/* Legacy IDE detection *******************************************************/
+
+#define PO_DUMP_IDE_PRIMARY     0x1
+#define PO_DUMP_IDE_SECONDARY   0x2
+#define PO_DUMP_PCI_MAX_BUS     16
+
+/*
+ * Channels of an IDE controller that are in compatibility mode (they use the
+ * legacy ports). ProgIf bit 0 and 2 say that the primary/secondary channel
+ * is in native PCI mode.
+ */
+static
+ULONG
+PopDumpCompatChannels(
+    _In_ UCHAR ProgIf)
+{
+    ULONG Mask = 0;
+
+    if (!(ProgIf & 0x01))
+        Mask |= PO_DUMP_IDE_PRIMARY;
+    if (!(ProgIf & 0x04))
+        Mask |= PO_DUMP_IDE_SECONDARY;
+    return Mask;
+}
+
+/*
+ * Legacy channels that exist: those of a PCI IDE controller (class 01h,
+ * subclass 01h) that decodes I/O space and is in compatibility mode. On a
+ * machine without any PCI device both channels are assumed to be present.
+ */
+static
+ULONG
+PopDumpLegacyIdeChannels(VOID)
+{
+    PCI_COMMON_HEADER Header;
+    PCI_SLOT_NUMBER Slot;
+    ULONG Bus, Device, Function, Functions, Bytes;
+    ULONG Mask = 0;
+    BOOLEAN PciPresent = FALSE;
+
+    for (Bus = 0; Bus < PO_DUMP_PCI_MAX_BUS; Bus++)
+    {
+        for (Device = 0; Device < PCI_MAX_DEVICES; Device++)
+        {
+            Functions = 1;
+            for (Function = 0; Function < Functions; Function++)
+            {
+                Slot.u.AsULONG = 0;
+                Slot.u.bits.DeviceNumber = Device;
+                Slot.u.bits.FunctionNumber = Function;
+
+                Bytes = HalGetBusDataByOffset(PCIConfiguration,
+                                              Bus,
+                                              Slot.u.AsULONG,
+                                              &Header,
+                                              0,
+                                              sizeof(Header));
+                if (Bytes < FIELD_OFFSET(PCI_COMMON_HEADER, LatencyTimer) ||
+                    Header.VendorID == PCI_INVALID_VENDORID)
+                {
+                    /* Nothing here; the other functions need function 0 */
+                    break;
+                }
+
+                PciPresent = TRUE;
+                if (Function == 0 && (Header.HeaderType & PCI_MULTIFUNCTION))
+                    Functions = PCI_MAX_FUNCTION;
+
+                if (Header.BaseClass == PCI_CLASS_MASS_STORAGE_CTLR &&
+                    Header.SubClass == PCI_SUBCLASS_MSC_IDE_CTLR &&
+                    (Header.Command & PCI_ENABLE_IO_SPACE))
+                {
+                    Mask |= PopDumpCompatChannels(Header.ProgIf);
+                }
+            }
+        }
+    }
+
+    return PciPresent ? Mask : (PO_DUMP_IDE_PRIMARY | PO_DUMP_IDE_SECONDARY);
 }
 
 /* File to disk mapping *******************************************************/
@@ -818,7 +907,8 @@ PopDumpFindDisk(
     _In_ const ULONGLONG *TestSectors,
     _In_ ULONG TestCount,
     _In_reads_(TestCount * PO_DUMP_SECTOR_SIZE) const UCHAR *Patterns,
-    _Out_writes_bytes_(PO_DUMP_SECTOR_SIZE) PUCHAR ReadBuffer)
+    _Out_writes_bytes_(PO_DUMP_SECTOR_SIZE) PUCHAR ReadBuffer,
+    _In_ ULONG ChannelMask)
 {
     static const ULONG Ports[2][2] = { { 0x1F0, 0x3F6 }, { 0x170, 0x376 } };
     ULONG Channel, Device, i;
@@ -828,6 +918,10 @@ PopDumpFindDisk(
 
     for (Channel = 0; Channel < 2; Channel++)
     {
+        /* Only ports that belong to a controller in compatibility mode */
+        if (!(ChannelMask & (1UL << Channel)))
+            continue;
+
         for (Device = 0; Device < 2; Device++)
         {
             Stack->CommandBase = (PUCHAR)(ULONG_PTR)Ports[Channel][0];
@@ -904,6 +998,7 @@ PopDumpStackInitialize(
     PUCHAR Patterns = NULL;
     ULONG TestCount = 0, i;
     ULONG ClusterBytes;
+    ULONG ChannelMask;
     ULONGLONG EndOfFile, LastSector;
     KIRQL OldIrql;
     BOOLEAN Interrupts;
@@ -916,6 +1011,17 @@ PopDumpStackInitialize(
 
     if (Context->LinkFileHandle == NULL || !PopDumpStackEnabled())
         return STATUS_NOT_SUPPORTED;
+
+    /*
+     * Legacy IDE only. Without a channel on the legacy ports the dump stack
+     * can't be used, so leave the disk alone and keep the normal path.
+     */
+    ChannelMask = PopDumpLegacyIdeChannels();
+    if (ChannelMask == 0)
+    {
+        DPRINT1("Hibernation dump stack not used: no legacy IDE channel\n");
+        return STATUS_NOT_SUPPORTED;
+    }
 
     Status = ObReferenceObjectByHandle(Context->LinkFileHandle,
                                        FILE_READ_DATA,
@@ -1072,7 +1178,8 @@ PopDumpStackInitialize(
                              TestSectors,
                              TestCount,
                              Patterns,
-                             Patterns + TestCount * PO_DUMP_SECTOR_SIZE);
+                             Patterns + TestCount * PO_DUMP_SECTOR_SIZE,
+                             ChannelMask);
     KeRestoreInterrupts(Interrupts);
     KeLowerIrql(OldIrql);
     if (!NT_SUCCESS(Status))
