@@ -138,7 +138,8 @@ HalpMpsParseExtendedTable(PUCHAR Data, USHORT Length, UCHAR Checksum)
         if (Entry[0] == MPS_EXT_ADDRESS) {
             PHALP_MPS_EXT_ADDRESS E = (PHALP_MPS_EXT_ADDRESS)Entry;
             ULONG n = HalpApicInfoTable.MpsExtendedAddressRangeCount;
-            if (n >= HALP_MPS_MAX_EXT_ADDRESS_RANGES || E->AddressType > 2 ||\n                E->Reserved != 0 || E->Length == 0 || E->Base + E->Length < E->Base) return FALSE;
+            if (n >= HALP_MPS_MAX_EXT_ADDRESS_RANGES || E->AddressType > 2 ||
+                E->Reserved != 0 || E->Length == 0 || E->Base + E->Length < E->Base) return FALSE;
             HalpApicInfoTable.MpsExtendedAddressRanges[n].BusId = E->BusId;
             HalpApicInfoTable.MpsExtendedAddressRanges[n].AddressType = E->AddressType;
             HalpApicInfoTable.MpsExtendedAddressRanges[n].BaseAddress = E->Base;
@@ -147,7 +148,8 @@ HalpMpsParseExtendedTable(PUCHAR Data, USHORT Length, UCHAR Checksum)
         } else if (Entry[0] == MPS_EXT_HIERARCHY) {
             PHALP_MPS_EXT_HIERARCHY E = (PHALP_MPS_EXT_HIERARCHY)Entry;
             ULONG n = HalpApicInfoTable.MpsBusHierarchyCount;
-            if (n >= HALP_MPS_MAX_BUS_HIERARCHIES || E->BusId == E->ParentBus ||\n                E->Reserved[0] || E->Reserved[1] || E->Reserved[2]) return FALSE;
+            if (n >= HALP_MPS_MAX_BUS_HIERARCHIES || E->BusId == E->ParentBus ||
+                E->Reserved[0] || E->Reserved[1] || E->Reserved[2]) return FALSE;
             HalpApicInfoTable.MpsBusHierarchies[n].BusId = E->BusId;
             HalpApicInfoTable.MpsBusHierarchies[n].BusInfo = E->BusInfo;
             HalpApicInfoTable.MpsBusHierarchies[n].ParentBus = E->ParentBus;
@@ -229,7 +231,10 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
             if (n >= HALP_MPS_MAX_INTERRUPT_ROUTES) return FALSE;
             Route = &HalpApicInfoTable.MpsInterruptRoutes[n];
             Route->InterruptType = Entry[1];
-            Route->Flags = *(PUSHORT)(Entry + 2);\n            if ((Route->Flags & 0xFFF0) ||\n                ((Route->Flags & 3) == 2) || (((Route->Flags >> 2) & 3) == 2))\n                return FALSE;
+            Route->Flags = *(PUSHORT)(Entry + 2);
+            if ((Route->Flags & 0xFFF0) ||
+                ((Route->Flags & 3) == 2) || (((Route->Flags >> 2) & 3) == 2))
+                return FALSE;
             Route->SourceBus = Entry[4];
             Route->SourceBusType = (UCHAR)BusTypes[Entry[4]];
             Route->SourceBusIrq = Entry[5];
@@ -277,12 +282,14 @@ HalpParseApicTables(_In_ PLOADER_PARAMETER_BLOCK LoaderBlock)
     UNREFERENCED_PARAMETER(LoaderBlock);
 
     Fp = HalpMpsFindFloatingPointer();
-    if (Fp) HalpApicInfoTable.MpsImcrPresent = ((Fp->Feature[1] & 0x80) != 0);
     if (!Fp || Fp->Feature[0] != 0 || Fp->TableAddress == 0 ||
         !HalpMpsParseTable((PHALP_MPS_HEADER)(ULONG_PTR)Fp->TableAddress)) {
-        DPRINT1("HALMP: No usable Intel MPS configuration; continuing with BSP only\n");
+        DPRINT1("HALMP: No usable Intel MPS configuration; continuing with BSP only
+");
         RtlZeroMemory(&HalpApicInfoTable, sizeof(HalpApicInfoTable));
         HalpMpsUseBspOnly();
+    } else {
+        HalpApicInfoTable.MpsImcrPresent = ((Fp->Feature[1] & 0x80) != 0);
     }
 }
 
@@ -291,10 +298,12 @@ HalpPrintApicTables(VOID)
 {
 #if DBG
     ULONG i;
-    DPRINT1("HALMP: Physical processor count: %lu\n",
+    DPRINT1("HALMP: Physical processor count: %lu
+",
             HalpApicInfoTable.ProcessorCount);
     for (i = 0; i < HalpApicInfoTable.ProcessorCount; ++i)
-        DPRINT1(" CPU %lu: APIC ID %lu, BSP %u, Started %u, PRCB %p\n",
+        DPRINT1(" CPU %lu: APIC ID %lu, BSP %u, Started %u, PRCB %p
+",
                 i, HalpProcessorIdentity[i].LapicId,
                 HalpProcessorIdentity[i].BSPCheck,
                 HalpProcessorIdentity[i].ProcessorStarted,
