@@ -43,6 +43,7 @@ typedef struct _HALP_MPS_INTERRUPT_ROUTE
     UCHAR SourceBusIrq;
     UCHAR DestinationApic;
     UCHAR DestinationInt;
+    ULONG GlobalSystemInterrupt;
 } HALP_MPS_INTERRUPT_ROUTE, *PHALP_MPS_INTERRUPT_ROUTE;
 
 typedef struct _HALP_MPS_EXT_ADDRESS_RANGE
