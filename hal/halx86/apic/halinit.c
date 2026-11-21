@@ -28,7 +28,8 @@ HalpInitProcessor(
     if (ProcessorNumber == 0)
     {
         HalpParseApicTables(LoaderBlock);
-        if (!HalpInitializeLowStub(LoaderBlock))
+        if (!(HalpBuildType & PRCB_BUILD_UNIPROCESSOR) &&
+            !HalpInitializeLowStub(LoaderBlock))
             DPRINT1("HAL: Failed to allocate/map shared low-memory AP startup stub; SMP startup disabled\n");
     }
 
