@@ -30,6 +30,36 @@ list(APPEND FREELDR_ARC_SOURCE
     # disk/scsiport.c
     # lib/fs/pxe.c
 
+
+# RC95LDR common core and BCD parser are compiled into each FreeLoader
+# firmware target so BIOS and UEFI use the same parser and ARC adapter.
+include_directories(BEFORE
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/core/include
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/bcd/include
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/winload/include)
+
+list(APPEND FREELDR_BOOTLIB_SOURCE
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/core/rc95ldr.c
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/core/rc95ldrentry.c
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/core/rc95ldrdiscover.c
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/bcd/bcdhive.c
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/bcd/bcdelement.c
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/bcd/bcdload.c
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/bcd/bcddevice.c
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/bcd/bcdwalk.c
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/winload/bcdpolicy.c
+    lib/rc95ldr/rc95ldrfs.c)
+
+# The normal RC95LDR entry is built only for the currently supported x86
+# loader configurations. ARM64 remains deliberately out of this integration.
+if(ARCH STREQUAL "i386")
+    set_source_files_properties(${REACTOS_SOURCE_DIR}/boot/rc95ldr/core/rc95ldrentry.c
+        PROPERTIES COMPILE_DEFINITIONS RC95LDR_ARCH_I386)
+elseif(ARCH STREQUAL "amd64")
+    set_source_files_properties(${REACTOS_SOURCE_DIR}/boot/rc95ldr/core/rc95ldrentry.c
+        PROPERTIES COMPILE_DEFINITIONS RC95LDR_ARCH_AMD64)
+endif()
+
 list(APPEND FREELDR_BOOTLIB_SOURCE
     lib/arcsupp.c
     lib/debug.c

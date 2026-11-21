@@ -1731,3 +1731,16 @@ const DEVVTBL* FatMount(ULONG DeviceId)
     TRACE("FatMount(%lu) success\n", DeviceId);
     return (ISFATX(Volume->FatType) ? &FatXFuncTable : &FatFuncTable);
 }
+
+/* RC95LDR uses this to distinguish FAT32 ESPs from FAT12/FAT16 volumes. */
+BOOLEAN
+FatIsFat32File(
+    _In_ ULONG FileId)
+{
+    ULONG DeviceId = FsGetDeviceId(FileId);
+
+    if (DeviceId >= MAX_FDS || FatVolumes[DeviceId] == NULL)
+        return FALSE;
+
+    return (FatVolumes[DeviceId]->FatType == FAT32);
+}

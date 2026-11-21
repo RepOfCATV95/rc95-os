@@ -20,6 +20,7 @@
 /* INCLUDES *******************************************************************/
 
 #include <freeldr.h>
+#include "rc95ldrentry.h"
 
 #include <debug.h>
 DBG_DEFAULT_CHANNEL(WARNING);
@@ -135,7 +136,27 @@ VOID __cdecl BootMain(IN PCCH CmdLine)
         goto Quit;
     }
 
-    /* Launch second stage loader */
+    /*
+     * Enter the RC95LDR normal-boot dispatch point first. The x86 entry is
+     * deliberately a staged handoff until the replacement platform and
+     * winload implementations are complete; Unsupported keeps the proven
+     * FreeLoader/rosload path available as a compatibility fallback.
+     */
+    {
+        RC95LDR_BOOT_CONTEXT Rc95LdrContext;
+        RC95LDR_STATUS Rc95LdrStatus;
+
+        Rc95LdrStatus = Rc95LdrNormalBootEntry(&Rc95LdrContext, NULL);
+        if (Rc95LdrStatus != Rc95LdrSuccess)
+        {
+            WARN("RC95LDR normal boot path is not ready (status %u, stage %u); "
+                 "using the FreeLoader compatibility path.\\n",
+                 (ULONG)Rc95LdrStatus,
+                 (ULONG)Rc95LdrContext.CurrentStage);
+        }
+    }
+
+    /* Launch second stage loader (compatibility path until RC95LDR handoff). */
     if (LaunchSecondStageLoader() != ESUCCESS)
     {
         UiMessageBoxCritical("Unable to load second stage loader.");

@@ -7,6 +7,8 @@
 
 include_directories(BEFORE
     ${REACTOS_SOURCE_DIR}/sdk/include/reactos/edk2
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/uefi/include
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/fs/include
     include
     include/arch/uefi)
 
@@ -15,6 +17,9 @@ list(APPEND UEFILDR_ARC_SOURCE
     arch/uefi/stubs.c
     arch/uefi/ueficon.c
     arch/uefi/uefidisk.c
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/uefi/uedisk.c
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/uefi/uefidiscover.c
+    ${REACTOS_SOURCE_DIR}/boot/rc95ldr/fs/fat32.c
     arch/uefi/uefihw.c
     arch/uefi/uefimem.c
     arch/uefi/uefisetup.c

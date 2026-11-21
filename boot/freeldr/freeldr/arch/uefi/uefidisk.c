@@ -8,6 +8,9 @@
 /* INCLUDES ******************************************************************/
 
 #include <uefildr.h>
+#include <DevicePath.h>
+#include <rc95ldruefi.h>
+#include <string.h>
 
 #include <debug.h>
 DBG_DEFAULT_CHANNEL(DISK);
@@ -63,6 +66,7 @@ static ULONG UefiBootRootIndex = 0;
 static ULONG PublicBootArcDisk = 0;
 static INTERNAL_UEFI_DISK* InternalUefiDisk = NULL;
 static EFI_GUID BlockIoGuid = BLOCK_IO_PROTOCOL;
+static EFI_GUID DevicePathGuid = DEVICE_PATH_PROTOCOL;
 static EFI_HANDLE* handles = NULL;
 static ULONG HandleCount = 0;
 
@@ -1070,7 +1074,8 @@ UefiInitializeBootDevices(VOID)
     EFI_STATUS Status;
     ULONG ArcDriveIndex;
 
-    DiskReadBufferSize = EFI_PAGE_SIZE;
+    /* 64 KiB aligned bounce buffer supports GPT arrays and 4Kn/8Kn media. */
+    DiskReadBufferSize = 64u * 1024u;
     DiskReadBuffer = NULL;
     DiskReadBufferRaw = NULL;
     DiskReadBufferAlignment = 1;
@@ -1366,4 +1371,468 @@ UefiDiskGetCacheableBlockCount(UCHAR DriveNumber)
     }
 
     return (ULONG)(BlockIo->Media->LastBlock + 1);
+}
+
+
+/* RC95LDR firmware protocol adapters. */
+static RC95LDR_STATUS
+Rc95LdrUefiReadBlocks(void *Protocol, uint32_t MediaId, uint64_t Lba,
+                      size_t ByteCount, void *Buffer)
+{
+    EFI_BLOCK_IO *BlockIo = (EFI_BLOCK_IO*)Protocol;
+    EFI_STATUS Status;
+    SIZE_T Remaining = ByteCount;
+    PUCHAR Destination = Buffer;
+    UINT32 BlockSize;
+    if (!BlockIo || !BlockIo->Media || !BlockIo->ReadBlocks || !Buffer)
+        return Rc95LdrInvalidParameter;
+    BlockSize = BlockIo->Media->BlockSize;
+    if (!BlockSize || (ByteCount % BlockSize) != 0)
+        return Rc95LdrInvalidParameter;
+    if (!UefiEnsureDiskReadBufferAligned(BlockIo->Media->IoAlign))
+        return Rc95LdrOutOfMemory;
+    while (Remaining)
+    {
+        SIZE_T Chunk = Remaining;
+        UINTN Blocks;
+        if (DiskReadBufferSize == 0)
+            return Rc95LdrOutOfMemory;
+        if (Chunk > DiskReadBufferSize)
+            Chunk = DiskReadBufferSize;
+        Chunk -= Chunk % BlockSize;
+        if (Chunk == 0)
+            return Rc95LdrBufferTooSmall;
+        Blocks = Chunk / BlockSize;
+        Status = BlockIo->ReadBlocks(BlockIo, MediaId, Lba, Chunk, DiskReadBuffer);
+        if (EFI_ERROR(Status))
+            return Rc95LdrIoError;
+        RtlCopyMemory(Destination, DiskReadBuffer, Chunk);
+        Destination += Chunk;
+        Remaining -= Chunk;
+        Lba += Blocks;
+    }
+    return Rc95LdrSuccess;
+}
+
+static RC95LDR_STATUS
+Rc95LdrUefiGetHandleCount(void *Context, size_t *Count)
+{
+    (void)Context;
+    if (!Count || !handles || !HandleCount)
+        return Rc95LdrNotFound;
+    *Count = HandleCount;
+    return Rc95LdrSuccess;
+}
+
+static RC95LDR_STATUS
+Rc95LdrUefiGetHandleAt(void *Context, size_t Index, void **Handle)
+{
+    (void)Context;
+    if (!Handle || !handles || Index >= HandleCount)
+        return Rc95LdrOutOfBounds;
+    *Handle = handles[Index];
+    return Rc95LdrSuccess;
+}
+
+static RC95LDR_STATUS
+Rc95LdrUefiOpenBlockIo(void *Context, void *Handle,
+                       RC95LDR_UEFI_BLOCK_IO *Result)
+{
+    EFI_BLOCK_IO *BlockIo = NULL;
+    EFI_STATUS Status;
+    (void)Context;
+    if (!Handle || !Result)
+        return Rc95LdrInvalidParameter;
+    Status = GlobalSystemTable->BootServices->HandleProtocol(
+        (EFI_HANDLE)Handle, &BlockIoGuid, (VOID**)&BlockIo);
+    if (EFI_ERROR(Status) || !BlockIo || !BlockIo->Media)
+        return Rc95LdrNotFound;
+    RtlZeroMemory(Result, sizeof(*Result));
+    Result->Protocol = BlockIo;
+    Result->Media.MediaId = BlockIo->Media->MediaId;
+    Result->Media.BlockSize = BlockIo->Media->BlockSize;
+    Result->Media.IoAlign = BlockIo->Media->IoAlign;
+    Result->Media.LastBlock = BlockIo->Media->LastBlock;
+    Result->Media.MediaPresent = BlockIo->Media->MediaPresent;
+    Result->Media.RemovableMedia = BlockIo->Media->RemovableMedia;
+    Result->Media.LogicalPartition = BlockIo->Media->LogicalPartition;
+    Result->Media.ReadOnly = BlockIo->Media->ReadOnly;
+    Result->ReadBlocks = Rc95LdrUefiReadBlocks;
+    return Rc95LdrSuccess;
+}
+
+static RC95LDR_STATUS
+Rc95LdrUefiGetDevicePath(void *Context, void *Handle,
+                         const uint8_t **Path, size_t *PathLength)
+{
+    EFI_DEVICE_PATH_PROTOCOL *Node = NULL, *FirstNode;
+    EFI_STATUS Status;
+    size_t Offset = 0;
+    (void)Context;
+    if (!Handle || !Path || !PathLength)
+        return Rc95LdrInvalidParameter;
+    Status = GlobalSystemTable->BootServices->HandleProtocol(
+        (EFI_HANDLE)Handle, &DevicePathGuid, (VOID**)&Node);
+    if (EFI_ERROR(Status) || !Node)
+        return Rc95LdrNotFound;
+    FirstNode = Node;
+    for (;;)
+    {
+        UINT16 Length;
+        if (Offset > 65536u - sizeof(*Node))
+            return Rc95LdrCorruptData;
+        Length = (UINT16)(Node->Length[0] | ((UINT16)Node->Length[1] << 8));
+        if (Length < sizeof(*Node) || Offset > 65536u - Length)
+            return Rc95LdrCorruptData;
+        Offset += Length;
+        if (Node->Type == 0x7f && Node->SubType == 0xff)
+            break;
+        Node = (EFI_DEVICE_PATH_PROTOCOL*)((PUCHAR)Node + Length);
+    }
+    *PathLength = Offset;
+    *Path = (const uint8_t*)FirstNode;
+    return Rc95LdrSuccess;
+}
+
+RC95LDR_STATUS
+Rc95LdrFreeldrUefiGetFirmwareOps(RC95LDR_UEFI_FIRMWARE_OPS *Ops)
+{
+    if (!Ops || !GlobalSystemTable || !GlobalSystemTable->BootServices ||
+        !handles || !HandleCount)
+        return Rc95LdrNotFound;
+    RtlZeroMemory(Ops, sizeof(*Ops));
+    Ops->GetHandleCount = Rc95LdrUefiGetHandleCount;
+    Ops->GetHandleAt = Rc95LdrUefiGetHandleAt;
+    Ops->OpenBlockIo = Rc95LdrUefiOpenBlockIo;
+    Ops->GetDevicePath = Rc95LdrUefiGetDevicePath;
+    return Rc95LdrSuccess;
+}
+
+
+RC95LDR_STATUS
+Rc95LdrFreeldrUefiReadBlockDevice(
+    void *Context, uint64_t Lba, uint32_t BlockCount,
+    void *Buffer, size_t BufferLength)
+{
+    RC95LDR_UEFI_BLOCK_IO *Io = (RC95LDR_UEFI_BLOCK_IO*)Context;
+    size_t Bytes;
+    if (!Io || !Buffer || !BlockCount || !Io->Media.BlockSize)
+        return Rc95LdrInvalidParameter;
+    if (!Rc95LdrMultiplySize((size_t)BlockCount, Io->Media.BlockSize, &Bytes))
+        return Rc95LdrIntegerOverflow;
+    if (Bytes > BufferLength)
+        return Rc95LdrBufferTooSmall;
+    return Rc95LdrUefiReadBlocks(Io->Protocol, Io->Media.MediaId,
+                                 Lba, Bytes, Buffer);
+}
+
+RC95LDR_STATUS
+Rc95LdrFreeldrUefiBuildArcPartitionPath(
+    const RC95LDR_PARTITION_INFO *Partition,
+    char *Buffer,
+    size_t BufferLength)
+{
+    ULONG Index;
+    if (!Partition || !Buffer || !BufferLength ||
+        Partition->FirmwarePartitionNumber == 0 || !InternalUefiDisk)
+        return Rc95LdrInvalidParameter;
+    for (Index = 0; Index < PcBiosDiskCount; ++Index)
+    {
+        if (InternalUefiDisk[Index].UefiHandleIndex ==
+            Partition->ParentDiskHandleIndex)
+        {
+            NTSTATUS Status = RtlStringCbPrintfA(Buffer, BufferLength,
+                "multi(0)disk(0)rdisk(%lu)partition(%lu)",
+                Index, (ULONG)Partition->FirmwarePartitionNumber);
+            return NT_SUCCESS(Status) ? Rc95LdrSuccess : Rc95LdrBufferTooSmall;
+        }
+    }
+    return Rc95LdrNotFound;
+}
+
+
+#define RC95LDR_MOUNT_FAT32 1u
+#define RC95LDR_MOUNT_NTFS  2u
+
+static RC95LDR_STATUS
+Rc95LdrFreeldrUefiEnumeratePartitions(
+    void *Context, RC95LDR_PARTITION_INFO *Partitions,
+    size_t Capacity, size_t *Count)
+{
+    RC95LDR_FREELDR_UEFI_CONTEXT *Uefi = Context;
+    if (!Uefi || !Uefi->Scratch)
+        return Rc95LdrInvalidParameter;
+    return Rc95LdrUefiEnumerateGptPartitions(&Uefi->Firmware,
+        Partitions, Capacity, Count, Uefi->Scratch, Uefi->ScratchLength);
+}
+
+static RC95LDR_STATUS
+Rc95LdrFreeldrUefiMountVolume(
+    void *Context, const RC95LDR_PARTITION_INFO *Partition,
+    RC95LDR_FILESYSTEM_KIND FileSystem, RC95LDR_VOLUME *Volume)
+{
+    RC95LDR_FREELDR_UEFI_CONTEXT *Uefi = Context;
+    RC95LDR_FREELDR_UEFI_MOUNT *Mount = NULL;
+    size_t Slot;
+    RC95LDR_STATUS Status;
+    if (!Uefi || !Partition || !Volume)
+        return Rc95LdrInvalidParameter;
+    if (Partition->FileSystem != FileSystem)
+        return Rc95LdrUnsupported;
+    for (Slot = 0; Slot < RC95LDR_UEFI_MOUNT_SLOTS; ++Slot)
+        if (!Uefi->Mounts[Slot].InUse) { Mount = &Uefi->Mounts[Slot]; break; }
+    if (!Mount)
+        return Rc95LdrOutOfMemory;
+    RtlZeroMemory(Mount, sizeof(*Mount));
+
+    if (FileSystem == Rc95LdrFsFat32)
+    {
+        void *Handle = NULL;
+        uint64_t StartLba;
+        Status = Rc95LdrUefiGetHandleAt(&Uefi->Firmware,
+            Partition->FirmwareHandleIndex, &Handle);
+        if (Status != Rc95LdrSuccess)
+            return Status;
+        Status = Rc95LdrUefiOpenBlockIo(&Uefi->Firmware, Handle, &Mount->BlockIo);
+        if (Status != Rc95LdrSuccess)
+            return Status;
+        if (Mount->BlockIo.Media.LastBlock == UINT64_MAX)
+            return Rc95LdrOutOfBounds;
+        Mount->BlockDevice.DeviceContext = &Mount->BlockIo;
+        Mount->BlockDevice.BlockSize = Mount->BlockIo.Media.BlockSize;
+        Mount->BlockDevice.BlockCount = Mount->BlockIo.Media.LastBlock + 1;
+        Mount->BlockDevice.Read = Rc95LdrFreeldrUefiReadBlockDevice;
+        StartLba = Mount->BlockIo.Media.LogicalPartition ? 0 : Partition->StartLba;
+        Status = Rc95LdrFat32MountPartition(&Mount->Fat32,
+            &Mount->BlockDevice, StartLba, Partition->BlockCount);
+        if (Status != Rc95LdrSuccess)
+            return Status;
+        Status = Rc95LdrFat32BindVolume(&Mount->Fat32, &Mount->Volume);
+        if (Status != Rc95LdrSuccess)
+        {
+            Rc95LdrFat32Unmount(&Mount->Fat32);
+            return Status;
+        }
+        Mount->Kind = RC95LDR_MOUNT_FAT32;
+    }
+    else if (FileSystem == Rc95LdrFsNtfs)
+    {
+        char ArcPath[96];
+        RC95LDR_VOLUME *BoundVolume = NULL;
+        Status = Rc95LdrFreeldrUefiBuildArcPartitionPath(
+            Partition, ArcPath, sizeof(ArcPath));
+        if (Status != Rc95LdrSuccess)
+            return Status;
+        Status = Rc95LdrFreeldrOpenVolume(ArcPath, &Mount->Ntfs, &BoundVolume);
+        if (Status != Rc95LdrSuccess)
+            return Status;
+        Mount->Volume = *BoundVolume;
+        Mount->Kind = RC95LDR_MOUNT_NTFS;
+    }
+    else
+        return Rc95LdrUnsupported;
+
+    Mount->InUse = 1;
+    *Volume = Mount->Volume;
+    return Rc95LdrSuccess;
+}
+
+static void
+Rc95LdrFreeldrUefiUnmountVolume(void *Context, RC95LDR_VOLUME *Volume)
+{
+    RC95LDR_FREELDR_UEFI_CONTEXT *Uefi = Context;
+    size_t Slot;
+    if (!Uefi || !Volume)
+        return;
+    for (Slot = 0; Slot < RC95LDR_UEFI_MOUNT_SLOTS; ++Slot)
+    {
+        RC95LDR_FREELDR_UEFI_MOUNT *Mount = &Uefi->Mounts[Slot];
+        if (!Mount->InUse || Mount->Volume.FileSystem != Volume->FileSystem)
+            continue;
+        if (Mount->Kind == RC95LDR_MOUNT_FAT32)
+            Rc95LdrFat32Unmount(&Mount->Fat32);
+        else if (Mount->Kind == RC95LDR_MOUNT_NTFS)
+            Rc95LdrFreeldrCloseVolume(&Mount->Ntfs);
+        RtlZeroMemory(Mount, sizeof(*Mount));
+        RtlZeroMemory(Volume, sizeof(*Volume));
+        return;
+    }
+}
+
+static RC95LDR_STATUS
+Rc95LdrFreeldrUefiCopyBcdPath(
+    const uint16_t *Source, uint32_t Characters,
+    char *Destination, size_t DestinationSize)
+{
+    uint32_t i;
+    if (!Source || !Destination || !Characters ||
+        Characters >= DestinationSize || Source[0] != '\\')
+        return Rc95LdrCorruptData;
+    for (i = 0; i < Characters; ++i)
+    {
+        uint16_t Ch = Source[i];
+        if (Ch < 0x20 || Ch >= 0x7f || Ch == ':' || Ch == '*' ||
+            Ch == '?' || Ch == '"' || Ch == '<' || Ch == '>' ||
+            Ch == '|' || Ch == '/')
+            return Rc95LdrUnsupported;
+        Destination[i] = (char)Ch;
+    }
+    Destination[Characters] = 0;
+    if (strstr(Destination, "..") != NULL)
+        return Rc95LdrCorruptData;
+    return Rc95LdrSuccess;
+}
+
+static RC95LDR_STATUS
+Rc95LdrFreeldrUefiValidateWindowsVolume(
+    void *Context, const RC95LDR_VOLUME *Volume,
+    const RC95LDR_WINDOWS_INSTALLATION *Installation)
+{
+    RC95LDR_FREELDR_UEFI_CONTEXT *Uefi = Context;
+    RC95LDR_VOLUME LoaderVolume;
+    char Root[RC95LDR_MAX_SYSTEM_ROOT_CHARS];
+    char LoaderPath[RC95LDR_MAX_SYSTEM_ROOT_CHARS];
+    char FilePath[RC95LDR_MAX_SYSTEM_ROOT_CHARS + 48];
+    void *File = NULL;
+    uint64_t FileSize;
+    RC95LDR_STATUS Status;
+    int LoaderMounted = 0;
+
+    if (!Uefi || !Volume || !Volume->FileSystem || !Installation ||
+        !Volume->FileSystem->OpenRead || !Volume->FileSystem->Close)
+        return Rc95LdrInvalidParameter;
+
+    Status = Rc95LdrFreeldrUefiCopyBcdPath(
+        Installation->SystemRootUtf16, Installation->SystemRootCharacters,
+        Root, sizeof(Root));
+    if (Status != Rc95LdrSuccess)
+        return Status;
+    Status = Rc95LdrFreeldrUefiCopyBcdPath(
+        Installation->LoaderPathUtf16, Installation->LoaderPathCharacters,
+        LoaderPath, sizeof(LoaderPath));
+    if (Status != Rc95LdrSuccess)
+        return Status;
+    {
+        size_t RootLength = strlen(Root), LoaderLength = strlen(LoaderPath);
+        size_t PathIndex;
+        if (LoaderLength <= RootLength)
+            return Rc95LdrCorruptData;
+        for (PathIndex = 0; PathIndex < RootLength; ++PathIndex)
+        {
+            char A = LoaderPath[PathIndex], B = Root[PathIndex];
+            if (A >= 'A' && A <= 'Z') A = (char)(A + ('a' - 'A'));
+            if (B >= 'A' && B <= 'Z') B = (char)(B + ('a' - 'A'));
+            if (A != B)
+                return Rc95LdrCorruptData;
+        }
+        if (LoaderPath[RootLength] != '\\\\')
+            return Rc95LdrCorruptData;
+    }
+
+    if (Installation->PartitionIndex == Installation->OsPartitionIndex)
+        LoaderVolume = *Volume;
+    else
+    {
+        Status = Rc95LdrFreeldrUefiMountVolume(Uefi,
+            &Installation->BootPartition,
+            Installation->BootPartition.FileSystem, &LoaderVolume);
+        if (Status != Rc95LdrSuccess)
+            return Status;
+        LoaderMounted = 1;
+    }
+
+    Status = LoaderVolume.FileSystem->OpenRead(
+        LoaderVolume.FileSystem->FileSystemContext,
+        LoaderPath, &File, &FileSize);
+    if (Status == Rc95LdrSuccess)
+    {
+        LoaderVolume.FileSystem->Close(
+            LoaderVolume.FileSystem->FileSystemContext, File);
+        if (!FileSize)
+            Status = Rc95LdrCorruptData;
+    }
+    if (LoaderMounted)
+        Rc95LdrFreeldrUefiUnmountVolume(Uefi, &LoaderVolume);
+    if (Status != Rc95LdrSuccess)
+        return Status;
+
+    {
+        NTSTATUS StringStatus = RtlStringCbPrintfA(FilePath, sizeof(FilePath),
+            "%s\\System32\\ntoskrnl.exe", Root);
+        if (!NT_SUCCESS(StringStatus))
+            return Rc95LdrBufferTooSmall;
+    }
+    File = NULL;
+    Status = Volume->FileSystem->OpenRead(
+        Volume->FileSystem->FileSystemContext, FilePath, &File, &FileSize);
+    if (Status != Rc95LdrSuccess)
+        return Status;
+    Volume->FileSystem->Close(Volume->FileSystem->FileSystemContext, File);
+    if (!FileSize)
+        return Rc95LdrCorruptData;
+
+    {
+        NTSTATUS StringStatus = RtlStringCbPrintfA(FilePath, sizeof(FilePath),
+            "%s\\System32\\Config\\SYSTEM", Root);
+        if (!NT_SUCCESS(StringStatus))
+            return Rc95LdrBufferTooSmall;
+    }
+    File = NULL;
+    Status = Volume->FileSystem->OpenRead(
+        Volume->FileSystem->FileSystemContext, FilePath, &File, &FileSize);
+    if (Status != Rc95LdrSuccess)
+        return Status;
+    Volume->FileSystem->Close(Volume->FileSystem->FileSystemContext, File);
+    return FileSize ? Rc95LdrSuccess : Rc95LdrCorruptData;
+}
+
+RC95LDR_STATUS
+Rc95LdrFreeldrUefiInitializeDiscovery(
+    RC95LDR_FREELDR_UEFI_CONTEXT *Context,
+    void *Scratch,
+    size_t ScratchLength,
+    RC95LDR_UEFI_DISCOVERY_OPS *DiscoveryOps)
+{
+    RC95LDR_STATUS Status;
+    if (!Context || !Scratch || !ScratchLength || !DiscoveryOps)
+        return Rc95LdrInvalidParameter;
+    RtlZeroMemory(Context, sizeof(*Context));
+    Context->Scratch = Scratch;
+    Context->ScratchLength = ScratchLength;
+    Status = Rc95LdrFreeldrUefiGetFirmwareOps(&Context->Firmware);
+    if (Status != Rc95LdrSuccess)
+        return Status;
+    RtlZeroMemory(DiscoveryOps, sizeof(*DiscoveryOps));
+    DiscoveryOps->Context = Context;
+    DiscoveryOps->EnumeratePartitions = Rc95LdrFreeldrUefiEnumeratePartitions;
+    DiscoveryOps->MountVolume = Rc95LdrFreeldrUefiMountVolume;
+    DiscoveryOps->UnmountVolume = Rc95LdrFreeldrUefiUnmountVolume;
+    DiscoveryOps->ValidateWindowsVolume = Rc95LdrFreeldrUefiValidateWindowsVolume;
+    /* NULL CollectBootCandidates selects Rc95BcdCollectWindowsBootCandidates. */
+    return Rc95LdrSuccess;
+}
+
+RC95LDR_STATUS
+Rc95LdrFreeldrUefiDiscoverWindows(
+    RC95LDR_FREELDR_UEFI_CONTEXT *Context,
+    void *Scratch, size_t ScratchLength,
+    RC95LDR_PARTITION_INFO *Partitions, size_t PartitionCapacity,
+    RC95LDR_BCD_BOOT_CANDIDATE *Candidates, size_t CandidateCapacity,
+    void *HiveBuffer, size_t HiveCapacity,
+    RC95LDR_WINDOWS_INSTALLATION *Installation,
+    RC95LDR_VOLUME *WindowsVolume,
+    size_t *EspPartitionIndex)
+{
+    RC95LDR_UEFI_DISCOVERY_OPS DiscoveryOps;
+    RC95LDR_STATUS Status;
+
+    Status = Rc95LdrFreeldrUefiInitializeDiscovery(
+        Context, Scratch, ScratchLength, &DiscoveryOps);
+    if (Status != Rc95LdrSuccess)
+        return Status;
+
+    return Rc95LdrDiscoverUefiWindows(
+        &DiscoveryOps, Partitions, PartitionCapacity,
+        Candidates, CandidateCapacity, HiveBuffer, HiveCapacity,
+        Installation, WindowsVolume, EspPartitionIndex);
 }
