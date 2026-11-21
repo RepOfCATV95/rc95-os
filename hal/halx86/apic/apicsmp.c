@@ -81,7 +81,7 @@ ApicRequestGlobalInterrupt(
     }
     if (Wait == 100000)
     {
-        DPRINT1("HAL: Timed out waiting for APIC ICR to become idle\\n");
+        DPRINT1("HAL: Timed out waiting for APIC ICR to become idle\n");
         if (Flags & EFLAGS_INTERRUPT_MASK) _enable();
         return;
     }
@@ -109,7 +109,7 @@ ApicRequestGlobalInterrupt(
             break;
     }
     if (Wait == 100000)
-        DPRINT1("HAL: APIC IPI delivery timed out (destination %u, vector %u)\\n",
+        DPRINT1("HAL: APIC IPI delivery timed out (destination %u, vector %u)\n",
                 DestinationProcessor, Vector);
 
     /* Finally, restore the original interrupt state */
