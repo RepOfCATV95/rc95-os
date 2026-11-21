@@ -1398,10 +1398,15 @@ Phase1InitializationDiscard(IN PVOID Context)
     CommandLine = (LoaderBlock->LoadOptions ? _strupr(LoaderBlock->LoadOptions) : NULL);
 
     /* Check if GUI Boot is enabled */
-    NoGuiBoot = (CommandLine && strstr(CommandLine, "NOGUIBOOT") != NULL);
+    NoGuiBoot = (CommandLine && (strstr(CommandLine, "NOGUIBOOT") != NULL));
 
     /* Get the SOS setting */
-    SosEnabled = (CommandLine && strstr(CommandLine, "SOS") != NULL);
+    SosEnabled = (CommandLine && (strstr(CommandLine, "SOS") != NULL));
+
+#if 0 // Temporarily disabled until BGFX is fully implemented
+    /* Check if BOOTVID fallback is enabled */
+    BOOTVIDFallback = (CommandLine && (strstr(CommandLine, "COME_HOME_TO_ABC") != NULL));
+#endif
 
     /* Setup the boot video driver */
     InbvEnableBootDriver(!NoGuiBoot);
@@ -1570,7 +1575,7 @@ Phase1InitializationDiscard(IN PVOID Context)
 #ifdef CONFIG_SMP
     /*
      * IMPORTANT NOTE:
-     * Because ReactOS is a "nice" OS, we do not care _at all_
+     * Because CATV 95 is a "nice" OS, we do not care _at all_
      * about any number of registered/licensed processors:
      * no usage of KeRegisteredProcessors nor KeLicensedProcessors.
      */
@@ -1584,13 +1589,13 @@ Phase1InitializationDiscard(IN PVOID Context)
         if (Option) Option = strstr(Option, "=");
         if (Option) KeNumprocSpecified = atol(Option + 1);
 
-        /* Check for BOOTPROC (NT6+ and ReactOS): maximum number
+        /* Check for BOOTPROC (NT6+ and CATV 95): maximum number
          * of logical processors that can be started at boot-time */
         Option = strstr(CommandLine, "BOOTPROC");
         if (Option) Option = strstr(Option, "=");
         if (Option) KeBootprocSpecified = atol(Option + 1);
 
-        /* Check for MAXPROC (NT6+ and ReactOS): forces the kernel to report
+        /* Check for MAXPROC (NT6+ and CATV 95): forces the kernel to report
          * as existing the maximum number of processors that can be handled */
         if (strstr(CommandLine, "MAXPROC"))
             KeMaximumProcessors = MAXIMUM_PROCESSORS;
