@@ -329,6 +329,40 @@ HalpParseApicTables(_In_ PLOADER_PARAMETER_BLOCK LoaderBlock)
     }
 }
 
+BOOLEAN
+NTAPI
+HalpMpsGetPciInterruptGsi(
+    _In_ ULONG BusNumber,
+    _In_ ULONG DeviceNumber,
+    _In_ ULONG InterruptPin,
+    _Out_ PULONG GlobalSystemInterrupt)
+{
+    ULONG Index;
+    UCHAR SourceBusIrq;
+
+    if (HalpApicInfoTable.ApicMode != HALP_APIC_MODE_LEGACY ||
+        DeviceNumber > 31 || InterruptPin < 1 || InterruptPin > 4)
+        return FALSE;
+
+    /* MPS encodes PCI INT[A..D] as device-number << 2 | pin[1:0]. */
+    SourceBusIrq = (UCHAR)((DeviceNumber << 2) | (InterruptPin - 1));
+    for (Index = 0; Index < HalpApicInfoTable.MpsInterruptRouteCount; ++Index)
+    {
+        PHALP_MPS_INTERRUPT_ROUTE Route =
+            &HalpApicInfoTable.MpsInterruptRoutes[Index];
+        if (Route->SourceBusType == 3 &&
+            Route->SourceBus == (UCHAR)BusNumber &&
+            Route->SourceBusIrq == SourceBusIrq &&
+            Route->InterruptType == 0 &&
+            Route->GlobalSystemInterrupt != MAXULONG)
+        {
+            *GlobalSystemInterrupt = Route->GlobalSystemInterrupt;
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 VOID
 HalpPrintApicTables(VOID)
 {
