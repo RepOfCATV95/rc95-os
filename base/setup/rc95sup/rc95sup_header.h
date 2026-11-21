@@ -7,8 +7,8 @@
  *              Copyright 2018-2026 Hermès Bélusca-Maïto <hermes.belusca-maito@reactos.org>
  */
 
-#ifndef _REACTOS_PCH_
-#define _REACTOS_PCH_
+#ifndef _RC95SUP_HEADER_PCH_
+#define _RC95SUP_HEADER_PCH_
 
 /* C Headers */
 #include <stdlib.h>

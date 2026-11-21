@@ -71,6 +71,40 @@ SystemSetLocalTime(LPSYSTEMTIME lpSystemTime)
     return Ret;
 }
 
+VOID
+ValidateForCorrectTime(SYSTEMTIME* stTime)
+{
+    TIME_ZONE_INFORMATION tzi = {0};
+    DWORD dwTZI = 0;
+    SYSTEMTIME st1 = {0};
+    SYSTEMTIME st2 = {0};
+    SYSTEMTIME Time = {0};
+    FILETIME mainFT = {0};
+
+    dwTZI = GetTimeZoneInformation(&tzi);
+    if (dwTZI == TIME_ZONE_ID_INVALID)
+    {
+        SystemSetLocalTime(stTime);
+        return;
+    }
+
+    TzSpecificLocalTimeToSystemTime(&tzi,stTime,&st1);
+    if (!SystemTimeToFileTime(&st1,&mainFT))
+    {
+        SystemSetLocalTime(stTime);
+        return;
+    }
+
+    if (!FileTimeToSystemTime(&mainFT,&st2))
+    {
+        SystemSetLocalTime(stTime);
+        return;
+    }
+
+    SystemTimeToTzSpecificLocalTime(&tzi,&st2,&Time);
+    SystemSetLocalTime(&Time);
+
+}
 
 static VOID
 SetLocalSystemTime(HWND hwnd)
@@ -86,7 +120,7 @@ SetLocalSystemTime(HWND hwnd)
                      (WPARAM)&Time,
                      0))
     {
-        SystemSetLocalTime(&Time);
+        ValidateForCorrectTime(&Time);
 
         SetWindowLongPtrW(hwnd,
                           DWLP_MSGRESULT,

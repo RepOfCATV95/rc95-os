@@ -307,6 +307,25 @@ SetLocalTimeZone(HWND hwnd)
     SetTimeZoneInformation(&TimeZoneInformation);
 }
 
+static VOID
+ApplyTimeZoneToLocalTime(TIME_ZONE_INFORMATION* NewTZI)
+{
+    SYSTEMTIME st = {0};
+    SYSTEMTIME Time = {0};
+
+    GetSystemTime(&st);
+    if (!NewTZI)
+        return;
+    SystemTimeToTzSpecificLocalTime(NewTZI,&st,&Time);
+    if (!NewTZI)
+    {
+        GetLocalTime(&Time);
+        SystemSetLocalTime(&Time);
+        return;
+    }
+
+    SystemSetLocalTime(&Time);
+}
 
 /* Property page dialog callback */
 INT_PTR CALLBACK

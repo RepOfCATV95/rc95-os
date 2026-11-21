@@ -696,7 +696,7 @@ LoadReactOSSetup(
         UiResetForSOS();
 
     /* Allocate and minimally-initialize the Loader Parameter Block */
-    AllocateAndInitLPB(_WIN32_WINNT_WS03, &LoaderBlock);
+    AllocateAndInitLPB(TARGET_OS_VERSION, &LoaderBlock);
 
     /* Allocate and initialize the setup loader block */
     SetupBlock = &WinLdrSystemBlock->SetupBlock;
@@ -731,10 +731,10 @@ LoadReactOSSetup(
     /* Close the inf file */
     InfCloseFile(InfHandle);
 
-    UiDrawStatusText("The Setup program is starting...");
+    UiDrawStatusText("Setup is starting the Republic of CATV 95");
 
     /* Finish loading */
-    return LoadAndBootWindowsCommon(_WIN32_WINNT_WS03,
+    return LoadAndBootWindowsCommon(TARGET_OS_VERSION,
                                     LoaderBlock,
                                     BootOptions,
                                     SystemPartition,

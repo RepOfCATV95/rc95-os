@@ -10,8 +10,7 @@
 /* Code based on clock.c from Programming Windows, Charles Petzold */
 
 #include "timedate.h"
-
-#include <math.h>
+#include "clock.h"
 
 typedef struct _CLOCKDATA
 {

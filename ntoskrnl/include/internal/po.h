@@ -95,6 +95,12 @@ typedef struct _POP_HIBER_CONTEXT
 
 NTSTATUS
 NTAPI
+PopHiberInitSystem(
+    VOID
+);
+
+NTSTATUS
+NTAPI
 PopHiberSystemHandler(
     _In_ PVOID SystemContext
 );

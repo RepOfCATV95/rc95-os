@@ -7,7 +7,7 @@
  *              Copyright 2018-2026 Hermès Bélusca-Maïto <hermes.belusca-maito@reactos.org>
  */
 
-#include "reactos.h"
+#include "rc95sup_header.h"
 #include <winnls.h> // For GetUserDefaultLCID()
 
 #define NTOS_MODE_USER
@@ -3704,7 +3704,7 @@ static HANDLE
 CheckForOtherInstance(
     _In_ HINSTANCE hInstance)
 {
-#define REACTOS_SETUP_MUTEX L"__ReactOS_Setup__"
+#define RC95_SETUP_MUTEX L"__Republic_of_CATV_95_Setup__"
 
     static HANDLE s_hMutex = NULL;
 
@@ -3714,9 +3714,9 @@ CheckForOtherInstance(
 
     /* Try to create or open the mutex. Use the Global namespace
      * if it exists; otherwise fall back to the default one. */
-    s_hMutex = CreateMutexW(NULL, FALSE, L"Global\\" REACTOS_SETUP_MUTEX);
+    s_hMutex = CreateMutexW(NULL, FALSE, L"Global\\" RC95_SETUP_MUTEX);
     if (!s_hMutex && (GetLastError() == ERROR_PATH_NOT_FOUND))
-        s_hMutex = CreateMutexW(NULL, FALSE, REACTOS_SETUP_MUTEX);
+        s_hMutex = CreateMutexW(NULL, FALSE, RC95_SETUP_MUTEX);
     if (!s_hMutex)
         return NULL; /* Failed to create the mutex */
 

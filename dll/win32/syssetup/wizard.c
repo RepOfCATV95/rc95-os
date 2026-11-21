@@ -417,7 +417,13 @@ typedef struct _PRODUCT_OPTION_DATA
 static const PRODUCT_OPTION_DATA s_ProductOptionData[INSTALLATION_TYPE_MAX] =
 {
     { L"Terminal Server\0", L"ServerNT", 0, 0x200, 0 },
+#if defined(BT2_BOOT)
+    { L"Terminal Server\0", L"WinNT", 1, 0x100, 0 },
+#elif defined(NEW_VISTA) && !defined(BT2_BOOT)
+    { L"Terminal Server\0", L"WinNT", 1, 0x200, 0 },
+#else
     { L"\0", L"WinNT", 1, 0x300, 1 },
+#endif
     { L"Terminal Server\0", L"ServerNT", 0, 0x200, 0 }
     // { L"Terminal Server\0", L"ServerNT", 0, 0x200, 0 }
 };

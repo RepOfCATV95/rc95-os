@@ -591,10 +591,9 @@ IopInitializeReserveIrp(IN PRESERVE_IRP_ALLOCATOR ReserveIrpAllocator)
         return FALSE;
     }
 
-    /* It's not in use */
-    ReserveIrpAllocator->ReserveIrpInUse = 0;
-    /* And init the event */
-    KeInitializeEvent(&ReserveIrpAllocator->WaitEvent, SynchronizationEvent, FALSE);
+    /* A semaphore avoids lost wakeups when several low-memory readers
+     * contend for the single reserved IRP. */
+    KeInitializeSemaphore(&ReserveIrpAllocator->Available, 1, 1);
 
     /* All good, keep booting */
     return TRUE;
@@ -610,15 +609,14 @@ IopAllocateReserveIrp(IN CCHAR StackSize)
         return NULL;
     }
 
-    /* Now, wait until the IRP becomes available and reserve it immediately */
-    while (InterlockedExchange(&IopReserveIrpAllocator.ReserveIrpInUse, 1) == 1)
-    {
-        KeWaitForSingleObject(&IopReserveIrpAllocator.WaitEvent,
-                              Executive,
-                              KernelMode,
-                              FALSE,
-                              NULL);
-    }
+    /* Acquire the single reserved IRP. The semaphore atomically couples
+     * availability with the wait, so a release cannot be lost between the
+     * availability test and the wait. */
+    KeWaitForSingleObject(&IopReserveIrpAllocator.Available,
+                          Executive,
+                          KernelMode,
+                          FALSE,
+                          NULL);
 
     /* It's ours! Initialize it */
     IoInitializeIrp(IopReserveIrpAllocator.ReserveIrp, IoSizeOfIrp(StackSize), StackSize);
@@ -630,11 +628,11 @@ IopAllocateReserveIrp(IN CCHAR StackSize)
 VOID
 IopFreeReserveIrp(IN CCHAR PriorityBoost)
 {
-    /* Mark we don't use the IRP anymore */
-    InterlockedExchange(&IopReserveIrpAllocator.ReserveIrpInUse, 0);
-
-    /* And set the event if someone is waiting on the IRP */
-    KeSetEvent(&IopReserveIrpAllocator.WaitEvent, PriorityBoost, FALSE);
+    /* Return the reserved IRP to the single-slot pool and wake one waiter. */
+    KeReleaseSemaphore(&IopReserveIrpAllocator.Available,
+                       PriorityBoost,
+                       1,
+                       FALSE);
 }
 
 /* FUNCTIONS *****************************************************************/

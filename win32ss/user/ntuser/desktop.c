@@ -403,9 +403,7 @@ GetSystemVersionString(OUT PWSTR pwszzVersion,
         /* String for Safe Mode */
         Status = RtlStringCchPrintfW(pwszzVersion,
                                      cchDest,
-                                     L"ReactOS Version %S %wZ (NT %u.%u Build %u%s)\n",
-                                     KERNEL_VERSION_STR,
-                                     &BuildLabString,
+                                     L"Republic of CATV 95 Version %u.%u (Build %u%s)\n",
                                      SharedUserData->NtMajorVersion,
                                      SharedUserData->NtMinorVersion,
                                      (VerInfo.dwBuildNumber & 0xFFFF),
@@ -443,15 +441,16 @@ GetSystemVersionString(OUT PWSTR pwszzVersion,
         /* Multi-string for Normal Mode */
         Status = RtlStringCchPrintfW(pwszzVersion,
                                      cchDest,
-                                     L"ReactOS Version %S\n"
-                                     L"Build %wZ\n"
-                                     L"Reporting NT %u.%u (Build %u%s)\n",
-                                     KERNEL_VERSION_STR,
-                                     &BuildLabString,
+#if defined(_WIN64) && !defined(NEW_VISTA)
+                                     L"Republic of CATV 95 x64 Edition Version %u.%u (Build %u%s)\n",
+#else
+                                     L"Republic of CATV 95 Version %u.%u (Build %u%s)\n",
+#endif
                                      SharedUserData->NtMajorVersion,
                                      SharedUserData->NtMinorVersion,
                                      (VerInfo.dwBuildNumber & 0xFFFF),
                                      VersionBuffer);
+
 
         if (AppendNtSystemRoot && NT_SUCCESS(Status))
         {
@@ -476,7 +475,11 @@ GetSystemVersionString(OUT PWSTR pwszzVersion,
         /* Fall-back string */
         Status = RtlStringCchPrintfW(pwszzVersion,
                                      cchDest,
-                                     L"ReactOS Version %S %wZ\n",
+#if defined(_WIN64) && !defined(NEW_VISTA)
+                                     L"Republic of CATV 95 x64 Edition Version %S %wZ\n",
+#else
+                                     L"Republic of CATV 95 Version %S %wZ\n",
+#endif
                                      KERNEL_VERSION_STR,
                                      &BuildLabString);
         if (!NT_SUCCESS(Status))

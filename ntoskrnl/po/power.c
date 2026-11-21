@@ -446,6 +446,24 @@ PopRestoreWorkingPowerState(
     return Status;
 }
 
+/*
+ * Entering a sleeping state (S1-S3 for sleep, S4 for hibernation) moves all
+ * devices to a low power state. When it does not work out, or when the system
+ * comes back, the devices have to be put back to D0 here.
+ */
+static
+BOOLEAN
+PopMustRestoreWorkingPowerState(
+    _In_ SYSTEM_POWER_STATE PowerState,
+    _In_ POWER_ACTION PowerAction)
+{
+    if (PowerAction == PowerActionSleep)
+        return TRUE;
+
+    return (PowerAction == PowerActionHibernate) &&
+           (PowerState != PowerSystemWorking);
+}
+
 NTSTATUS
 NTAPI
 PopSetSystemPowerState(
@@ -458,6 +476,7 @@ PopSetSystemPowerState(
     DEVICETREE_TRAVERSE_CONTEXT Context;
     POWER_STATE_TRAVERSE_CONTEXT PowerContext;
     NTSTATUS RestoreStatus;
+    BOOLEAN Restore = PopMustRestoreWorkingPowerState(PowerState, PowerAction);
 
     if (PowerAction == PowerActionSleep && !PopAcpiPresent)
     {
@@ -510,7 +529,7 @@ PopSetSystemPowerState(
 
     /* Set system power change */
     Status = PopTraverseSystemPowerState(PowerState, PowerAction, Fdo);
-    if (!NT_SUCCESS(Status) && PowerAction == PowerActionSleep)
+    if (!NT_SUCCESS(Status) && Restore)
     {
         DPRINT1("Setting device power state failed: 0x%lx\n", Status);
         RestoreStatus = PopTraverseSystemPowerState(PowerSystemWorking,
@@ -526,6 +545,16 @@ PopSetSystemPowerState(
 
     if (!PopAcpiPresent)
     {
+        /* Without ACPI nobody can enter the state: the devices stay in D0 */
+        if (Restore)
+        {
+            RestoreStatus = PopTraverseSystemPowerState(PowerSystemWorking,
+                                                        PowerAction,
+                                                        Fdo);
+            if (!NT_SUCCESS(RestoreStatus))
+                DPRINT1("Restoring device power states failed: 0x%lx\n",
+                        RestoreStatus);
+        }
         if (Fdo != NULL)
             ObDereferenceObject(Fdo);
         return STATUS_NOT_IMPLEMENTED;
@@ -536,11 +565,15 @@ PopSetSystemPowerState(
         if (PowerAction != PowerActionShutdownReset)
         {
             Status = PopSendSetSystemPowerState(Fdo, PowerState, PowerAction);
-            if (!NT_SUCCESS(Status) && PowerAction != PowerActionSleep)
+            if (!NT_SUCCESS(Status) && !Restore)
                 DPRINT1("Setting system power state failed: 0x%lx\n", Status);
         }
 
-        if (PowerAction == PowerActionSleep)
+        /*
+         * For sleep this is the wake-up. For hibernation the machine normally
+         * powers off here and never returns; if it does, entering S4 failed.
+         */
+        if (Restore)
         {
             if (!NT_SUCCESS(Status))
                 DPRINT1("Entering system power state failed: 0x%lx\n", Status);
@@ -554,6 +587,16 @@ PopSetSystemPowerState(
         }
 
         ObDereferenceObject(Fdo);
+    }
+    else if (Restore)
+    {
+        /* No system power driver to talk to, but the devices were lowered */
+        RestoreStatus = PopRestoreWorkingPowerState(PowerAction, NULL);
+        if (!NT_SUCCESS(RestoreStatus))
+            DPRINT1("Restoring working power state failed: 0x%lx\n",
+                    RestoreStatus);
+        if (NT_SUCCESS(Status))
+            Status = RestoreStatus;
     }
 
     return Status;
@@ -609,14 +652,15 @@ PoInitSystem(_In_ ULONG BootPhase)
     /* Initialize the power capabilities */
     RtlZeroMemory(&PopCapabilities, sizeof(SYSTEM_POWER_CAPABILITIES));
 
-    /* Get the Command Line */
-    CommandLine = KeLoaderBlock->LoadOptions;
+    /* Get the command line. Some boot paths provide no load-options string. */
+    CommandLine = (KeLoaderBlock != NULL) ? KeLoaderBlock->LoadOptions : NULL;
 
-    /* Upcase it */
-    _strupr(CommandLine);
-
-    /* Check for ACPI disable */
-    if (strstr(CommandLine, "NOACPI")) ForceAcpiDisable = TRUE;
+    /* Upcase and inspect it only when the loader supplied one. */
+    if (CommandLine != NULL)
+    {
+        _strupr(CommandLine);
+        if (strstr(CommandLine, "NOACPI")) ForceAcpiDisable = TRUE;
+    }
 
     if (ForceAcpiDisable)
     {
@@ -626,7 +670,9 @@ PoInitSystem(_In_ ULONG BootPhase)
     else
     {
         /* Otherwise check if the LoaderBlock has a ACPI Table  */
-        PopAcpiPresent = KeLoaderBlock->Extension->AcpiTable != NULL ? TRUE : FALSE;
+        PopAcpiPresent = (KeLoaderBlock != NULL &&
+                         KeLoaderBlock->Extension != NULL &&
+                         KeLoaderBlock->Extension->AcpiTable != NULL);
     }
 
     /* Enable shutdown by power button */
@@ -642,6 +688,14 @@ PoInitSystem(_In_ ULONG BootPhase)
 
     /* Initialize support for shutdown waits and work-items */
     PopInitShutdownList();
+
+    /* Hibernation state must exist before power requests can enter S4. */
+    {
+        NTSTATUS HiberStatus = PopHiberInitSystem();
+        if (!NT_SUCCESS(HiberStatus))
+            DPRINT1("PopHiberInitSystem failed (0x%08lx); hibernation disabled\n",
+                    HiberStatus);
+    }
 
     return TRUE;
 }
@@ -1324,6 +1378,29 @@ NtSetThreadExecutionState(_In_ EXECUTION_STATE esFlags,
     return STATUS_SUCCESS;
 }
 
+/*
+ * The system time stood still while the machine was off. Take the time of the
+ * RTC, the same way as boot does.
+ */
+static
+VOID
+PopResyncSystemTimeAfterResume(VOID)
+{
+    TIME_FIELDS TimeFields;
+    LARGE_INTEGER LocalTime, SystemTime, OldTime;
+
+    if (!HalQueryRealTimeClock(&TimeFields) ||
+        !RtlTimeFieldsToTime(&TimeFields, &LocalTime))
+    {
+        DPRINT1("Could not read the RTC after resume\n");
+        return;
+    }
+
+    ExLocalTimeToSystemTime(&LocalTime, &SystemTime);
+    KeSetSystemTime(&SystemTime, &OldTime, FALSE, NULL);
+    PoNotifySystemTimeSet();
+}
+
 NTSTATUS
 NTAPI
 NtSetSystemPowerState(_In_ POWER_ACTION SystemAction,
@@ -1507,6 +1584,7 @@ NtSetSystemPowerState(_In_ POWER_ACTION SystemAction,
                 NTSTATUS InvalidateStatus;
 
                 PopHiberContext->ResumeFlag = 0;
+                PopResyncSystemTimeAfterResume();
                 Status = PopSetSystemPowerState(PowerSystemWorking,
                                                 PowerActionHibernate);
 

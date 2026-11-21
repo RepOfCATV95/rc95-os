@@ -132,7 +132,7 @@ PoUnregisterPowerSettingCallback(
 #endif /* (NTDDI_VERSION >= NTDDI_VISTA) */
 
 #if (NTDDI_VERSION >= NTDDI_VISTASP1)
-NTKERNELAPI
+NTKRNLVISTAAPI
 VOID
 NTAPI
 PoSetDeviceBusyEx(
@@ -141,13 +141,13 @@ PoSetDeviceBusyEx(
 
 #if (NTDDI_VERSION >= NTDDI_WIN7)
 
-NTKERNELAPI
+NTKRNLVISTAAPI
 VOID
 NTAPI
 PoStartDeviceBusy(
   _Inout_ PULONG IdlePointer);
 
-NTKERNELAPI
+NTKRNLVISTAAPI
 VOID
 NTAPI
 PoEndDeviceBusy(
@@ -162,14 +162,14 @@ PoQueryWatchdogTime(
   _Out_ PULONG SecondsRemaining);
 
 _IRQL_requires_max_(APC_LEVEL)
-NTKERNELAPI
+NTKRNLVISTAAPI
 VOID
 NTAPI
 PoDeletePowerRequest(
   _Inout_ PVOID PowerRequest);
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
-NTKERNELAPI
+NTKRNLVISTAAPI
 NTSTATUS
 NTAPI
 PoSetPowerRequest(
@@ -177,7 +177,7 @@ PoSetPowerRequest(
   _In_ POWER_REQUEST_TYPE Type);
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
-NTKERNELAPI
+NTKRNLVISTAAPI
 NTSTATUS
 NTAPI
 PoClearPowerRequest(
@@ -185,7 +185,7 @@ PoClearPowerRequest(
   _In_ POWER_REQUEST_TYPE Type);
 
 _IRQL_requires_max_(APC_LEVEL)
-NTKERNELAPI
+NTKRNLVISTAAPI
 NTSTATUS
 NTAPI
 PoCreatePowerRequest(

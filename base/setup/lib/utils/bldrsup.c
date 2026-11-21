@@ -19,7 +19,6 @@
 #define NDEBUG
 #include <debug.h>
 
-
 /* GLOBALS ******************************************************************/
 
 typedef NTSTATUS
@@ -392,7 +391,7 @@ CreateCommonFreeLdrSections(
     IniSection = IniAddSection(BootStore->IniCache, L"Display");
 
     /* TitleText and MinimalUI */
-    IniAddKey(IniSection, L"TitleText", L"ReactOS Boot Manager");
+    IniAddKey(IniSection, L"TitleText", L"Republic of CATV 95 Boot Manager");
     IniAddKey(IniSection, L"MinimalUI", L"Yes");
 
     /*
@@ -1062,7 +1061,7 @@ CreateNTOSEntry(
         PNTOS_OPTIONS Options = (PNTOS_OPTIONS)&BootEntry->OsOptions;
 
         /* BootType, SystemPath and Options */
-        IniAddKey(IniSection, L"BootType", L"Windows2003");
+        IniAddKey(IniSection, L"BootType", L"Windows");
         IniAddKey(IniSection, L"SystemPath", Options->OsLoadPath);
         IniAddKey(IniSection, L"Options", Options->OsLoadOptions);
     }
@@ -1489,10 +1488,10 @@ FreeLdrEnumerateBootEntries(
         }
 
         // TODO: What to do with "Windows" ; "WindowsNT40" ; "ReactOSSetup" ?
-        if ((_wcsicmp(KeyData, L"Windows2003")     == 0) ||
-            (_wcsicmp(KeyData, L"\"Windows2003\"") == 0))
+        if ((_wcsicmp(KeyData, L"Windows")     == 0) ||
+            (_wcsicmp(KeyData, L"\"Windows\"") == 0))
         {
-            /* BootType is Windows2003 */
+            /* BootType is Windows */
             PNTOS_OPTIONS Options = (PNTOS_OPTIONS)&BootEntry->OsOptions;
 
             DPRINT("This is a '%S' boot entry\n", KeyData);

@@ -1030,6 +1030,12 @@ KiSaveProcessorControlState(
 
 VOID
 NTAPI
+KiRestoreProcessorMsrState(
+    VOID
+);
+
+VOID
+NTAPI
 KiSaveProcessorState(
     _In_ PKTRAP_FRAME TrapFrame,
     _In_ PKEXCEPTION_FRAME ExceptionFrame);

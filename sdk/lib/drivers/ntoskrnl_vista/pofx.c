@@ -4,6 +4,12 @@
 
 #define TAG_POFX 'xFoP'
 
+/*
+ * Keep the allocation arithmetic valid on both 32-bit and 64-bit builds.
+ * MAXULONG_PTR is not consistently exposed by all supported WDK/NDK
+ * header combinations; SIZE_T is the native allocation-size type.
+ */
+
 typedef struct _POFX_COMPONENT_STATE
 {
     ULONG IdleStateCount;
@@ -11,6 +17,7 @@ typedef struct _POFX_COMPONENT_STATE
     ULONG ActiveCount;
     ULONG RequestedIdleState;
     ULONG CurrentIdleState;
+    BOOLEAN ActiveConditionPending;
     BOOLEAN IdleConditionPending;
     BOOLEAN IdleStatePending;
     BOOLEAN InIdleState;
@@ -137,9 +144,16 @@ PofxpNotifyDeviceIdle(
     {
         Callback = Device->DevicePowerNotRequiredCallback;
         if (Callback != NULL)
+        {
+            /* The callback completes this request asynchronously. */
             Device->PowerNotRequiredPending = TRUE;
+        }
         else
+        {
+            /* With no callback there is no device-specific transition. */
             Device->PowerNotRequired = TRUE;
+            Device->PoweredOn = FALSE;
+        }
     }
     KeReleaseSpinLock(&PofxLock, OldIrql);
 
@@ -169,9 +183,9 @@ PoFxRegisterDevice(
 
     *Handle = NULL;
 
-    if (Device->ComponentCount >
-        (MAXULONG_PTR - FIELD_OFFSET(POFX_DEVICE_CONTEXT, Components)) /
-            sizeof(POFX_COMPONENT_STATE))
+    if ((SIZE_T)Device->ComponentCount >
+        (((SIZE_T)-1 - FIELD_OFFSET(POFX_DEVICE_CONTEXT, Components)) /
+         sizeof(POFX_COMPONENT_STATE)))
     {
         return STATUS_INVALID_PARAMETER;
     }
@@ -188,7 +202,8 @@ PoFxRegisterDevice(
     }
 
     AllocationSize = FIELD_OFFSET(POFX_DEVICE_CONTEXT, Components) +
-                    Device->ComponentCount * sizeof(POFX_COMPONENT_STATE);
+                    ((SIZE_T)Device->ComponentCount *
+                     sizeof(POFX_COMPONENT_STATE));
     Context = ExAllocatePoolWithTag(NonPagedPool, AllocationSize, TAG_POFX);
     if (Context == NULL)
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -206,6 +221,7 @@ PoFxRegisterDevice(
         Device->DevicePowerNotRequiredCallback;
     Context->PowerControlCallback = Device->PowerControlCallback;
     Context->DeviceContext = Device->DeviceContext;
+    Context->PoweredOn = TRUE;
 
     for (i = 0; i < Device->ComponentCount; ++i)
     {
@@ -213,6 +229,7 @@ PoFxRegisterDevice(
             Device->Components[i].IdleStateCount;
         Context->Components[i].DeepestWakeableIdleState =
             Device->Components[i].DeepestWakeableIdleState;
+        Context->Components[i].ActiveCount = 1;
     }
 
     KeAcquireSpinLock(&PofxLock, &OldIrql);
@@ -266,8 +283,9 @@ PoFxStartDevicePowerManagement(
     _In_ POHANDLE Handle)
 {
     KIRQL OldIrql;
+    ULONG i;
     PPOFX_DEVICE_CONTEXT Context = PofxpReferenceDevice(Handle);
-    PPO_FX_DEVICE_POWER_REQUIRED_CALLBACK Callback = NULL;
+    BOOLEAN AlreadyStarted = FALSE;
 
     if (Context == NULL)
     {
@@ -279,18 +297,54 @@ PoFxStartDevicePowerManagement(
     if (!Context->Started)
     {
         Context->Started = TRUE;
-        Callback = Context->DevicePowerRequiredCallback;
-        if (Callback == NULL)
-            Context->PoweredOn = TRUE;
     }
     else
     {
-        DPRINT1("PoFxStartDevicePowerManagement: device already started\n");
+        AlreadyStarted = TRUE;
     }
     KeReleaseSpinLock(&PofxLock, OldIrql);
 
-    if (Callback != NULL)
-        Callback(Context->DeviceContext);
+    if (AlreadyStarted)
+    {
+        DPRINT1("PoFxStartDevicePowerManagement: device already started\n");
+        PofxpDereferenceDevice(Context);
+        return;
+    }
+
+    for (i = 0; i < Context->ComponentCount; ++i)
+    {
+        PPOFX_COMPONENT_STATE ComponentState;
+        PPO_FX_COMPONENT_IDLE_CONDITION_CALLBACK IdleCallback = NULL;
+        PPO_FX_COMPONENT_IDLE_STATE_CALLBACK StateCallback = NULL;
+        ULONG State = 0;
+        BOOLEAN CompleteIdleCondition = FALSE;
+
+        KeAcquireSpinLock(&PofxLock, &OldIrql);
+        ComponentState = &Context->Components[i];
+
+        if (ComponentState->ActiveCount != 0 &&
+            --ComponentState->ActiveCount == 0)
+        {
+            ComponentState->IdleConditionPending = TRUE;
+            ComponentState->InIdleState = FALSE;
+            IdleCallback = Context->ComponentIdleConditionCallback;
+            if (IdleCallback == NULL)
+            {
+                PofxpCompleteIdleConditionLocked(Context,
+                                                  i,
+                                                  &StateCallback,
+                                                  &State);
+                CompleteIdleCondition = TRUE;
+            }
+        }
+
+        KeReleaseSpinLock(&PofxLock, OldIrql);
+
+        if (IdleCallback != NULL)
+            IdleCallback(Context->DeviceContext, i);
+        else if (CompleteIdleCondition && StateCallback != NULL)
+            StateCallback(Context->DeviceContext, i, State);
+    }
 
     PofxpNotifyDeviceIdle(Context);
     PofxpDereferenceDevice(Context);
@@ -338,18 +392,26 @@ PoFxActivateComponent(
 
     if (ComponentState->ActiveCount++ == 0)
     {
+        ComponentState->ActiveConditionPending =
+            (Context->ComponentActiveConditionCallback != NULL);
         ComponentState->IdleConditionPending = FALSE;
         ComponentState->IdleStatePending = FALSE;
         ComponentState->InIdleState = FALSE;
-        Callback = Context->ComponentActiveConditionCallback;
         if (Context->PowerNotRequired || Context->PowerNotRequiredPending)
         {
+            /* Cancel a not-required completion before requesting power. */
             Context->PowerNotRequired = FALSE;
             Context->PowerNotRequiredPending = FALSE;
             Context->PoweredOn = FALSE;
             PowerRequiredCallback = Context->DevicePowerRequiredCallback;
             if (PowerRequiredCallback == NULL)
                 Context->PoweredOn = TRUE;
+        }
+
+        if (Context->PoweredOn && ComponentState->ActiveConditionPending)
+        {
+            ComponentState->ActiveConditionPending = FALSE;
+            Callback = Context->ComponentActiveConditionCallback;
         }
     }
     KeReleaseSpinLock(&PofxLock, OldIrql);
@@ -441,6 +503,7 @@ PoFxIdleComponent(
 
     if (--ComponentState->ActiveCount == 0)
     {
+        ComponentState->ActiveConditionPending = FALSE;
         ComponentState->IdleConditionPending = TRUE;
         ComponentState->InIdleState = FALSE;
         IdleCallback = Context->ComponentIdleConditionCallback;
@@ -585,6 +648,7 @@ PoFxReportDevicePoweredOn(
     _In_ POHANDLE Handle)
 {
     KIRQL OldIrql;
+    ULONG i;
     PPOFX_DEVICE_CONTEXT Context = PofxpReferenceDevice(Handle);
 
     if (Context == NULL)
@@ -596,6 +660,24 @@ PoFxReportDevicePoweredOn(
     KeAcquireSpinLock(&PofxLock, &OldIrql);
     Context->PoweredOn = TRUE;
     KeReleaseSpinLock(&PofxLock, OldIrql);
+
+    for (i = 0; i < Context->ComponentCount; ++i)
+    {
+        PPO_FX_COMPONENT_ACTIVE_CONDITION_CALLBACK Callback = NULL;
+
+        KeAcquireSpinLock(&PofxLock, &OldIrql);
+        if (Context->Components[i].ActiveConditionPending &&
+            Context->Components[i].ActiveCount != 0)
+        {
+            Context->Components[i].ActiveConditionPending = FALSE;
+            Callback = Context->ComponentActiveConditionCallback;
+        }
+        KeReleaseSpinLock(&PofxLock, OldIrql);
+
+        if (Callback != NULL)
+            Callback(Context->DeviceContext, i);
+    }
+
     PofxpNotifyDeviceIdle(Context);
     PofxpDereferenceDevice(Context);
 }

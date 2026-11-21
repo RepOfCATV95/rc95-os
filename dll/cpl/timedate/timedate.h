@@ -50,7 +50,7 @@ extern HINSTANCE hApplet;
 /* dateandtime.c */
 INT_PTR CALLBACK DateTimePageProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam);
 BOOL SystemSetLocalTime(LPSYSTEMTIME lpSystemTime);
-
+VOID ValidateForCorrectTime(SYSTEMTIME* stTime);
 
 /* timezone.c */
 INT_PTR CALLBACK TimeZonePageProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam);
