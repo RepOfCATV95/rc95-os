@@ -30,6 +30,9 @@ static KSPIN_LOCK PopHiberLock;
 static BOOLEAN PopHiberInitialized;
 extern PLOADER_PARAMETER_BLOCK KeLoaderBlock;
 
+/* Polled disk writer for the image, see the file for details */
+#include "hibdump.inc"
+
 typedef struct _POP_HIBER_SERIALIZATION_CONTEXT
 {
     PPOP_HIBER_CONTEXT HiberContext;
@@ -209,6 +212,10 @@ PopHiberWriteAt(
 
     if (Offset > 0x7FFFFFFFFFFFFFFFULL)
         return STATUS_INTEGER_OVERFLOW;
+
+    /* At DISPATCH_LEVEL with interrupts off: no file system, no I/O manager */
+    if (Context->DumpStackActive)
+        return PopDumpStackWrite(Context->DumpStack, Offset, Buffer, Length);
 
     FileOffset.QuadPart = (LONGLONG)Offset;
     Status = ZwWriteFile(Context->LinkFileHandle,
@@ -728,8 +735,9 @@ PopHiberSystemHandler(
 #else
     PPOP_HIBER_CONTEXT Context = SystemContext;
     BOOLEAN Interrupts;
+    BOOLEAN UseDumpStack;
     KIRQL OldIrql;
-    NTSTATUS Status;
+    NTSTATUS Status, FlushStatus;
 
     if (Context == NULL)
         return STATUS_INVALID_PARAMETER;
@@ -755,15 +763,24 @@ PopHiberSystemHandler(
     RtlZeroMemory(Context->WakeState, sizeof(*Context->WakeState));
 
     /*
+     * Try to get a dump stack for the hibernation file. With one, the whole
+     * image is written at DISPATCH_LEVEL with interrupts off, so memory does
+     * not change while it is saved. Without one (no legacy IDE disk, ...)
+     * the image is written through the file system at PASSIVE_LEVEL, as
+     * before. This has to be done now, it needs PASSIVE_LEVEL.
+     */
+    UseDumpStack = NT_SUCCESS(PopDumpStackInitialize(Context));
+
+    /*
      * Capture the processor and FPU state at DISPATCH_LEVEL with interrupts
      * off: no thread switch, DPC or interrupt handler may change the
      * registers between the capture, the test of ResumeFlag below and the
      * copy into the image header. The IRQL is part of the captured state
      * (CR8 on amd64), so the resumed system comes back at DISPATCH_LEVEL too.
      *
-     * Interrupts and the IRQL are put back before the image is written. That
-     * part needs ZwWriteFile, which must run at PASSIVE_LEVEL with working
-     * disk interrupts, so it can't be done at DISPATCH_LEVEL.
+     * With a dump stack IRQL and interrupts stay like this until the image
+     * is written. Without one they are put back before, since ZwWriteFile
+     * needs PASSIVE_LEVEL and working disk interrupts.
      *
      * The captured context has IF clear, so the resumed system also arrives
      * here with interrupts off and leaves at the same place.
@@ -779,6 +796,14 @@ PopHiberSystemHandler(
      */
     if (Context->ResumeFlag)
     {
+        /*
+         * The image was taken while the dump stack was active. On this
+         * machine the disk is not in the state it expects, and the stack
+         * (allocated before the image was taken) is no longer needed.
+         */
+        Context->DumpStackActive = FALSE;
+        PopDumpStackFree(Context);
+
         Status = PopHiberRestoreProcessorState(Context);
         KeRestoreInterrupts(Interrupts);
         KeLowerIrql(OldIrql);
@@ -790,6 +815,7 @@ PopHiberSystemHandler(
     {
         KeRestoreInterrupts(Interrupts);
         KeLowerIrql(OldIrql);
+        PopDumpStackFree(Context);
         return STATUS_NOT_SUPPORTED;
     }
 #endif
@@ -861,15 +887,34 @@ PopHiberSystemHandler(
                   Context->WakeState,
                   sizeof(*Context->WakeState));
 
-    /* The state is complete; the rest of the work is file I/O at PASSIVE_LEVEL */
-    KeRestoreInterrupts(Interrupts);
-    KeLowerIrql(OldIrql);
+    if (UseDumpStack)
+    {
+        /* Everything from here on is written by polling, at this IRQL */
+        Context->DumpStackActive = TRUE;
+    }
+    else
+    {
+        /* The state is complete; the rest is file I/O at PASSIVE_LEVEL */
+        KeRestoreInterrupts(Interrupts);
+        KeLowerIrql(OldIrql);
+    }
 
     Status = PopSaveHiberContextStates(Context);
-    if (!NT_SUCCESS(Status))
-        return Status;
+    if (NT_SUCCESS(Status))
+        Status = PopHiberSerializeMemory(Context);
 
-    Status = PopHiberSerializeMemory(Context);
+    if (UseDumpStack)
+    {
+        FlushStatus = PopDumpStackFlush(Context->DumpStack);
+        Context->DumpStackActive = FALSE;
+        KeRestoreInterrupts(Interrupts);
+        KeLowerIrql(OldIrql);
+        PopDumpStackFree(Context);
+
+        if (NT_SUCCESS(Status))
+            Status = FlushStatus;
+    }
+
     if (NT_SUCCESS(Status))
         PopHiberUpdateComplete(100);
 
@@ -898,6 +943,14 @@ PopHiberWriteImageHeader(
     Context->ImageHeader.CheckSum = 0;
     Context->ImageHeader.CheckSum =
         PopHiberCalculateHeaderChecksum(&Context->ImageHeader);
+
+    if (Context->DumpStackActive)
+    {
+        return PopDumpStackWrite(Context->DumpStack,
+                                 0,
+                                 &Context->ImageHeader,
+                                 sizeof(Context->ImageHeader));
+    }
 
     FileOffset.QuadPart = 0;
     Status = ZwWriteFile(Context->LinkFileHandle,

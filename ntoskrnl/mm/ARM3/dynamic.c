@@ -75,7 +75,7 @@ MmGetPhysicalMemoryRanges(VOID)
     ULONG Size, i;
     PPHYSICAL_MEMORY_RANGE Entry, Buffer;
     KIRQL OldIrql;
-    ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+    ASSERT(KeGetCurrentIrql() <= DISPATCH_LEVEL);
 
     //
     // Calculate how much memory we'll need

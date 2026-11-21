@@ -91,6 +91,7 @@ typedef struct _POP_HIBER_CONTEXT
     ULONG HiberPercentComplete;
     BOOLEAN HiberStatusScreenInitialized;
     volatile ULONG ResumeFlag;
+    volatile BOOLEAN DumpStackActive;
 } POP_HIBER_CONTEXT, *PPOP_HIBER_CONTEXT;
 
 NTSTATUS
