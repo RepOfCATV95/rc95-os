@@ -158,6 +158,7 @@ typedef struct {
     btrfs_chunk* c;
     LIST_ENTRY items;
     LIST_ENTRY list_entry;
+    bool allocation_failed;
 } btrfs_root;
 
 typedef struct {
@@ -242,10 +243,42 @@ typedef BOOLEAN (NTAPI* PFMIFSCALLBACK)(CALLBACKCOMMAND Command, ULONG SubAction
 
 #endif // __REACTOS__
 
-#ifndef __REACTOS__
-NTSTATUS WINAPI ChkdskEx(PUNICODE_STRING DriveRoot, BOOLEAN FixErrors, BOOLEAN Verbose, BOOLEAN CheckOnlyIfDirty,
-                         BOOLEAN ScanDrive, PFMIFSCALLBACK Callback) {
-#else
+#ifdef __REACTOS__
+static BOOLEAN
+BtrfsCheckSuperblockChecksum(const superblock *Sb)
+{
+    const uint8_t *Data = (const uint8_t *)&Sb->uuid;
+    ULONG DataLength = (ULONG)sizeof(superblock) - sizeof(Sb->checksum);
+
+    switch (Sb->csum_type)
+    {
+        case CSUM_TYPE_CRC32C:
+        {
+            uint32_t Checksum = ~calc_crc32c_sw(0xffffffff, (uint8_t *)Data, DataLength);
+            return Checksum == *(const uint32_t *)Sb->checksum;
+        }
+        case CSUM_TYPE_XXHASH:
+        {
+            uint64_t Checksum = XXH64(Data, DataLength, 0);
+            return Checksum == *(const uint64_t *)Sb->checksum;
+        }
+        case CSUM_TYPE_SHA256:
+        {
+            uint8_t Hash[SHA256_HASH_SIZE];
+            calc_sha256(Hash, Data, DataLength);
+            return RtlCompareMemory(Hash, Sb->checksum, sizeof(Hash)) == sizeof(Hash);
+        }
+        case CSUM_TYPE_BLAKE2:
+        {
+            uint8_t Hash[BLAKE2_HASH_SIZE];
+            blake2b(Hash, sizeof(Hash), Data, DataLength);
+            return RtlCompareMemory(Hash, Sb->checksum, sizeof(Hash)) == sizeof(Hash);
+        }
+        default:
+            return FALSE;
+    }
+}
+
 BOOLEAN
 NTAPI
 BtrfsChkdsk(
@@ -261,31 +294,200 @@ BtrfsChkdsk(
     IN PVOID pUnknown4,
     IN PULONG ExitStatus)
 {
-#endif
-    // STUB
+    HANDLE VolumeHandle = NULL;
+    OBJECT_ATTRIBUTES Attributes;
+    IO_STATUS_BLOCK IoStatus;
+    GET_LENGTH_INFORMATION LengthInfo;
+    superblock *Sb = NULL, *Best = NULL;
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    ULONG i, ValidCount = 0;
+    BOOLEAN Success = FALSE;
+    static const ULONGLONG SuperOffsets[] = {
+        0x10000ULL, 0x4000000ULL, 0x4000000000ULL, 0x4000000000000ULL
+    };
 
-    if (Callback) {
-        TEXTOUTPUT TextOut;
+    UNREFERENCED_PARAMETER(Verbose);
+    UNREFERENCED_PARAMETER(CheckOnlyIfDirty);
+    UNREFERENCED_PARAMETER(ScanDrive);
+    UNREFERENCED_PARAMETER(pUnknown1);
+    UNREFERENCED_PARAMETER(pUnknown2);
+    UNREFERENCED_PARAMETER(pUnknown3);
+    UNREFERENCED_PARAMETER(pUnknown4);
 
-        TextOut.Lines = 1;
-        TextOut.Output = "stub, not implemented";
+    if (ExitStatus)
+        *ExitStatus = (ULONG)STATUS_UNSUCCESSFUL;
 
-        Callback(OUTPUT, 0, &TextOut);
+    if (Callback)
+    {
+        TEXTOUTPUT Message;
+        Message.Lines = 1;
+        Message.Output = "Btrfs consistency checking is experimental and currently validates superblocks only.";
+        Callback(OUTPUT, 0, &Message);
     }
 
-#ifndef __REACTOS__
-    return STATUS_SUCCESS;
-#else
-    *ExitStatus = (ULONG)STATUS_SUCCESS;
-    return TRUE;
-#endif
+    if (FixErrors && Callback)
+    {
+        TEXTOUTPUT Warning;
+        Warning.Lines = 2;
+        Warning.Output = "WARNING: Btrfs repair is experimental. This checker will not modify the volume; make a verified backup before attempting repair.";
+        Callback(OUTPUT, 0, &Warning);
+    }
+
+    if (!DriveRoot || !DriveRoot->Buffer || DriveRoot->Length == 0 ||
+        DriveRoot->Length > DriveRoot->MaximumLength)
+    {
+        Status = STATUS_INVALID_PARAMETER;
+        goto Done;
+    }
+
+    /* No metadata writes are implemented; refuse repair requests explicitly. */
+    if (FixErrors)
+    {
+        Status = STATUS_NOT_SUPPORTED;
+        goto Done;
+    }
+
+    InitializeObjectAttributes(&Attributes, DriveRoot, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    Status = NtOpenFile(&VolumeHandle,
+                        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                        &Attributes, &IoStatus, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        FILE_SYNCHRONOUS_IO_ALERT);
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(IoStatus.Status))
+    {
+        if (NT_SUCCESS(Status)) Status = IoStatus.Status;
+        goto Done;
+    }
+
+    Status = NtDeviceIoControlFile(VolumeHandle, NULL, NULL, NULL, &IoStatus,
+                                   IOCTL_DISK_GET_LENGTH_INFO, NULL, 0,
+                                   &LengthInfo, sizeof(LengthInfo));
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(IoStatus.Status) ||
+        IoStatus.Information < sizeof(LengthInfo))
+    {
+        if (NT_SUCCESS(Status))
+            Status = NT_SUCCESS(IoStatus.Status) ? STATUS_DEVICE_DATA_ERROR : IoStatus.Status;
+        goto Done;
+    }
+
+    if (LengthInfo.Length.QuadPart < 0x10000 + sizeof(superblock))
+    {
+        Status = STATUS_DISK_CORRUPT_ERROR;
+        goto Done;
+    }
+
+    Sb = malloc(sizeof(superblock));
+    if (!Sb)
+    {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        goto Done;
+    }
+
+    for (i = 0; i < (sizeof(SuperOffsets) / sizeof(SuperOffsets[0])); ++i)
+    {
+        LARGE_INTEGER Offset;
+        if (SuperOffsets[i] > (ULONGLONG)LengthInfo.Length.QuadPart ||
+            sizeof(superblock) > (ULONGLONG)LengthInfo.Length.QuadPart - SuperOffsets[i])
+            continue;
+
+        Offset.QuadPart = (LONGLONG)SuperOffsets[i];
+        RtlZeroMemory(Sb, sizeof(superblock));
+        Status = NtReadFile(VolumeHandle, NULL, NULL, NULL, &IoStatus,
+                            Sb, sizeof(superblock), &Offset, NULL);
+        if (!NT_SUCCESS(Status) || !NT_SUCCESS(IoStatus.Status) ||
+            IoStatus.Information != sizeof(superblock))
+        {
+            if (NT_SUCCESS(Status))
+                Status = NT_SUCCESS(IoStatus.Status) ? STATUS_DEVICE_DATA_ERROR : IoStatus.Status;
+            continue;
+        }
+
+        if (Sb->magic != BTRFS_MAGIC || Sb->sb_phys_addr != SuperOffsets[i] ||
+            !BtrfsCheckSuperblockChecksum(Sb))
+        {
+            Status = STATUS_DISK_CORRUPT_ERROR;
+            continue;
+        }
+
+        if (Sb->sector_size < 512 || Sb->sector_size > 65536 ||
+            (Sb->sector_size & (Sb->sector_size - 1)) != 0 ||
+            Sb->node_size < Sb->sector_size || Sb->node_size > 65536 ||
+            (Sb->node_size & (Sb->node_size - 1)) != 0 ||
+            Sb->leaf_size != Sb->node_size || Sb->stripe_size == 0 ||
+            Sb->total_bytes == 0 || Sb->bytes_used > Sb->total_bytes ||
+            Sb->num_devices == 0 || Sb->root_tree_addr == 0 ||
+            Sb->chunk_tree_addr == 0)
+        {
+            Status = STATUS_DISK_CORRUPT_ERROR;
+            continue;
+        }
+
+        ++ValidCount;
+        if (!Best || Sb->generation > Best->generation)
+        {
+            if (!Best)
+                Best = malloc(sizeof(superblock));
+            if (!Best)
+            {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                goto Done;
+            }
+            RtlCopyMemory(Best, Sb, sizeof(superblock));
+        }
+    }
+
+    if (ValidCount == 0 || !Best)
+    {
+        Status = STATUS_DISK_CORRUPT_ERROR;
+        goto Done;
+    }
+
+    Status = STATUS_SUCCESS;
+    Success = TRUE;
+    if (Callback)
+    {
+        TEXTOUTPUT Message;
+        Message.Lines = 1;
+        Message.Output = "Btrfs superblock check completed. Tree, extent, checksum-tree and free-space consistency have not yet been verified.";
+        Callback(OUTPUT, 0, &Message);
+    }
+
+Done:
+    if (Best) free(Best);
+    if (Sb) free(Sb);
+    if (VolumeHandle) NtClose(VolumeHandle);
+    if (ExitStatus) *ExitStatus = (ULONG)Status;
+    if (Callback)
+        Callback(DONE, 0, &Success);
+    return Success;
 }
+#else
+NTSTATUS WINAPI ChkdskEx(PUNICODE_STRING DriveRoot, BOOLEAN FixErrors, BOOLEAN Verbose, BOOLEAN CheckOnlyIfDirty,
+                         BOOLEAN ScanDrive, PFMIFSCALLBACK Callback)
+{
+    UNREFERENCED_PARAMETER(DriveRoot);
+    UNREFERENCED_PARAMETER(FixErrors);
+    UNREFERENCED_PARAMETER(Verbose);
+    UNREFERENCED_PARAMETER(CheckOnlyIfDirty);
+    UNREFERENCED_PARAMETER(ScanDrive);
+    if (Callback)
+    {
+        TEXTOUTPUT Message;
+        Message.Lines = 1;
+        Message.Output = "Btrfs checking is unavailable in this build configuration.";
+        Callback(OUTPUT, 0, &Message);
+    }
+    return STATUS_NOT_IMPLEMENTED;
+}
+#endif
 
 static btrfs_root* add_root(LIST_ENTRY* roots, uint64_t id) {
     btrfs_root* root;
 
     root = malloc(sizeof(btrfs_root));
+    if (!root)
+        return NULL;
 
+    root->allocation_failed = false;
     root->id = id;
     RtlZeroMemory(&root->header, sizeof(tree_header));
     InitializeListHead(&root->items);
@@ -340,29 +542,62 @@ static void add_item(btrfs_root* r, uint64_t obj_id, uint8_t obj_type, uint64_t 
     LIST_ENTRY* le;
     btrfs_item* item;
 
+    if (!r || r->allocation_failed)
+        return;
+
     item = malloc(sizeof(btrfs_item));
+    if (!item) {
+        r->allocation_failed = true;
+        return;
+    }
 
     item->key.obj_id = obj_id;
     item->key.obj_type = obj_type;
     item->key.offset = offset;
     item->size = size;
+    item->data = NULL;
 
-    if (size == 0)
-        item->data = NULL;
-    else {
+    if (size != 0) {
+        if (!data) {
+            free(item);
+            r->allocation_failed = true;
+            return;
+        }
+
         item->data = malloc(size);
+        if (!item->data) {
+            free(item);
+            r->allocation_failed = true;
+            return;
+        }
         memcpy(item->data, data, size);
+    }
+
+    /*
+     * Metadata is commonly generated in key order. Preserve the sorted-list
+     * invariant with an O(1) append in that common case; retain the ordered
+     * insertion fallback for out-of-order keys.
+     */
+    if (r->items.Flink == &r->items) {
+        InsertTailList(&r->items, &item->list_entry);
+        return;
+    }
+
+    {
+        btrfs_item* last = CONTAINING_RECORD(r->items.Blink, btrfs_item, list_entry);
+        if (keycmp(item->key, last->key) > 0) {
+            InsertTailList(&r->items, &item->list_entry);
+            return;
+        }
     }
 
     le = r->items.Flink;
     while (le != &r->items) {
         btrfs_item* i2 = CONTAINING_RECORD(le, btrfs_item, list_entry);
-
-        if (keycmp(item->key, i2->key) != 1) {
+        if (keycmp(item->key, i2->key) <= 0) {
             InsertTailList(le, &item->list_entry);
             return;
         }
-
         le = le->Flink;
     }
 
@@ -373,9 +608,14 @@ static uint64_t find_chunk_offset(uint64_t size, uint64_t offset, btrfs_dev* dev
     uint64_t off;
     DEV_EXTENT de;
 
+    if (dev->last_alloc > dev->dev_item.num_bytes ||
+        size > dev->dev_item.num_bytes - dev->last_alloc ||
+        dev->dev_item.bytes_used > dev->dev_item.num_bytes ||
+        size > dev->dev_item.num_bytes - dev->dev_item.bytes_used)
+        return ~(uint64_t)0;
+
     off = dev->last_alloc;
     dev->last_alloc += size;
-
     dev->dev_item.bytes_used += size;
 
     de.chunktree = BTRFS_ROOT_CHUNK;
@@ -390,16 +630,24 @@ static uint64_t find_chunk_offset(uint64_t size, uint64_t offset, btrfs_dev* dev
 }
 
 static btrfs_chunk* add_chunk(LIST_ENTRY* chunks, uint64_t flags, btrfs_root* chunk_root, btrfs_dev* dev, btrfs_root* dev_root, BTRFS_UUID* chunkuuid, uint32_t sector_size) {
-    uint64_t off, size;
+    uint64_t off, size = 0;
     uint16_t stripes, i;
     btrfs_chunk* c;
     LIST_ENTRY* le;
     CHUNK_ITEM_STRIPE* cis;
 
+    if (!chunks || !chunk_root || !dev || !dev_root || !chunkuuid ||
+        sector_size == 0 || (sector_size & (sector_size - 1)) != 0)
+        return NULL;
+
     off = 0xc00000;
     le = chunks->Flink;
     while (le != chunks) {
         c = CONTAINING_RECORD(le, btrfs_chunk, list_entry);
+
+        if (!c->chunk_item ||
+            c->chunk_item->size > (~(uint64_t)0) - c->offset)
+            return NULL;
 
         if (c->offset + c->chunk_item->size > off)
             off = c->offset + c->chunk_item->size;
@@ -412,23 +660,41 @@ static btrfs_chunk* add_chunk(LIST_ENTRY* chunks, uint64_t flags, btrfs_root* ch
             size = 0x40000000; // 1 GB
         else
             size = 0x10000000; // 256 MB
-    } else if (flags & BLOCK_FLAG_SYSTEM)
+    } else if (flags & BLOCK_FLAG_SYSTEM) {
         size = 0x800000;
+    } else {
+        /* Unknown chunk classes must never inherit an uninitialized size. */
+        return NULL;
+    }
+
+    if (dev->dev_item.bytes_used > dev->dev_item.num_bytes)
+        return NULL;
 
     size = min(size, dev->dev_item.num_bytes / 10); // cap at 10%
     size &= ~(UINT64)(sector_size - 1);
+    if (size == 0)
+        return NULL;
 
     stripes = flags & BLOCK_FLAG_DUPLICATE ? 2 : 1;
 
-    if (dev->dev_item.num_bytes - dev->dev_item.bytes_used < stripes * size) // not enough space
+    if (size > (dev->dev_item.num_bytes - dev->dev_item.bytes_used) / stripes ||
+        dev->last_alloc > dev->dev_item.num_bytes ||
+        size > (dev->dev_item.num_bytes - dev->last_alloc) / stripes ||
+        off > (~(uint64_t)0) - size)
         return NULL;
 
     c = malloc(sizeof(btrfs_chunk));
+    if (!c)
+        return NULL;
     c->offset = off;
     c->lastoff = off;
     c->used = 0;
 
     c->chunk_item = malloc(sizeof(CHUNK_ITEM) + (stripes * sizeof(CHUNK_ITEM_STRIPE)));
+    if (!c->chunk_item) {
+        free(c);
+        return NULL;
+    }
 
     c->chunk_item->size = size;
     c->chunk_item->root_id = BTRFS_ROOT_EXTENT;
@@ -445,6 +711,11 @@ static btrfs_chunk* add_chunk(LIST_ENTRY* chunks, uint64_t flags, btrfs_root* ch
     for (i = 0; i < stripes; i++) {
         cis[i].dev_id = dev->dev_item.dev_id;
         cis[i].offset = find_chunk_offset(size, c->offset, dev, dev_root, chunkuuid);
+        if (cis[i].offset == ~(uint64_t)0) {
+            free(c->chunk_item);
+            free(c);
+            return NULL;
+        }
         cis[i].dev_uuid = dev->dev_item.device_uuid;
     }
 
@@ -590,8 +861,10 @@ static NTSTATUS write_data(HANDLE h, uint64_t address, btrfs_chunk* c, void* dat
         off.QuadPart = cis[i].offset + address - c->offset;
 
         Status = NtWriteFile(h, NULL, NULL, NULL, &iosb, data, size, &off, NULL);
-        if (!NT_SUCCESS(Status))
-            return Status;
+        if (!NT_SUCCESS(Status) || !NT_SUCCESS(iosb.Status))
+            return NT_SUCCESS(Status) ? iosb.Status : Status;
+        if (iosb.Information != size)
+            return STATUS_DEVICE_DATA_ERROR;
     }
 
     return STATUS_SUCCESS;
@@ -861,7 +1134,10 @@ static NTSTATUS write_superblocks(HANDLE h, btrfs_dev* dev, btrfs_root* chunk_ro
         off.QuadPart = superblock_addrs[i];
 
         Status = NtWriteFile(h, NULL, NULL, NULL, &iosb, sb, sblen, &off, NULL);
-        if (!NT_SUCCESS(Status)) {
+        if (!NT_SUCCESS(Status) || !NT_SUCCESS(iosb.Status) ||
+            iosb.Information != sblen) {
+            if (NT_SUCCESS(Status))
+                Status = NT_SUCCESS(iosb.Status) ? STATUS_DEVICE_DATA_ERROR : iosb.Status;
             free(sb);
             return Status;
         }
@@ -961,11 +1237,19 @@ static NTSTATUS clear_first_megabyte(HANDLE h) {
     uint8_t* mb;
 
     mb = malloc(0x100000);
+    if (!mb)
+        return STATUS_INSUFFICIENT_RESOURCES;
     memset(mb, 0, 0x100000);
 
     zero.QuadPart = 0;
 
     Status = NtWriteFile(h, NULL, NULL, NULL, &iosb, mb, 0x100000, &zero, NULL);
+    if (NT_SUCCESS(Status)) {
+        if (!NT_SUCCESS(iosb.Status))
+            Status = iosb.Status;
+        else if (iosb.Information != 0x100000)
+            Status = STATUS_DEVICE_DATA_ERROR;
+    }
 
     free(mb);
 
@@ -981,6 +1265,8 @@ static bool is_ssd(HANDLE h) {
 
     aptelen = sizeof(ATA_PASS_THROUGH_EX) + 512;
     apte = malloc(aptelen);
+    if (!apte)
+        return false;
 
     RtlZeroMemory(apte, aptelen);
 
@@ -1092,6 +1378,13 @@ static NTSTATUS write_btrfs(HANDLE h, uint64_t size, PUNICODE_STRING label, uint
     fs_root = add_root(&roots, BTRFS_ROOT_FSTREE);
     reloc_root = add_root(&roots, BTRFS_ROOT_DATA_RELOC);
 
+    if (!root_root || !chunk_root || !extent_root || !dev_root ||
+        !fs_root || !reloc_root) {
+        free_roots(&roots);
+        free_chunks(&chunks);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
 #ifndef __REACTOS__
     init_device(&dev, 1, size, &fsuuid, sector_size);
 #else
@@ -1101,8 +1394,11 @@ static NTSTATUS write_btrfs(HANDLE h, uint64_t size, PUNICODE_STRING label, uint
     ssd = is_ssd(h);
 
     sys_chunk = add_chunk(&chunks, BLOCK_FLAG_SYSTEM | (ssd ? 0 : BLOCK_FLAG_DUPLICATE), chunk_root, &dev, dev_root, &chunkuuid, sector_size);
-    if (!sys_chunk)
-        return STATUS_INTERNAL_ERROR;
+    if (!sys_chunk) {
+        free_roots(&roots);
+        free_chunks(&chunks);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     metadata_flags = BLOCK_FLAG_METADATA;
 
@@ -1113,8 +1409,11 @@ static NTSTATUS write_btrfs(HANDLE h, uint64_t size, PUNICODE_STRING label, uint
         metadata_flags |= BLOCK_FLAG_DATA;
 
     metadata_chunk = add_chunk(&chunks, metadata_flags, chunk_root, &dev, dev_root, &chunkuuid, sector_size);
-    if (!metadata_chunk)
-        return STATUS_INTERNAL_ERROR;
+    if (!metadata_chunk) {
+        free_roots(&roots);
+        free_chunks(&chunks);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     add_item(chunk_root, 1, TYPE_DEV_ITEM, dev.dev_item.dev_id, &dev.dev_item, sizeof(DEV_ITEM));
 
@@ -1127,22 +1426,33 @@ static NTSTATUS write_btrfs(HANDLE h, uint64_t size, PUNICODE_STRING label, uint
 
     add_block_group_items(&chunks, extent_root);
 
+    {
+        LIST_ENTRY* root_entry;
+        for (root_entry = roots.Flink; root_entry != &roots; root_entry = root_entry->Flink) {
+            btrfs_root* root = CONTAINING_RECORD(root_entry, btrfs_root, list_entry);
+            if (root->allocation_failed) {
+                free_roots(&roots);
+                free_chunks(&chunks);
+                return STATUS_INSUFFICIENT_RESOURCES;
+            }
+        }
+    }
+
     Status = write_roots(h, &roots, node_size, &fsuuid, &chunkuuid);
     if (!NT_SUCCESS(Status))
-        return Status;
+        goto cleanup;
 
     Status = clear_first_megabyte(h);
     if (!NT_SUCCESS(Status))
-        return Status;
+        goto cleanup;
 
     Status = write_superblocks(h, &dev, chunk_root, root_root, extent_root, sys_chunk, node_size, &fsuuid, sector_size, label, incompat_flags);
-    if (!NT_SUCCESS(Status))
-        return Status;
 
+cleanup:
     free_roots(&roots);
     free_chunks(&chunks);
 
-    return STATUS_SUCCESS;
+    return Status;
 }
 
 static bool look_for_device(btrfs_filesystem* bfs, BTRFS_UUID* devuuid) {
@@ -1218,11 +1528,14 @@ static bool is_mounted_multi_device(HANDLE h, uint32_t sector_size) {
         sblen = (sblen & sector_size) + sector_size;
 
     sb = malloc(sblen);
+    if (!sb)
+        return true; /* Fail closed: do not format if mount state cannot be checked. */
 
     off.QuadPart = superblock_addrs[0];
 
     Status = NtReadFile(h, NULL, NULL, NULL, &iosb, sb, sblen, &off, NULL);
-    if (!NT_SUCCESS(Status)) {
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(iosb.Status) ||
+        iosb.Information != sblen) {
         free(sb);
         return false;
     }
@@ -1234,7 +1547,7 @@ static bool is_mounted_multi_device(HANDLE h, uint32_t sector_size) {
 
     if (!check_superblock_checksum(sb)) {
         free(sb);
-        return false;
+        return true; /* A Btrfs signature with a bad checksum is not safe to overwrite. */
     }
 
     fsuuid = sb->uuid;
@@ -1259,12 +1572,20 @@ static bool is_mounted_multi_device(HANDLE h, uint32_t sector_size) {
 
         if (bfs) free(bfs);
         bfs = malloc(bfssize);
+        if (!bfs) {
+            ret = true;
+            goto end;
+        }
 
         Status = NtDeviceIoControlFile(h2, NULL, NULL, NULL, &iosb, IOCTL_BTRFS_QUERY_FILESYSTEMS, NULL, 0, bfs, bfssize);
     } while (Status == STATUS_BUFFER_OVERFLOW);
 
-    if (!NT_SUCCESS(Status))
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(iosb.Status)) {
+        /* The Btrfs control device answered, but its mounted-volume state
+           could not be queried. Refuse destructive format rather than guess. */
+        ret = true;
         goto end;
+    }
 
     if (bfs->num_devices != 0) {
         bfs2 = bfs;
@@ -1337,6 +1658,7 @@ static NTSTATUS NTAPI FormatEx2(PUNICODE_STRING DriveRoot, FMIFS_MEDIA_FLAG Medi
                                 BOOLEAN QuickFormat, ULONG ClusterSize, PFMIFSCALLBACK Callback)
 {
     NTSTATUS Status;
+    BOOLEAN VolumeLocked = FALSE;
     HANDLE h, btrfsh;
     OBJECT_ATTRIBUTES attr;
     IO_STATUS_BLOCK iosb;
@@ -1379,6 +1701,8 @@ static NTSTATUS NTAPI FormatEx2(PUNICODE_STRING DriveRoot, FMIFS_MEDIA_FLAG Medi
 #endif
 #endif
 
+    UNREFERENCED_PARAMETER(MediaFlag);
+
     if (def_csum_type != CSUM_TYPE_CRC32C && def_csum_type != CSUM_TYPE_XXHASH && def_csum_type != CSUM_TYPE_SHA256 &&
         def_csum_type != CSUM_TYPE_BLAKE2)
         return STATUS_INVALID_PARAMETER;
@@ -1392,7 +1716,8 @@ static NTSTATUS NTAPI FormatEx2(PUNICODE_STRING DriveRoot, FMIFS_MEDIA_FLAG Medi
         return Status;
 
     Status = NtDeviceIoControlFile(h, NULL, NULL, NULL, &iosb, IOCTL_DISK_GET_LENGTH_INFO, NULL, 0, &gli, sizeof(gli));
-    if (!NT_SUCCESS(Status)) {
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(iosb.Status)) {
+        if (NT_SUCCESS(Status)) Status = iosb.Status;
         NtClose(h);
         return Status;
     }
@@ -1401,9 +1726,17 @@ static NTSTATUS NTAPI FormatEx2(PUNICODE_STRING DriveRoot, FMIFS_MEDIA_FLAG Medi
     // some instances where it fails and IOCTL_DISK_GET_DRIVE_GEOMETRY succeeds -
     // such as with spanned volumes.
     Status = NtDeviceIoControlFile(h, NULL, NULL, NULL, &iosb, IOCTL_DISK_GET_DRIVE_GEOMETRY, NULL, 0, &dg, sizeof(dg));
-    if (!NT_SUCCESS(Status)) {
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(iosb.Status)) {
+        if (NT_SUCCESS(Status)) Status = iosb.Status;
         NtClose(h);
         return Status;
+    }
+
+    if (gli.Length.QuadPart <= 0 || dg.BytesPerSector < 512 ||
+        dg.BytesPerSector > 4096 || !is_power_of_two(dg.BytesPerSector) ||
+        (gli.Length.QuadPart % dg.BytesPerSector) != 0) {
+        NtClose(h);
+        return STATUS_INVALID_PARAMETER;
     }
 
     if (def_sector_size == 0) {
@@ -1436,14 +1769,22 @@ static NTSTATUS NTAPI FormatEx2(PUNICODE_STRING DriveRoot, FMIFS_MEDIA_FLAG Medi
         Callback(PROGRESS, 0, (PVOID)&pc);
     }
 
-    NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0);
+    Status = NtFsControlFile(h, NULL, NULL, NULL, &iosb,
+                             FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0);
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(iosb.Status)) {
+        if (NT_SUCCESS(Status)) Status = iosb.Status;
+        goto end;
+    }
+    VolumeLocked = TRUE;
 
     if (is_mounted_multi_device(h, sector_size)) {
         Status = STATUS_ACCESS_DENIED;
         goto end;
     }
 
-    do_full_trim(h);
+    /* Quick format must not issue a full-volume trim. */
+    if (!QuickFormat)
+        do_full_trim(h);
 
     incompat_flags = def_incompat_flags;
     incompat_flags |= BTRFS_INCOMPAT_FLAGS_MIXED_BACKREF | BTRFS_INCOMPAT_FLAGS_BIG_METADATA;
@@ -1456,10 +1797,25 @@ static NTSTATUS NTAPI FormatEx2(PUNICODE_STRING DriveRoot, FMIFS_MEDIA_FLAG Medi
 
     Status = write_btrfs(h, gli.Length.QuadPart, Label, sector_size, node_size, incompat_flags);
 
-    NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0);
+    if (NT_SUCCESS(Status)) {
+        NTSTATUS DismountStatus;
+        DismountStatus = NtFsControlFile(h, NULL, NULL, NULL, &iosb,
+                                         FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0);
+        if (!NT_SUCCESS(DismountStatus) || !NT_SUCCESS(iosb.Status)) {
+            if (NT_SUCCESS(DismountStatus)) DismountStatus = iosb.Status;
+            Status = DismountStatus;
+        }
+    }
 
 end:
-    NtFsControlFile(h, NULL, NULL, NULL, &iosb, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0);
+    if (VolumeLocked) {
+        NTSTATUS UnlockStatus;
+        UnlockStatus = NtFsControlFile(h, NULL, NULL, NULL, &iosb,
+                                       FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0);
+        if (NT_SUCCESS(Status) &&
+            (!NT_SUCCESS(UnlockStatus) || !NT_SUCCESS(iosb.Status)))
+            Status = NT_SUCCESS(UnlockStatus) ? iosb.Status : UnlockStatus;
+    }
 
     NtClose(h);
 
@@ -1478,17 +1834,19 @@ end:
 
             mdnsize = (ULONG)(offsetof(MOUNTDEV_NAME, Name[0]) + DriveRoot->Length);
             mdn = malloc(mdnsize);
+            if (mdn) {
+                mdn->NameLength = DriveRoot->Length;
+                memcpy(mdn->Name, DriveRoot->Buffer, DriveRoot->Length);
 
-            mdn->NameLength = DriveRoot->Length;
-            memcpy(mdn->Name, DriveRoot->Buffer, DriveRoot->Length);
-
-            NtDeviceIoControlFile(btrfsh, NULL, NULL, NULL, &iosb, IOCTL_BTRFS_PROBE_VOLUME, mdn, mdnsize, NULL, 0);
-
-            free(mdn);
+                NtDeviceIoControlFile(btrfsh, NULL, NULL, NULL, &iosb,
+                                      IOCTL_BTRFS_PROBE_VOLUME, mdn, mdnsize, NULL, 0);
+                free(mdn);
+            }
 
             NtClose(btrfsh);
         }
 
+        /* The probe is ancillary; the on-disk format already succeeded. */
         Status = STATUS_SUCCESS;
     }
 
@@ -1516,6 +1874,8 @@ BtrfsFormat(
     IN ULONG ClusterSize)
 {
     NTSTATUS Status;
+
+    UNREFERENCED_PARAMETER(ClusterSize);
 
     if (BackwardCompatible)
     {

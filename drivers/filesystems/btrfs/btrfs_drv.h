@@ -769,7 +769,7 @@ typedef struct _device_extension {
     superblock superblock;
     unsigned int sector_shift;
     unsigned int csum_size;
-    bool readonly;
+    volatile LONG readonly;
     bool removing;
     bool locked;
     bool lock_paused_balance;

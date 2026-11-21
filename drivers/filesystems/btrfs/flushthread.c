@@ -7884,7 +7884,7 @@ NTSTATUS do_write(device_extension* Vcb, PIRP Irp) {
 
     if (!NT_SUCCESS(Status)) {
         ERR("do_write2 returned %08lx, dropping into readonly mode\n", Status);
-        Vcb->readonly = true;
+        InterlockedExchange(&Vcb->readonly, TRUE);
         FsRtlNotifyVolumeEvent(Vcb->root_file, FSRTL_VOLUME_FORCED_CLOSED);
         do_rollback(Vcb, &rollback);
     } else
