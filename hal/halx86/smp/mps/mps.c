@@ -124,6 +124,7 @@ HalpMpsParseExtendedTable(PUCHAR Data, USHORT Length, UCHAR Checksum)
     UCHAR Sum = Checksum;
     ULONG i;
     for (i = 0; i < Length; ++i) Sum = (UCHAR)(Sum + Data[i]);
+    if (Length == 0) return (Checksum == 0);
     if (Sum != 0) return FALSE;
 
     while (Entry < End) {
@@ -171,8 +172,8 @@ HalpMpsParseExtendedTable(PUCHAR Data, USHORT Length, UCHAR Checksum)
 static BOOLEAN
 HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
 {
-    PUCHAR Entry, End;
-    ULONG i, CpuCount = 0, IoCount = 0;
+    PUCHAR Entry, End, Scan;
+    ULONG i, ScanIndex, CpuCount = 0, IoCount = 0;
     UCHAR BootId = (UCHAR)KeGetCurrentPrcb()->InitialApicId;
     BOOLEAN BootFound = FALSE;
     ULONG BusTypes[256] = {0};
@@ -190,6 +191,34 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
     HalpApicInfoTable.LocalApicPA = Table->LocalApicAddress;
     Entry = (PUCHAR)(Table + 1);
     End = (PUCHAR)Table + Table->Length;
+
+    /* Bus descriptors may appear anywhere in the base entry list. Resolve
+     * their classes before interpreting any interrupt source entries. */
+    Scan = Entry;
+    for (ScanIndex = 0; ScanIndex < Table->EntryCount; ++ScanIndex)
+    {
+        ULONG ScanSize;
+        if (Scan >= End) return FALSE;
+        switch (Scan[0])
+        {
+        case MPS_CPU: ScanSize = sizeof(HALP_MPS_CPU); break;
+        case MPS_BUS: ScanSize = 8; break;
+        case MPS_IOAPIC: ScanSize = sizeof(HALP_MPS_IOAPIC); break;
+        case MPS_INTSRC:
+        case MPS_LINTSRC: ScanSize = 8; break;
+        default: return FALSE;
+        }
+        if ((ULONG)(End - Scan) < ScanSize) return FALSE;
+        if (Scan[0] == MPS_BUS)
+        {
+            if (RtlCompareMemory(Scan + 2, "ISA   ", 6) == 6) BusTypes[Scan[1]] = 1;
+            else if (RtlCompareMemory(Scan + 2, "EISA  ", 6) == 6) BusTypes[Scan[1]] = 2;
+            else if (RtlCompareMemory(Scan + 2, "PCI   ", 6) == 6) BusTypes[Scan[1]] = 3;
+            else if (RtlCompareMemory(Scan + 2, "MCA   ", 6) == 6) BusTypes[Scan[1]] = 4;
+        }
+        Scan += ScanSize;
+    }
+    if (Scan != End) return FALSE;
 
     for (i = 0; i < Table->EntryCount; ++i) {
         ULONG Size;
