@@ -9,6 +9,7 @@
 /* INCLUDES ******************************************************************/
 
 #include <hal.h>
+#include <smp.h>
 #define NDEBUG
 #include <debug.h>
 
@@ -728,6 +729,24 @@ HalpGetISAFixedPCIIrq(IN PBUS_HANDLER BusHandler,
     if (!PciData.u.type0.InterruptPin) return STATUS_SUCCESS;
 
     /* FIXME: The PCI IRQ Routing Miniport should be called */
+
+#if defined(HALMP_MPS_PCI_ROUTING)
+    /* Prefer the firmware's explicit MPS PCI INTx route when present.
+     * MPS discovery is part of the 32-bit legacy HAL only. The AMD64 HAL
+     * uses ACPI and must not reference the HALMP-only routing helper. */
+    {
+        ULONG GlobalSystemInterrupt;
+        if (HalpMpsGetPciInterruptGsi(BusHandler->BusNumber,
+                                      PciSlot.u.bits.DeviceNumber,
+                                      PciData.u.type0.InterruptPin,
+                                      &GlobalSystemInterrupt))
+        {
+            (*Range)->Base = GlobalSystemInterrupt;
+            (*Range)->Limit = GlobalSystemInterrupt;
+            return STATUS_SUCCESS;
+        }
+    }
+#endif
 
     /* Also if the INT# seems bogus, nothing to do either */
     if ((PciData.u.type0.InterruptLine == 0) ||

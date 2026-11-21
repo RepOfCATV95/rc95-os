@@ -29,10 +29,8 @@ PACPI_SRAT HalpAcpiSrat;
 PBOOT_TABLE HalpSimpleBootFlagTable;
 
 PHYSICAL_ADDRESS HalpMaxHotPlugMemoryAddress;
-PHYSICAL_ADDRESS HalpLowStubPhysicalAddress;
 PHARDWARE_PTE HalpPteForFlush;
 PVOID HalpVirtAddrForFlush;
-PVOID HalpLowStub;
 
 PACPI_BIOS_MULTI_NODE HalpAcpiMultiNode;
 
@@ -850,21 +848,6 @@ HalpSetupAcpiPhase0(IN PLOADER_PARAMETER_BLOCK LoaderBlock)
 
     /* Setup the ACPI timer */
     HaliAcpiTimerInit(0, 0);
-
-    /* Do we have a low stub address yet? */
-    if (!HalpLowStubPhysicalAddress.QuadPart)
-    {
-        /* Allocate it */
-        HalpLowStubPhysicalAddress.QuadPart = HalpAllocPhysicalMemory(LoaderBlock,
-                                                                      0x100000,
-                                                                      HALP_LOW_STUB_SIZE_IN_PAGES,
-                                                                      FALSE);
-        if (HalpLowStubPhysicalAddress.QuadPart)
-        {
-            /* Map it */
-            HalpLowStub = HalpMapPhysicalMemory64(HalpLowStubPhysicalAddress, HALP_LOW_STUB_SIZE_IN_PAGES);
-        }
-    }
 
     /* Grab a page for flushes */
     PhysicalAddress.QuadPart = 0x100000;

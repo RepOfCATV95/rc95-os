@@ -8,9 +8,19 @@
 /* INCLUDES ******************************************************************/
 
 #include <hal.h>
+#include <smp.h>
 
 #define NDEBUG
 #include <debug.h>
+
+/* UP HALs do not allocate or start an AP trampoline. */
+BOOLEAN
+NTAPI
+HalpInitializeLowStub(_In_ PLOADER_PARAMETER_BLOCK LoaderBlock)
+{
+    UNREFERENCED_PARAMETER(LoaderBlock);
+    return FALSE;
+}
 
 /* FUNCTIONS *****************************************************************/
 

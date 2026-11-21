@@ -90,7 +90,8 @@ HalStartNextProcessor(
     _In_ PKPROCESSOR_STATE ProcessorState)
 {
     /* Bail out if we only use the boot CPU */
-    if (HalpOnlyBootProcessor)
+    if (HalpOnlyBootProcessor || !HalpLowStub ||
+        !HalpLowStubPhysicalAddress.QuadPart)
         return FALSE;
 
     /* Bail out if we have started all available CPUs */
@@ -119,9 +120,22 @@ HalStartNextProcessor(
         .Idtr = ProcessorState->SpecialRegisters.Idtr,
     };
 
+    /* The AP marks its identity entry started from HalpSetupProcessorsTable. */
+    HalpProcessorIdentity[HalpStartedProcessorCount].ProcessorStarted = FALSE;
     ApicStartApplicationProcessor(HalpStartedProcessorCount, HalpLowStubPhysicalAddress);
 
-    HalpStartedProcessorCount++;
+    for (ULONG Wait = 0; Wait < 1000; ++Wait)
+    {
+        if (HalpProcessorIdentity[HalpStartedProcessorCount].ProcessorStarted)
+        {
+            ++HalpStartedProcessorCount;
+            return TRUE;
+        }
+        KeStallExecutionProcessor(100);
+    }
 
-    return TRUE;
+    DPRINT1("HAL: AP %lu (APIC ID %lu) did not complete startup handshake\\n",
+            HalpStartedProcessorCount,
+            HalpProcessorIdentity[HalpStartedProcessorCount].LapicId);
+    return FALSE;
 }
