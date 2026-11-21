@@ -677,7 +677,7 @@ ApicInitializeIOApic(VOID)
                     continue;
                 if (Route->DestinationInt >= Unit->InputCount)
                 {
-                    DPRINT1("HALMP: MPS route targets invalid IOAPIC pin %lu on APIC %lu\\n",
+                    DPRINT1("HALMP: MPS route targets invalid IOAPIC pin %lu on APIC %lu\n",
                             Route->DestinationInt, Route->DestinationApic);
                     break;
                 }
