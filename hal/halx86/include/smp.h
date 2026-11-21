@@ -104,6 +104,14 @@ VOID
 HalpSetupProcessorsTable(
     _In_ UINT32 NTProcessorNumber);
 
+BOOLEAN
+NTAPI
+HalpMpsGetPciInterruptGsi(
+    _In_ ULONG BusNumber,
+    _In_ ULONG DeviceNumber,
+    _In_ ULONG InterruptPin,
+    _Out_ PULONG GlobalSystemInterrupt);
+
 VOID
 HalpPrintApicTables(VOID);
 
