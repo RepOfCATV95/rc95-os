@@ -481,54 +481,6 @@ HalpAllocateSystemInterrupt(
     ASSERT(Irq < HalpMaxGsi);
     ASSERT(HalpVectorToIndex[Vector] == APIC_FREE_VECTOR);
 
-    /* Resolve MPS destination APIC IDs and INTIN pins to the GSI namespace
-     * used by the common interrupt allocator. MPS has no GSI base field;
-     * assign each probed controller a disjoint range in table order. */
-    if (HalpApicInfoTable.ApicMode == HALP_APIC_MODE_LEGACY)
-    {
-        ULONG RouteIndex;
-        for (RouteIndex = 0;
-             RouteIndex < HalpApicInfoTable.MpsInterruptRouteCount;
-             ++RouteIndex)
-        {
-            PHALP_MPS_INTERRUPT_ROUTE Route =
-                &HalpApicInfoTable.MpsInterruptRoutes[RouteIndex];
-            for (Unit = HalpIoApics;
-                 Unit < HalpIoApics + HalpIoApicCount;
-                 ++Unit)
-            {
-                if (Unit->ApicId != Route->DestinationApic)
-                    continue;
-                if (Route->DestinationInt >= Unit->InputCount)
-                {
-                    DPRINT1("HALMP: MPS route targets invalid IOAPIC pin %lu on APIC %lu\\n",
-                            Route->DestinationInt, Route->DestinationApic);
-                    break;
-                }
-                Route->GlobalSystemInterrupt =
-                    Unit->InputBase + Route->DestinationInt;
-                if ((Route->SourceBusType == 1 || Route->SourceBusType == 2) &&
-                    Route->InterruptType == 0 &&
-                    Route->SourceBusIrq < HALP_ISA_IRQ_COUNT)
-                {
-                    ULONG Flags = Route->Flags;
-                    ULONG Polarity = Flags & 3;
-                    ULONG Trigger = (Flags >> 2) & 3;
-                    ULONG Irq = Route->SourceBusIrq;
-                    HalpApicInfoTable.IsaIrqGsi[Irq] =
-                        Route->GlobalSystemInterrupt;
-                    HalpApicInfoTable.IsaIrqPolarity[Irq] =
-                        (Polarity == 3) ? InterruptActiveLow :
-                        (Polarity == 1) ? InterruptActiveHigh :
-                        InterruptPolarityUnknown;
-                    HalpApicInfoTable.IsaIrqTrigger[Irq] =
-                        (Trigger == 3) ? LevelSensitive : Latched;
-                }
-                break;
-            }
-        }
-    }
-
     /* Setup a redirection entry */
     ReDirReg.Vector = Vector;
     ReDirReg.MessageType = APIC_MT_LowestPriority;
@@ -703,6 +655,54 @@ ApicInitializeIOApic(VOID)
     if (HalpIoApicCount == 0)
     {
         HalpMapIoApic(IOAPIC_PHYS_BASE, 0, 0);
+    }
+
+    /* Resolve MPS destination APIC IDs and INTIN pins to the GSI namespace
+     * used by the common interrupt allocator. MPS has no GSI base field;
+     * assign each probed controller a disjoint range in table order. */
+    if (HalpApicInfoTable.ApicMode == HALP_APIC_MODE_LEGACY)
+    {
+        ULONG RouteIndex;
+        for (RouteIndex = 0;
+             RouteIndex < HalpApicInfoTable.MpsInterruptRouteCount;
+             ++RouteIndex)
+        {
+            PHALP_MPS_INTERRUPT_ROUTE Route =
+                &HalpApicInfoTable.MpsInterruptRoutes[RouteIndex];
+            for (Unit = HalpIoApics;
+                 Unit < HalpIoApics + HalpIoApicCount;
+                 ++Unit)
+            {
+                if (Unit->ApicId != Route->DestinationApic)
+                    continue;
+                if (Route->DestinationInt >= Unit->InputCount)
+                {
+                    DPRINT1("HALMP: MPS route targets invalid IOAPIC pin %lu on APIC %lu\\n",
+                            Route->DestinationInt, Route->DestinationApic);
+                    break;
+                }
+                Route->GlobalSystemInterrupt =
+                    Unit->InputBase + Route->DestinationInt;
+                if ((Route->SourceBusType == 1 || Route->SourceBusType == 2) &&
+                    Route->InterruptType == 0 &&
+                    Route->SourceBusIrq < HALP_ISA_IRQ_COUNT)
+                {
+                    ULONG Flags = Route->Flags;
+                    ULONG Polarity = Flags & 3;
+                    ULONG Trigger = (Flags >> 2) & 3;
+                    ULONG Irq = Route->SourceBusIrq;
+                    HalpApicInfoTable.IsaIrqGsi[Irq] =
+                        Route->GlobalSystemInterrupt;
+                    HalpApicInfoTable.IsaIrqPolarity[Irq] =
+                        (Polarity == 3) ? InterruptActiveLow :
+                        (Polarity == 1) ? InterruptActiveHigh :
+                        InterruptPolarityUnknown;
+                    HalpApicInfoTable.IsaIrqTrigger[Irq] =
+                        (Trigger == 3) ? LevelSensitive : Latched;
+                }
+                break;
+            }
+        }
     }
 
     /* Setup a redirection entry */
