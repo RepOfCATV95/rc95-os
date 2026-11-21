@@ -38,6 +38,7 @@ typedef struct _HALP_IOAPIC_UNIT
     ULONG_PTR Base;
     ULONG InputBase;
     ULONG InputCount;
+    ULONG ApicId;
 } HALP_IOAPIC_UNIT, *PHALP_IOAPIC_UNIT;
 
 /* I/O APICs in use, the first one is mapped at IOAPIC_BASE */
@@ -480,6 +481,54 @@ HalpAllocateSystemInterrupt(
     ASSERT(Irq < HalpMaxGsi);
     ASSERT(HalpVectorToIndex[Vector] == APIC_FREE_VECTOR);
 
+    /* Resolve MPS destination APIC IDs and INTIN pins to the GSI namespace
+     * used by the common interrupt allocator. MPS has no GSI base field;
+     * assign each probed controller a disjoint range in table order. */
+    if (HalpApicInfoTable.ApicMode == HALP_APIC_MODE_LEGACY)
+    {
+        ULONG RouteIndex;
+        for (RouteIndex = 0;
+             RouteIndex < HalpApicInfoTable.MpsInterruptRouteCount;
+             ++RouteIndex)
+        {
+            PHALP_MPS_INTERRUPT_ROUTE Route =
+                &HalpApicInfoTable.MpsInterruptRoutes[RouteIndex];
+            for (Unit = HalpIoApics;
+                 Unit < HalpIoApics + HalpIoApicCount;
+                 ++Unit)
+            {
+                if (Unit->ApicId != Route->DestinationApic)
+                    continue;
+                if (Route->DestinationInt >= Unit->InputCount)
+                {
+                    DPRINT1("HALMP: MPS route targets invalid IOAPIC pin %lu on APIC %lu\\n",
+                            Route->DestinationInt, Route->DestinationApic);
+                    break;
+                }
+                Route->GlobalSystemInterrupt =
+                    Unit->InputBase + Route->DestinationInt;
+                if ((Route->SourceBusType == 1 || Route->SourceBusType == 2) &&
+                    Route->InterruptType == 0 &&
+                    Route->SourceBusIrq < HALP_ISA_IRQ_COUNT)
+                {
+                    ULONG Flags = Route->Flags;
+                    ULONG Polarity = Flags & 3;
+                    ULONG Trigger = (Flags >> 2) & 3;
+                    ULONG Irq = Route->SourceBusIrq;
+                    HalpApicInfoTable.IsaIrqGsi[Irq] =
+                        Route->GlobalSystemInterrupt;
+                    HalpApicInfoTable.IsaIrqPolarity[Irq] =
+                        (Polarity == 3) ? InterruptActiveLow :
+                        (Polarity == 1) ? InterruptActiveHigh :
+                        InterruptPolarityUnknown;
+                    HalpApicInfoTable.IsaIrqTrigger[Irq] =
+                        (Trigger == 3) ? LevelSensitive : Latched;
+                }
+                break;
+            }
+        }
+    }
+
     /* Setup a redirection entry */
     ReDirReg.Vector = Vector;
     ReDirReg.MessageType = APIC_MT_LowestPriority;
@@ -586,7 +635,8 @@ VOID
 NTAPI
 HalpMapIoApic(
     _In_ ULONG PhysicalBase,
-    _In_ ULONG InputBase)
+    _In_ ULONG InputBase,
+    _In_ ULONG ApicId)
 {
     PHALP_IOAPIC_UNIT Unit;
     PHARDWARE_PTE Pte;
@@ -621,6 +671,7 @@ HalpMapIoApic(
 
     /* Bits 23:16 hold the index of the last redirection entry, the register index caps the count */
     Unit->InputBase = InputBase;
+    Unit->ApicId = ApicId;
     Unit->InputCount = min(((Version >> 16) & 0xFF) + 1, HALP_IOAPIC_MAX_ENTRIES);
     Unit->InputCount = min(Unit->InputCount, HALP_MAX_INPUTS - InputBase);
     HalpMaxGsi = max(HalpMaxGsi, InputBase + Unit->InputCount);
@@ -641,13 +692,17 @@ ApicInitializeIOApic(VOID)
     {
         if (HalpApicInfoTable.IoApicPA[Index] != 0)
         {
-            HalpMapIoApic(HalpApicInfoTable.IoApicPA[Index],
-                          HalpApicInfoTable.IoApicIrqBase[Index]);
+            ULONG InputBase = HalpApicInfoTable.IoApicIrqBase[Index];
+            ULONG ApicId = (HalpApicInfoTable.ApicMode == HALP_APIC_MODE_LEGACY) ?
+                           HalpApicInfoTable.IoApicId[Index] : Index;
+            if (HalpApicInfoTable.ApicMode == HALP_APIC_MODE_LEGACY)
+                InputBase = HalpMaxGsi;
+            HalpMapIoApic(HalpApicInfoTable.IoApicPA[Index], InputBase, ApicId);
         }
     }
     if (HalpIoApicCount == 0)
     {
-        HalpMapIoApic(IOAPIC_PHYS_BASE, 0);
+        HalpMapIoApic(IOAPIC_PHYS_BASE, 0, 0);
     }
 
     /* Setup a redirection entry */
