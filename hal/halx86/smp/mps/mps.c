@@ -177,7 +177,8 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
     BOOLEAN BootFound = FALSE;
     ULONG BusTypes[256] = {0};
 
-    if (RtlCompareMemory(Table->Signature, "PCMP", 4) != 4 ||
+    if ((ULONG_PTR)Table + Table->Length + Table->ExtendedLength < (ULONG_PTR)Table ||
+        RtlCompareMemory(Table->Signature, "PCMP", 4) != 4 ||
         Table->Length < sizeof(*Table) ||
         (Table->Revision != 1 && Table->Revision != 4) ||
         !HalpMpsChecksum((const UCHAR *)Table, Table->Length))
@@ -244,16 +245,19 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
             Route->SourceBusIrq = Entry[5];
             Route->DestinationApic = Entry[6];
             Route->DestinationInt = Entry[7];
+            Route->GlobalSystemInterrupt = MAXULONG;
             ++HalpApicInfoTable.MpsInterruptRouteCount;
             if ((BusTypes[Entry[4]] == 1 || BusTypes[Entry[4]] == 2) &&
                 Entry[1] == 0 && Entry[5] < HALP_ISA_IRQ_COUNT) {
                 Polarity = Route->Flags & 3;
                 Trigger = (Route->Flags >> 2) & 3;
                 HalpApicInfoTable.IsaIrqGsi[Entry[5]] = Entry[7]; /* translated to GSI after IOAPIC probing */
+                if (Polarity == 0)
+                    Polarity = (BusTypes[Entry[4]] == 3) ? 3 : 1;
+                if (Trigger == 0)
+                    Trigger = (BusTypes[Entry[4]] == 1) ? 1 : 3;
                 HalpApicInfoTable.IsaIrqPolarity[Entry[5]] =
-                    (Polarity == 3) ? InterruptActiveLow :
-                    (Polarity == 1) ? InterruptActiveHigh :
-                    InterruptPolarityUnknown;
+                    (Polarity == 3) ? InterruptActiveLow : InterruptActiveHigh;
                 HalpApicInfoTable.IsaIrqTrigger[Entry[5]] =
                     (Trigger == 3) ? LevelSensitive : Latched;
             }
