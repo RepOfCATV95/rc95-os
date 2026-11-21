@@ -39,6 +39,7 @@ typedef struct _HALP_MPS_INTERRUPT_ROUTE
     UCHAR InterruptType;
     USHORT Flags;
     UCHAR SourceBus;
+    UCHAR SourceBusType;
     UCHAR SourceBusIrq;
     UCHAR DestinationApic;
     UCHAR DestinationInt;
