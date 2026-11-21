@@ -231,6 +231,7 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
             Route->InterruptType = Entry[1];
             Route->Flags = *(PUSHORT)(Entry + 2);
             Route->SourceBus = Entry[4];
+            Route->SourceBusType = (UCHAR)BusTypes[Entry[4]];
             Route->SourceBusIrq = Entry[5];
             Route->DestinationApic = Entry[6];
             Route->DestinationInt = Entry[7];
@@ -239,7 +240,7 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
                 Entry[1] == 0 && Entry[5] < HALP_ISA_IRQ_COUNT) {
                 Polarity = Route->Flags & 3;
                 Trigger = (Route->Flags >> 2) & 3;
-                HalpApicInfoTable.IsaIrqGsi[Entry[5]] = Entry[7];
+                HalpApicInfoTable.IsaIrqGsi[Entry[5]] = Entry[7]; /* translated to GSI after IOAPIC probing */
                 HalpApicInfoTable.IsaIrqPolarity[Entry[5]] =
                     (Polarity == 3) ? InterruptActiveLow :
                     (Polarity == 1) ? InterruptActiveHigh :
