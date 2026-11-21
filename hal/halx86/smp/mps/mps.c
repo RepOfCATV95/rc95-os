@@ -250,10 +250,14 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
             else if (RtlCompareMemory(Entry + 2, "MCA   ", 6) == 6) BusTypes[Entry[1]] = 4;
         } else if (Entry[0] == MPS_IOAPIC) {
             PHALP_MPS_IOAPIC Io = (PHALP_MPS_IOAPIC)Entry;
-            if ((Io->Flags & 1) && IoCount < HALP_APIC_INFO_TABLE_IOAPIC_NUMBER)
+            if (Io->Flags & 1)
             {
-                if (Io->Address == 0)
+                ULONG Previous;
+                if (Io->Address == 0 || IoCount >= HALP_APIC_INFO_TABLE_IOAPIC_NUMBER)
                     return FALSE;
+                for (Previous = 0; Previous < IoCount; ++Previous)
+                    if (HalpApicInfoTable.IoApicId[Previous] == Io->ApicId)
+                        return FALSE;
                 HalpApicInfoTable.IoApicPA[IoCount] = Io->Address;
                 HalpApicInfoTable.IoApicId[IoCount] = Io->ApicId;
                 ++IoCount;
