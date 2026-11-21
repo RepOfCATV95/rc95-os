@@ -639,6 +639,17 @@ ApicInitializeIOApic(VOID)
     ULONG Index, Vector, Input;
     UCHAR Register;
 
+    /* The MP floating pointer advertises an IMCR on legacy PC/AT systems.
+     * Route external interrupts away from the 8259 pair and into the APICs. */
+    if (HalpApicInfoTable.ApicMode == HALP_APIC_MODE_LEGACY &&
+        HalpApicInfoTable.MpsImcrPresent)
+    {
+        UCHAR Imcr;
+        WRITE_PORT_UCHAR((PUCHAR)0x22, 0x70);
+        Imcr = READ_PORT_UCHAR((PUCHAR)0x23);
+        WRITE_PORT_UCHAR((PUCHAR)0x23, (UCHAR)(Imcr | 0x01));
+    }
+
     /* Rebuild the runtime controller/GSI map from firmware topology. */
     HalpIoApicCount = 0;
     HalpMaxGsi = 0;
@@ -653,6 +664,7 @@ ApicInitializeIOApic(VOID)
                            HalpApicInfoTable.IoApicId[Index] : Index;
             if (HalpApicInfoTable.ApicMode == HALP_APIC_MODE_LEGACY)
                 InputBase = HalpMaxGsi;
+            HalpApicInfoTable.IoApicIrqBase[Index] = InputBase;
             HalpMapIoApic(HalpApicInfoTable.IoApicPA[Index], InputBase, ApicId);
         }
     }
