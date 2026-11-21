@@ -15,7 +15,6 @@
 #include <debug.h>
 
 /* Shared processor state and real-mode AP trampoline storage. */
-PROCESSOR_IDENTITY HalpProcessorIdentity[MAXIMUM_PROCESSORS];
 PHYSICAL_ADDRESS HalpLowStubPhysicalAddress;
 PVOID HalpLowStub;
 
