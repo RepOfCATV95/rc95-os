@@ -730,13 +730,14 @@ HalpGetISAFixedPCIIrq(IN PBUS_HANDLER BusHandler,
 
     /* FIXME: The PCI IRQ Routing Miniport should be called */
 
+#if defined(_M_IX86) || defined(__i386__)
     /* Prefer the firmware's explicit MPS PCI INTx route when present.
-     * The source IRQ encodes device number and INTA..INTD; the common APIC
-     * layer has already translated the destination I/O APIC pin to a GSI. */
+     * MPS discovery is part of the 32-bit legacy HAL only. The AMD64 HAL
+     * uses ACPI and must not reference the HALMP-only routing helper. */
     {
         ULONG GlobalSystemInterrupt;
         if (HalpMpsGetPciInterruptGsi(BusHandler->BusNumber,
-                                      SlotNumber.u.bits.DeviceNumber,
+                                      PciSlot.u.bits.DeviceNumber,
                                       PciData.u.type0.InterruptPin,
                                       &GlobalSystemInterrupt))
         {
@@ -745,6 +746,7 @@ HalpGetISAFixedPCIIrq(IN PBUS_HANDLER BusHandler,
             return STATUS_SUCCESS;
         }
     }
+#endif
 
     /* Also if the INT# seems bogus, nothing to do either */
     if ((PciData.u.type0.InterruptLine == 0) ||
