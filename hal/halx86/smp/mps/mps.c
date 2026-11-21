@@ -138,7 +138,7 @@ HalpMpsParseExtendedTable(PUCHAR Data, USHORT Length, UCHAR Checksum)
         if (Entry[0] == MPS_EXT_ADDRESS) {
             PHALP_MPS_EXT_ADDRESS E = (PHALP_MPS_EXT_ADDRESS)Entry;
             ULONG n = HalpApicInfoTable.MpsExtendedAddressRangeCount;
-            if (n >= HALP_MPS_MAX_EXT_ADDRESS_RANGES || E->AddressType > 2) return FALSE;
+            if (n >= HALP_MPS_MAX_EXT_ADDRESS_RANGES || E->AddressType > 2 ||\n                E->Reserved != 0 || E->Length == 0 || E->Base + E->Length < E->Base) return FALSE;
             HalpApicInfoTable.MpsExtendedAddressRanges[n].BusId = E->BusId;
             HalpApicInfoTable.MpsExtendedAddressRanges[n].AddressType = E->AddressType;
             HalpApicInfoTable.MpsExtendedAddressRanges[n].BaseAddress = E->Base;
@@ -147,7 +147,7 @@ HalpMpsParseExtendedTable(PUCHAR Data, USHORT Length, UCHAR Checksum)
         } else if (Entry[0] == MPS_EXT_HIERARCHY) {
             PHALP_MPS_EXT_HIERARCHY E = (PHALP_MPS_EXT_HIERARCHY)Entry;
             ULONG n = HalpApicInfoTable.MpsBusHierarchyCount;
-            if (n >= HALP_MPS_MAX_BUS_HIERARCHIES || E->BusId == E->ParentBus) return FALSE;
+            if (n >= HALP_MPS_MAX_BUS_HIERARCHIES || E->BusId == E->ParentBus ||\n                E->Reserved[0] || E->Reserved[1] || E->Reserved[2]) return FALSE;
             HalpApicInfoTable.MpsBusHierarchies[n].BusId = E->BusId;
             HalpApicInfoTable.MpsBusHierarchies[n].BusInfo = E->BusInfo;
             HalpApicInfoTable.MpsBusHierarchies[n].ParentBus = E->ParentBus;
@@ -155,7 +155,7 @@ HalpMpsParseExtendedTable(PUCHAR Data, USHORT Length, UCHAR Checksum)
         } else {
             PHALP_MPS_EXT_COMPAT E = (PHALP_MPS_EXT_COMPAT)Entry;
             ULONG n = HalpApicInfoTable.MpsCompatibilityRangeCount;
-            if (n >= HALP_MPS_MAX_COMPATIBILITY_RANGES || E->Modifier > 1) return FALSE;
+            if (n >= HALP_MPS_MAX_COMPATIBILITY_RANGES || E->Modifier > 1 || E->Reserved) return FALSE;
             HalpApicInfoTable.MpsCompatibilityRanges[n].BusId = E->BusId;
             HalpApicInfoTable.MpsCompatibilityRanges[n].Modifier = E->Modifier;
             HalpApicInfoTable.MpsCompatibilityRanges[n].Address = E->RangeList;
@@ -229,7 +229,7 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
             if (n >= HALP_MPS_MAX_INTERRUPT_ROUTES) return FALSE;
             Route = &HalpApicInfoTable.MpsInterruptRoutes[n];
             Route->InterruptType = Entry[1];
-            Route->Flags = *(PUSHORT)(Entry + 2);
+            Route->Flags = *(PUSHORT)(Entry + 2);\n            if ((Route->Flags & 0xFFF0) ||\n                ((Route->Flags & 3) == 2) || (((Route->Flags >> 2) & 3) == 2))\n                return FALSE;
             Route->SourceBus = Entry[4];
             Route->SourceBusType = (UCHAR)BusTypes[Entry[4]];
             Route->SourceBusIrq = Entry[5];
