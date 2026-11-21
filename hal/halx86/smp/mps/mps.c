@@ -321,7 +321,7 @@ HalpParseApicTables(_In_ PLOADER_PARAMETER_BLOCK LoaderBlock)
     Fp = HalpMpsFindFloatingPointer();
     if (!Fp || Fp->Feature[0] != 0 || Fp->TableAddress == 0 ||
         !HalpMpsParseTable((PHALP_MPS_HEADER)(ULONG_PTR)Fp->TableAddress)) {
-        DPRINT1("HALMP: No usable Intel MPS configuration; continuing with BSP only\\n");
+        DPRINT1("HALMP: No usable Intel MPS configuration; continuing with BSP only\n");
         RtlZeroMemory(&HalpApicInfoTable, sizeof(HalpApicInfoTable));
         HalpMpsUseBspOnly();
     } else {
@@ -334,10 +334,10 @@ HalpPrintApicTables(VOID)
 {
 #if DBG
     ULONG i;
-    DPRINT1("HALMP: Physical processor count: %lu\\n",
+    DPRINT1("HALMP: Physical processor count: %lu\n",
             HalpApicInfoTable.ProcessorCount);
     for (i = 0; i < HalpApicInfoTable.ProcessorCount; ++i)
-        DPRINT1(" CPU %lu: APIC ID %lu, BSP %u, Started %u, PRCB %p\\n",
+        DPRINT1(" CPU %lu: APIC ID %lu, BSP %u, Started %u, PRCB %p\n",
                 i, HalpProcessorIdentity[i].LapicId,
                 HalpProcessorIdentity[i].BSPCheck,
                 HalpProcessorIdentity[i].ProcessorStarted,
