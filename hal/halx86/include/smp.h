@@ -26,20 +26,68 @@ BOOLEAN
 NTAPI
 HalpInitializeLowStub(_In_ PLOADER_PARAMETER_BLOCK LoaderBlock);
 
-/* This table is counter of the overall APIC constants acquired from madt */
-#define HALP_APIC_INFO_TABLE_IOAPIC_NUMBER 256 // ACPI_MADT_IO_APIC.Id is a UINT8.
+/* Shared firmware topology consumed by the common APIC implementation. */
+#define HALP_APIC_INFO_TABLE_IOAPIC_NUMBER 256
 #define HALP_ISA_IRQ_COUNT 16
+#define HALP_MPS_MAX_INTERRUPT_ROUTES 256
+#define HALP_MPS_MAX_EXT_ADDRESS_RANGES 32
+#define HALP_MPS_MAX_BUS_HIERARCHIES 32
+#define HALP_MPS_MAX_COMPATIBILITY_RANGES 32
+
+typedef struct _HALP_MPS_INTERRUPT_ROUTE
+{
+    UCHAR InterruptType;
+    USHORT Flags;
+    UCHAR SourceBus;
+    UCHAR SourceBusIrq;
+    UCHAR DestinationApic;
+    UCHAR DestinationInt;
+} HALP_MPS_INTERRUPT_ROUTE, *PHALP_MPS_INTERRUPT_ROUTE;
+
+typedef struct _HALP_MPS_EXT_ADDRESS_RANGE
+{
+    UCHAR BusId;
+    UCHAR AddressType;
+    ULONGLONG BaseAddress;
+    ULONGLONG AddressLength;
+} HALP_MPS_EXT_ADDRESS_RANGE, *PHALP_MPS_EXT_ADDRESS_RANGE;
+
+typedef struct _HALP_MPS_BUS_HIERARCHY
+{
+    UCHAR BusId;
+    UCHAR BusInfo;
+    UCHAR ParentBus;
+} HALP_MPS_BUS_HIERARCHY, *PHALP_MPS_BUS_HIERARCHY;
+
+typedef struct _HALP_MPS_COMPATIBILITY_RANGE
+{
+    UCHAR BusId;
+    UCHAR Modifier;
+    ULONG Address;
+} HALP_MPS_COMPATIBILITY_RANGE, *PHALP_MPS_COMPATIBILITY_RANGE;
+
 typedef struct _HALP_APIC_INFO_TABLE
 {
     ULONG ApicMode;
-    ULONG ProcessorCount; /* Count of all physical cores, This includes BSP */
+    ULONG ProcessorCount;
     ULONG IOAPICCount;
-    ULONG LocalApicPA;                // The 32-bit physical address at which each processor can access its local interrupt controller
+    ULONG LocalApicPA;
     ULONG IoApicVA[HALP_APIC_INFO_TABLE_IOAPIC_NUMBER];
     ULONG IoApicPA[HALP_APIC_INFO_TABLE_IOAPIC_NUMBER];
-    ULONG IoApicIrqBase[HALP_APIC_INFO_TABLE_IOAPIC_NUMBER]; // Global system interrupt base
-    ULONG IsaIrqGsi[HALP_ISA_IRQ_COUNT];                     // Interrupt source override target
-    KINTERRUPT_POLARITY IsaIrqPolarity[HALP_ISA_IRQ_COUNT];  // Unknown when conforming to the bus
+    ULONG IoApicId[HALP_APIC_INFO_TABLE_IOAPIC_NUMBER];
+    ULONG IoApicIrqBase[HALP_APIC_INFO_TABLE_IOAPIC_NUMBER];
+    ULONG IsaIrqGsi[HALP_ISA_IRQ_COUNT];
+    KINTERRUPT_POLARITY IsaIrqPolarity[HALP_ISA_IRQ_COUNT];
+    KINTERRUPT_MODE IsaIrqTrigger[HALP_ISA_IRQ_COUNT];
+    ULONG MpsInterruptRouteCount;
+    HALP_MPS_INTERRUPT_ROUTE MpsInterruptRoutes[HALP_MPS_MAX_INTERRUPT_ROUTES];
+    ULONG MpsExtendedAddressRangeCount;
+    HALP_MPS_EXT_ADDRESS_RANGE MpsExtendedAddressRanges[HALP_MPS_MAX_EXT_ADDRESS_RANGES];
+    ULONG MpsBusHierarchyCount;
+    HALP_MPS_BUS_HIERARCHY MpsBusHierarchies[HALP_MPS_MAX_BUS_HIERARCHIES];
+    ULONG MpsCompatibilityRangeCount;
+    HALP_MPS_COMPATIBILITY_RANGE MpsCompatibilityRanges[HALP_MPS_MAX_COMPATIBILITY_RANGES];
+    BOOLEAN MpsImcrPresent;
 } HALP_APIC_INFO_TABLE, *PHALP_APIC_INFO_TABLE;
 
 /* HALP_APIC_INFO_TABLE.ApicMode values */
