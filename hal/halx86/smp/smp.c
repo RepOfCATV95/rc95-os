@@ -14,6 +14,35 @@
 #define NDEBUG
 #include <debug.h>
 
+/* Shared processor state and real-mode AP trampoline storage. */
+PROCESSOR_IDENTITY HalpProcessorIdentity[MAXIMUM_PROCESSORS];
+PHYSICAL_ADDRESS HalpLowStubPhysicalAddress;
+PVOID HalpLowStub;
+
+BOOLEAN
+NTAPI
+HalpInitializeLowStub(_In_ PLOADER_PARAMETER_BLOCK LoaderBlock)
+{
+    if (HalpLowStub && HalpLowStubPhysicalAddress.QuadPart)
+        return TRUE;
+
+    HalpLowStubPhysicalAddress.QuadPart = HalpAllocPhysicalMemory(
+        LoaderBlock, 0x100000, HALP_LOW_STUB_SIZE_IN_PAGES, FALSE);
+    if (!HalpLowStubPhysicalAddress.QuadPart)
+        return FALSE;
+
+    HalpLowStub = HalpMapPhysicalMemory64(HalpLowStubPhysicalAddress,
+                                          HALP_LOW_STUB_SIZE_IN_PAGES);
+    if (!HalpLowStub)
+    {
+        HalpLowStubPhysicalAddress.QuadPart = 0;
+        return FALSE;
+    }
+
+    RtlZeroMemory(HalpLowStub, HALP_LOW_STUB_SIZE_IN_PAGES * PAGE_SIZE);
+    return TRUE;
+}
+
 /* FUNCTIONS *****************************************************************/
 
 VOID
@@ -28,6 +57,7 @@ HalpSetupProcessorsTable(
      */
     CurrentPrcb = KeGetCurrentPrcb();
     HalpProcessorIdentity[NTProcessorNumber].ProcessorPrcb = CurrentPrcb;
+    HalpProcessorIdentity[NTProcessorNumber].ProcessorStarted = TRUE;
 }
 
 VOID
