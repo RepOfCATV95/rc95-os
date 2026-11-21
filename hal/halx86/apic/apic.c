@@ -639,6 +639,10 @@ ApicInitializeIOApic(VOID)
     ULONG Index, Vector, Input;
     UCHAR Register;
 
+    /* Rebuild the runtime controller/GSI map from firmware topology. */
+    HalpIoApicCount = 0;
+    HalpMaxGsi = 0;
+
     /* Use the I/O APICs from the MADT, or the default one without it */
     for (Index = 0; Index < HALP_APIC_INFO_TABLE_IOAPIC_NUMBER; Index++)
     {
@@ -702,6 +706,9 @@ ApicInitializeIOApic(VOID)
                 }
                 break;
             }
+            if (Route->GlobalSystemInterrupt == MAXULONG)
+                DPRINT1("HALMP: MPS route destination IOAPIC ID %u was not found\n",
+                        Route->DestinationApic);
         }
     }
 
