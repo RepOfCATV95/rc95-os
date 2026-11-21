@@ -12,7 +12,7 @@ typedef struct _PROCESSOR_IDENTITY
 {
     ULONG ProcessorId;
     ULONG LapicId;
-    BOOLEAN ProcessorStarted;
+    volatile BOOLEAN ProcessorStarted;
     BOOLEAN BSPCheck;
     PKPRCB ProcessorPrcb;
 } PROCESSOR_IDENTITY, *PPROCESSOR_IDENTITY;
