@@ -19,6 +19,13 @@ typedef struct _PROCESSOR_IDENTITY
 
 extern PROCESSOR_IDENTITY HalpProcessorIdentity[MAXIMUM_PROCESSORS];
 
+extern PHYSICAL_ADDRESS HalpLowStubPhysicalAddress;
+extern PVOID HalpLowStub;
+
+BOOLEAN
+NTAPI
+HalpInitializeLowStub(_In_ PLOADER_PARAMETER_BLOCK LoaderBlock);
+
 /* This table is counter of the overall APIC constants acquired from madt */
 #define HALP_APIC_INFO_TABLE_IOAPIC_NUMBER 256 // ACPI_MADT_IO_APIC.Id is a UINT8.
 #define HALP_ISA_IRQ_COUNT 16
