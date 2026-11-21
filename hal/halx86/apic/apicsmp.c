@@ -65,17 +65,26 @@ ApicRequestGlobalInterrupt(
     _In_ APIC_DSH DestinationShortHand)
 {
     ULONG Flags;
+    ULONG Wait;
     APIC_INTERRUPT_COMMAND_REGISTER Icr;
 
     /* Disable interrupts so that we can change IRR without being interrupted */
     Flags = __readeflags();
     _disable();
 
-    /* Wait for the APIC to be idle */
-    do
+    /* Never spin forever if the local APIC is wedged or disabled. */
+    for (Wait = 0; Wait < 100000; ++Wait)
     {
         Icr.Long0 = ApicRead(APIC_ICR0);
-    } while (Icr.DeliveryStatus);
+        if (!Icr.DeliveryStatus)
+            break;
+    }
+    if (Wait == 100000)
+    {
+        DPRINT1("HAL: Timed out waiting for APIC ICR to become idle\\n");
+        if (Flags & EFLAGS_INTERRUPT_MASK) _enable();
+        return;
+    }
 
     /* Setup the command register */
     Icr.LongLong = 0;
@@ -92,6 +101,16 @@ ApicRequestGlobalInterrupt(
     /* Write the low dword last to send the interrupt */
     ApicWrite(APIC_ICR1, Icr.Long1);
     ApicWrite(APIC_ICR0, Icr.Long0);
+
+    /* Wait for delivery completion, with a bounded timeout. */
+    for (Wait = 0; Wait < 100000; ++Wait)
+    {
+        if (!(ApicRead(APIC_ICR0) & (1u << 12)))
+            break;
+    }
+    if (Wait == 100000)
+        DPRINT1("HAL: APIC IPI delivery timed out (destination %u, vector %u)\\n",
+                DestinationProcessor, Vector);
 
     /* Finally, restore the original interrupt state */
     if (Flags & EFLAGS_INTERRUPT_MASK)
