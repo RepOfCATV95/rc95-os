@@ -17,6 +17,7 @@
 
 /* Filled from the MADT by acpi/madt.c, which not every APIC HAL links */
 HALP_APIC_INFO_TABLE HalpApicInfoTable;
+PROCESSOR_IDENTITY HalpProcessorIdentity[MAXIMUM_PROCESSORS];
 
 UCHAR HalpSerialLen;
 CHAR HalpSerialNumber[31];

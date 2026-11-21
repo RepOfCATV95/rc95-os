@@ -22,7 +22,6 @@
 /* Defined in generic/misc.c */
 extern HALP_APIC_INFO_TABLE HalpApicInfoTable;
 
-PROCESSOR_IDENTITY HalpProcessorIdentity[MAXIMUM_PROCESSORS];
 
 extern ULONG HalpPicVectorRedirect[HALP_ISA_IRQ_COUNT];
 
