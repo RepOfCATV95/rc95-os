@@ -5,7 +5,6 @@ list(APPEND HAL_LEGACY_SOURCE
     legacy/bus/bushndlr.c
     legacy/bus/cmosbus.c
     legacy/bus/isabus.c
-    legacy/bus/pcibus.c
     legacy/pir/legacypcirqarb.c
     ${CMAKE_CURRENT_BINARY_DIR}/pci_classes.c
     ${CMAKE_CURRENT_BINARY_DIR}/pci_vendors.c
@@ -13,7 +12,7 @@ list(APPEND HAL_LEGACY_SOURCE
     legacy/bussupp.c
     legacy/halpnpdd.c
     legacy/halpcat.c
-    smp/mps/mps.c)
+)
 
 add_library(lib_hal_legacy OBJECT ${HAL_LEGACY_SOURCE})
 #add_pch(lib_hal_legacy include/hal.h)

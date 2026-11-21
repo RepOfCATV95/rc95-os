@@ -62,7 +62,8 @@ ApicRequestGlobalInterrupt(
     _In_ UCHAR Vector,
     _In_ APIC_MT MessageType,
     _In_ APIC_TGM TriggerMode,
-    _In_ APIC_DSH DestinationShortHand)
+    _In_ APIC_DSH DestinationShortHand,
+    _In_ BOOLEAN Assert)
 {
     ULONG Flags;
     ULONG Wait;
@@ -92,8 +93,10 @@ ApicRequestGlobalInterrupt(
     Icr.MessageType = MessageType;
     Icr.DestinationMode = APIC_DM_Physical;
     Icr.DeliveryStatus = 0;
-    Icr.Level = 0;
-    Icr.TriggerMode = TriggerMode;
+    /* INIT is level-triggered: Level=1 asserts INIT and Level=0 deasserts it.
+     * Other message types always use Level=0. */
+    Icr.Level = (MessageType == APIC_MT_INIT && Assert) ? 1 : 0;
+    Icr.TriggerMode = (MessageType == APIC_MT_INIT) ? APIC_TGM_Level : TriggerMode;
     Icr.RemoteReadStatus = 0;
     Icr.DestinationShortHand = DestinationShortHand;
     Icr.Destination = DestinationProcessor;
@@ -135,11 +138,11 @@ ApicStartApplicationProcessor(
 
     /* Init IPI */
     ApicRequestGlobalInterrupt(HalpProcessorIdentity[NTProcessorNumber].LapicId, 0,
-        APIC_MT_INIT, APIC_TGM_Edge, APIC_DSH_Destination);
+        APIC_MT_INIT, APIC_TGM_Level, APIC_DSH_Destination, TRUE);
 
-    /* De-Assert Init IPI */
+    /* De-assert INIT before sending a startup IPI. */
     ApicRequestGlobalInterrupt(HalpProcessorIdentity[NTProcessorNumber].LapicId, 0,
-        APIC_MT_INIT, APIC_TGM_Level, APIC_DSH_Destination);
+        APIC_MT_INIT, APIC_TGM_Level, APIC_DSH_Destination, FALSE);
 
     /* Give the APIC time to latch INIT before the first SIPI: MPS Spec - B.4 */
     KeStallExecutionProcessor(10000);
@@ -150,14 +153,14 @@ ApicStartApplicationProcessor(
     {
         /* First Startup IPI */
         ApicRequestGlobalInterrupt(HalpProcessorIdentity[NTProcessorNumber].LapicId, (StartupLoc.LowPart) >> 12,
-            APIC_MT_Startup, APIC_TGM_Edge, APIC_DSH_Destination);
+            APIC_MT_Startup, APIC_TGM_Edge, APIC_DSH_Destination, FALSE);
 
         /* Stall between SIPIs: MPS Spec - B.4 */
         KeStallExecutionProcessor(200);
 
         /* Second Startup IPI, required unconditionally by the MP Spec */
         ApicRequestGlobalInterrupt(HalpProcessorIdentity[NTProcessorNumber].LapicId, (StartupLoc.LowPart) >> 12,
-            APIC_MT_Startup, APIC_TGM_Edge, APIC_DSH_Destination);
+            APIC_MT_Startup, APIC_TGM_Edge, APIC_DSH_Destination, FALSE);
 
         /* Give the AP time to come up before returning */
         KeStallExecutionProcessor(200);
@@ -186,7 +189,7 @@ HalpBroadcastIpiSpecifyVector(
                                Vector,
                                APIC_MT_Fixed,
                                APIC_TGM_Edge,
-                               DestinationShortHand);
+                               DestinationShortHand, FALSE);
 }
 
 /*!
@@ -242,7 +245,7 @@ HalRequestIpiSpecifyVector(
                                    Vector,
                                    APIC_MT_Fixed,
                                    APIC_TGM_Edge,
-                                   APIC_DSH_Destination);
+                                   APIC_DSH_Destination, FALSE);
     }
 }
 
@@ -327,7 +330,7 @@ HalpSendNMI(
                                    0,
                                    APIC_MT_NMI,
                                    APIC_TGM_Edge,
-                                   APIC_DSH_Destination);
+                                   APIC_DSH_Destination, FALSE);
     }
 }
 
