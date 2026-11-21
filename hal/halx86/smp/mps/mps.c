@@ -221,9 +221,13 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
         } else if (Entry[0] == MPS_IOAPIC) {
             PHALP_MPS_IOAPIC Io = (PHALP_MPS_IOAPIC)Entry;
             if ((Io->Flags & 1) && IoCount < HALP_APIC_INFO_TABLE_IOAPIC_NUMBER)
+            {
+                if (Io->Address == 0)
+                    return FALSE;
                 HalpApicInfoTable.IoApicPA[IoCount] = Io->Address;
                 HalpApicInfoTable.IoApicId[IoCount] = Io->ApicId;
                 ++IoCount;
+            }
         } else if (Entry[0] == MPS_INTSRC) {
             HALP_MPS_INTERRUPT_ROUTE *Route;
             ULONG n = HalpApicInfoTable.MpsInterruptRouteCount;
@@ -284,8 +288,7 @@ HalpParseApicTables(_In_ PLOADER_PARAMETER_BLOCK LoaderBlock)
     Fp = HalpMpsFindFloatingPointer();
     if (!Fp || Fp->Feature[0] != 0 || Fp->TableAddress == 0 ||
         !HalpMpsParseTable((PHALP_MPS_HEADER)(ULONG_PTR)Fp->TableAddress)) {
-        DPRINT1("HALMP: No usable Intel MPS configuration; continuing with BSP only
-");
+        DPRINT1("HALMP: No usable Intel MPS configuration; continuing with BSP only\\n");
         RtlZeroMemory(&HalpApicInfoTable, sizeof(HalpApicInfoTable));
         HalpMpsUseBspOnly();
     } else {
@@ -298,12 +301,10 @@ HalpPrintApicTables(VOID)
 {
 #if DBG
     ULONG i;
-    DPRINT1("HALMP: Physical processor count: %lu
-",
+    DPRINT1("HALMP: Physical processor count: %lu\\n",
             HalpApicInfoTable.ProcessorCount);
     for (i = 0; i < HalpApicInfoTable.ProcessorCount; ++i)
-        DPRINT1(" CPU %lu: APIC ID %lu, BSP %u, Started %u, PRCB %p
-",
+        DPRINT1(" CPU %lu: APIC ID %lu, BSP %u, Started %u, PRCB %p\\n",
                 i, HalpProcessorIdentity[i].LapicId,
                 HalpProcessorIdentity[i].BSPCheck,
                 HalpProcessorIdentity[i].ProcessorStarted,
