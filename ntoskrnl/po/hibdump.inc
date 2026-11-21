@@ -1025,7 +1025,7 @@ PopDumpStackInitialize(
 
     Status = ObReferenceObjectByHandle(Context->LinkFileHandle,
                                        FILE_READ_DATA,
-                                       *IoFileObjectType,
+                                       IoFileObjectType,
                                        KernelMode,
                                        (PVOID *)&FileObject,
                                        NULL);
