@@ -134,6 +134,12 @@
 #include <arch/mips/arcbios.h>
 #endif
 
+#ifdef NEW_VISTA
+#define TARGET_OS_VERSION _WIN32_WINNT_VISTA
+#else
+#define TARGET_OS_VERSION _WIN32_WINNT_WS03
+#endif
+
 VOID __cdecl BootMain(IN PCCH CmdLine);
 
 #ifdef HAS_DEPRECATED_OPTIONS

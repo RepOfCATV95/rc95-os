@@ -14,6 +14,12 @@
 #define HIBER_MAINTAG 'Hibe'
 #define HIBER_WAKE_TAG 'WbiH'
 #define HIBER_MEMORY_CHUNK_SIZE (64 * 1024)
+#define HIBER_LZ_HASH_SIZE 4096
+#define HIBER_LZ_MAX_MATCH 18
+#define HIBER_LZ_MIN_MATCH 3
+#define HIBER_LZ_OFFSET_MASK 0x0FFF
+#define HIBER_CHUNK_COMPRESSED 0x80000000UL
+#define HIBER_CHUNK_LENGTH_MASK 0x7FFFFFFFUL
 #define HIBER_MAX_ULONGLONG ((ULONGLONG)~0ULL)
 #define HIBER_CR4_PAE 0x00000020
 
@@ -21,6 +27,7 @@ C_ASSERT(sizeof(KPROCESSOR_STATE) + 15 + 512 <= HIBERFILE_CPU_STATE_MAX_SIZE);
 
 PPOP_HIBER_CONTEXT PopHiberContext;
 static KSPIN_LOCK PopHiberLock;
+static BOOLEAN PopHiberInitialized;
 extern PLOADER_PARAMETER_BLOCK KeLoaderBlock;
 
 typedef struct _POP_HIBER_SERIALIZATION_CONTEXT
@@ -66,6 +73,126 @@ PopHiberCalculateMemoryChecksum(
 
     return CheckSum;
 }
+
+/*
+ * Small bounded LZ codec used only for hibernation memory chunks. The stream
+ * consists of groups of up to eight tokens, preceded by a control byte. A
+ * set control bit denotes a two-byte (offset,length) back-reference; a clear
+ * bit denotes one literal byte. The offset is 1..4096 and the match length is
+ * 3..18. This deliberately avoids depending on pageable RTL compression
+ * entry points while the hibernation path is running.
+ */
+#if defined(HIBERFILE_SUPPORTS_LZ_CHUNKS)
+static
+ULONG
+PopHiberLzHash(
+    _In_reads_bytes_(3) const UCHAR *Input)
+{
+    ULONG Hash = ((ULONG)Input[0] * 251u) ^
+                 ((ULONG)Input[1] * 31u) ^ Input[2];
+    return Hash & (HIBER_LZ_HASH_SIZE - 1);
+}
+
+static
+BOOLEAN
+PopHiberLzCompress(
+    _In_reads_bytes_(InputLength) const UCHAR *Input,
+    _In_ ULONG InputLength,
+    _Inout_updates_(HIBER_LZ_HASH_SIZE) PULONG HashTable,
+    _Out_writes_bytes_(OutputCapacity) PUCHAR Output,
+    _In_ ULONG OutputCapacity,
+    _Out_ PULONG OutputLength)
+{
+    ULONG InPos = 0, OutPos = 0;
+
+    if (Input == NULL || Output == NULL || HashTable == NULL ||
+        OutputLength == NULL || InputLength == 0)
+        return FALSE;
+
+    RtlFillMemory(HashTable,
+                  HIBER_LZ_HASH_SIZE * sizeof(*HashTable),
+                  0xFF);
+
+    while (InPos < InputLength)
+    {
+        ULONG ControlPosition;
+        UCHAR Control = 0;
+        ULONG Token;
+
+        if (OutPos >= OutputCapacity)
+            return FALSE;
+        ControlPosition = OutPos++;
+
+        for (Token = 0; Token < 8 && InPos < InputLength; ++Token)
+        {
+            ULONG MatchPosition = 0xFFFFFFFFUL;
+            ULONG MatchLength = 0;
+            ULONG Hash = 0;
+
+            if (InPos + HIBER_LZ_MIN_MATCH <= InputLength)
+            {
+                Hash = PopHiberLzHash(Input + InPos);
+                MatchPosition = HashTable[Hash];
+                HashTable[Hash] = InPos;
+
+                if (MatchPosition != 0xFFFFFFFFUL &&
+                    InPos > MatchPosition &&
+                    InPos - MatchPosition <= 4096)
+                {
+                    ULONG Limit = InputLength - InPos;
+                    if (Limit > HIBER_LZ_MAX_MATCH)
+                        Limit = HIBER_LZ_MAX_MATCH;
+                    while (MatchLength < Limit &&
+                           Input[MatchPosition + MatchLength] ==
+                           Input[InPos + MatchLength])
+                    {
+                        ++MatchLength;
+                    }
+                }
+            }
+
+            if (MatchLength >= HIBER_LZ_MIN_MATCH)
+            {
+                ULONG Offset = InPos - MatchPosition;
+                USHORT Encoded;
+
+                if (OutPos > OutputCapacity - 2)
+                    return FALSE;
+                Encoded = (USHORT)(((Offset - 1) & HIBER_LZ_OFFSET_MASK) |
+                         ((MatchLength - HIBER_LZ_MIN_MATCH) << 12));
+                Output[OutPos++] = (UCHAR)Encoded;
+                Output[OutPos++] = (UCHAR)(Encoded >> 8);
+
+                /* Seed hashes for positions skipped by this match. */
+                {
+                    ULONG Advance = MatchLength;
+                    while (Advance > 1 &&
+                           InPos + 1 + HIBER_LZ_MIN_MATCH <= InputLength)
+                    {
+                        ++InPos;
+                        --Advance;
+                        HashTable[PopHiberLzHash(Input + InPos)] = InPos;
+                    }
+                    InPos += Advance;
+                }
+                Control |= (UCHAR)(1u << Token);
+            }
+            else
+            {
+                if (OutPos >= OutputCapacity)
+                    return FALSE;
+                Output[OutPos++] = Input[InPos++];
+            }
+        }
+
+        Output[ControlPosition] = Control;
+    }
+
+    *OutputLength = OutPos;
+    return TRUE;
+}
+
+#endif /* HIBERFILE_SUPPORTS_LZ_CHUNKS */
 
 static
 NTSTATUS
@@ -148,6 +275,9 @@ PopHiberWriteMemoryChunk(
     ULONGLONG ChunkPayloadSize;
     ULONGLONG FileOffset;
     ULONGLONG PageCount;
+    ULONG StoredLength = Length;
+    PUCHAR StoredBuffer;
+    BOOLEAN Compressed = FALSE;
     NTSTATUS Status;
 
     if (SerializationContext == NULL ||
@@ -165,6 +295,40 @@ PopHiberWriteMemoryChunk(
         return STATUS_INVALID_PARAMETER;
 
     RtlCopyMemory(SerializationContext->Buffer, MappedAddress, Length);
+    StoredBuffer = SerializationContext->Buffer;
+
+#if defined(HIBERFILE_SUPPORTS_LZ_CHUNKS)
+    /*
+     * The on-disk chunk extension stores a 32-bit original length before the
+     * LZ stream. The high bit of ChunkHeader.Length marks this representation;
+     * the low 31 bits contain the stored payload length. The checksum always
+     * covers the original uncompressed page bytes. Do not enable this define
+     * until the boot/resume image reader understands this chunk encoding.
+     */
+    if (HiberContext->CompressionWorkspace != NULL &&
+        HiberContext->CompressedWriteBuffer != NULL &&
+        Length <= HIBER_MEMORY_CHUNK_SIZE)
+    {
+        ULONG EncodedLength = 0;
+        PUCHAR Candidate = HiberContext->CompressedWriteBuffer + sizeof(ULONG);
+        ULONG CandidateCapacity = HIBER_MEMORY_CHUNK_SIZE +
+                                  (HIBER_MEMORY_CHUNK_SIZE / 8) + 16;
+
+        if (PopHiberLzCompress(SerializationContext->Buffer,
+                               Length,
+                               (PULONG)HiberContext->CompressionWorkspace,
+                               Candidate,
+                               CandidateCapacity,
+                               &EncodedLength) &&
+            EncodedLength + sizeof(ULONG) + 8 < Length)
+        {
+            *(PULONG)HiberContext->CompressedWriteBuffer = Length;
+            StoredBuffer = HiberContext->CompressedWriteBuffer;
+            StoredLength = EncodedLength + sizeof(ULONG);
+            Compressed = TRUE;
+        }
+    }
+#endif /* HIBERFILE_SUPPORTS_LZ_CHUNKS */
 
     PageCount = Length >> PAGE_SHIFT;
     if (HiberContext->PagesOut > HIBER_MAX_ULONGLONG - PageCount)
@@ -172,7 +336,7 @@ PopHiberWriteMemoryChunk(
 
     PayloadSize = ((ULONGLONG)HiberContext->ImageHeader.PayloadSizeHigh << 32) |
                   HiberContext->ImageHeader.PayloadSizeLow;
-    ChunkPayloadSize = sizeof(ChunkHeader) + (ULONGLONG)Length;
+    ChunkPayloadSize = sizeof(ChunkHeader) + (ULONGLONG)StoredLength;
     if (PayloadSize > HIBER_MAX_ULONGLONG - ChunkPayloadSize ||
         PayloadSize + ChunkPayloadSize >
             0x7FFFFFFFFFFFFFFFULL - sizeof(HiberContext->ImageHeader))
@@ -182,7 +346,8 @@ PopHiberWriteMemoryChunk(
 
     FileOffset = sizeof(HiberContext->ImageHeader) + PayloadSize;
     ChunkHeader.PhysicalAddress = (ULONGLONG)PhysicalAddress.QuadPart;
-    ChunkHeader.Length = Length;
+    ChunkHeader.Length = StoredLength |
+                          (Compressed ? HIBER_CHUNK_COMPRESSED : 0);
     ChunkHeader.CheckSum =
         (ULONG)ChunkHeader.PhysicalAddress ^
         (ULONG)(ChunkHeader.PhysicalAddress >> 32) ^
@@ -197,8 +362,8 @@ PopHiberWriteMemoryChunk(
         return Status;
 
     Status = PopHiberWriteAt(HiberContext,
-                             SerializationContext->Buffer,
-                             Length,
+                             StoredBuffer,
+                             StoredLength,
                              FileOffset + sizeof(ChunkHeader));
     if (!NT_SUCCESS(Status))
         return Status;
@@ -390,6 +555,26 @@ PopHiberSerializeMemory(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+#if defined(HIBERFILE_SUPPORTS_LZ_CHUNKS)
+    if (Context->CompressionWorkspace == NULL)
+    {
+        Context->CompressionWorkspace =
+            ExAllocatePoolWithTag(NonPagedPool,
+                                  HIBER_LZ_HASH_SIZE * sizeof(ULONG),
+                                  HIBER_MAINTAG);
+    }
+    if (Context->CompressedWriteBuffer == NULL)
+    {
+        Context->CompressedWriteBuffer =
+            ExAllocatePoolWithTag(NonPagedPool,
+                                  HIBER_MEMORY_CHUNK_SIZE +
+                                  (HIBER_MEMORY_CHUNK_SIZE / 8) +
+                                  sizeof(ULONG) + 16,
+                                  HIBER_MAINTAG);
+    }
+#endif /* HIBERFILE_SUPPORTS_LZ_CHUNKS */
+
+    /* Compression allocation failure leaves raw chunk I/O valid. */
     Status = MiSerializePhysicalMemory(Ranges,
                                       RangeCount,
                                       HIBER_MEMORY_CHUNK_SIZE,
@@ -424,6 +609,113 @@ PopInitializeHiberContext(
     InitializeListHead(&Context->ClonedRanges);
 }
 
+/* Initialize hibernation state during phase-0 power-manager startup. */
+NTSTATUS
+NTAPI
+PopHiberInitSystem(
+    VOID
+)
+{
+    if (PopHiberInitialized)
+        return STATUS_SUCCESS;
+
+    KeInitializeSpinLock(&PopHiberLock);
+    PopHiberInitialized = TRUE;
+
+    PopHiberContext = ExAllocatePoolWithTag(NonPagedPool,
+                                            sizeof(POP_HIBER_CONTEXT),
+                                            HIBER_MAINTAG);
+    if (PopHiberContext == NULL)
+    {
+        PopHiberInitialized = FALSE;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    PopInitializeHiberContext(PopHiberContext);
+    PopCapabilities.HiberFilePresent = FALSE;
+
+    return STATUS_SUCCESS;
+}
+
+#if defined(_M_IX86) || defined(_M_AMD64)
+/*
+ * Called on the resumed system, right after KeSaveStateForHibernate returned
+ * for the second time. By now WakeState holds the state of the machine as
+ * the resume stub left it: the capture in KeSaveStateForHibernate runs again
+ * on resume and overwrites the control registers that were saved before
+ * hibernating. The original copy is in the image header, which comes back
+ * with the rest of memory. Put it back in the processor, including the parts
+ * that are not in the saved context (MSRs, FPU/SSE state).
+ */
+static
+NTSTATUS
+PopHiberRestoreProcessorState(
+    _Inout_ PPOP_HIBER_CONTEXT Context
+)
+{
+    PO_HIBER_IMAGE_HEADER *Header = &Context->ImageHeader;
+    DECLSPEC_ALIGN(16) UCHAR FxStateBuffer[512];
+    BOOLEAN Interrupts;
+    ULONG Cr0;
+
+    if (!(Header->Flags & HIBERFILE_FLAG_HAS_CPU_STATE) ||
+        Header->CpuStateVersion != HIBERFILE_CPU_STATE_VERSION ||
+        Header->CpuStateSize != sizeof(*Context->WakeState) ||
+        Context->WakeState == NULL)
+    {
+        return STATUS_DEVICE_DATA_ERROR;
+    }
+
+    if ((Header->Flags & HIBERFILE_FLAG_HAS_FX_STATE) &&
+        (Header->FxStateSize != sizeof(FxStateBuffer) ||
+         Header->FxStateOffset > HIBERFILE_CPU_STATE_MAX_SIZE ||
+         Header->FxStateSize >
+             HIBERFILE_CPU_STATE_MAX_SIZE - Header->FxStateOffset))
+    {
+        return STATUS_DEVICE_DATA_ERROR;
+    }
+
+    /* The header is not suitably aligned for a KPROCESSOR_STATE */
+    RtlCopyMemory(Context->WakeState, Header->CpuState, sizeof(*Context->WakeState));
+
+    Interrupts = KeDisableInterrupts();
+
+    KiRestoreProcessorControlState(Context->WakeState);
+    KiRestoreProcessorMsrState();
+
+    if (Header->Flags & HIBERFILE_FLAG_HAS_FPU_STATE)
+    {
+        Cr0 = __readcr0();
+        __writecr0(Cr0 & ~(CR0_MP | CR0_EM | CR0_TS));
+
+        if (Header->Flags & HIBERFILE_FLAG_HAS_FX_STATE)
+        {
+            RtlCopyMemory(FxStateBuffer,
+                          Header->CpuState + Header->FxStateOffset,
+                          sizeof(FxStateBuffer));
+#if defined(_M_AMD64)
+            _fxrstor64(FxStateBuffer);
+#else
+            Ke386RestoreFpuState((PFX_SAVE_AREA)FxStateBuffer);
+#endif
+        }
+#if defined(_M_IX86)
+        else
+        {
+            /* Pre-FXSR CPUs: the FNSAVE image is in the saved context */
+            Ke386RestoreFpuState(
+                (PFX_SAVE_AREA)&Context->WakeState->ContextFrame.FloatSave);
+        }
+#endif
+
+        __writecr0(Cr0);
+    }
+
+    KeRestoreInterrupts(Interrupts);
+    return STATUS_SUCCESS;
+}
+#endif
+
 NTSTATUS
 NTAPI
 PopHiberSystemHandler(
@@ -435,6 +727,8 @@ PopHiberSystemHandler(
     return STATUS_NOT_SUPPORTED;
 #else
     PPOP_HIBER_CONTEXT Context = SystemContext;
+    BOOLEAN Interrupts;
+    KIRQL OldIrql;
     NTSTATUS Status;
 
     if (Context == NULL)
@@ -459,11 +753,45 @@ PopHiberSystemHandler(
     }
 
     RtlZeroMemory(Context->WakeState, sizeof(*Context->WakeState));
+
+    /*
+     * Capture the processor and FPU state at DISPATCH_LEVEL with interrupts
+     * off: no thread switch, DPC or interrupt handler may change the
+     * registers between the capture, the test of ResumeFlag below and the
+     * copy into the image header. The IRQL is part of the captured state
+     * (CR8 on amd64), so the resumed system comes back at DISPATCH_LEVEL too.
+     *
+     * Interrupts and the IRQL are put back before the image is written. That
+     * part needs ZwWriteFile, which must run at PASSIVE_LEVEL with working
+     * disk interrupts, so it can't be done at DISPATCH_LEVEL.
+     *
+     * The captured context has IF clear, so the resumed system also arrives
+     * here with interrupts off and leaves at the same place.
+     */
+    KeRaiseIrql(DISPATCH_LEVEL, &OldIrql);
+    Interrupts = KeDisableInterrupts();
     KeSaveStateForHibernate(Context->WakeState);
+
+    /*
+     * On the resumed system execution continues right here. Nothing below
+     * may run again: it would overwrite the CPU state that was stored in the
+     * image header before hibernating with the one of the resumed machine.
+     */
+    if (Context->ResumeFlag)
+    {
+        Status = PopHiberRestoreProcessorState(Context);
+        KeRestoreInterrupts(Interrupts);
+        KeLowerIrql(OldIrql);
+        return Status;
+    }
 
 #if defined(_M_IX86)
     if (Context->WakeState->SpecialRegisters.Cr4 & HIBER_CR4_PAE)
+    {
+        KeRestoreInterrupts(Interrupts);
+        KeLowerIrql(OldIrql);
         return STATUS_NOT_SUPPORTED;
+    }
 #endif
 
     Context->ImageHeader.CpuStateVersion = HIBERFILE_CPU_STATE_VERSION;
@@ -533,8 +861,9 @@ PopHiberSystemHandler(
                   Context->WakeState,
                   sizeof(*Context->WakeState));
 
-    if (Context->ResumeFlag)
-        return STATUS_SUCCESS;
+    /* The state is complete; the rest of the work is file I/O at PASSIVE_LEVEL */
+    KeRestoreInterrupts(Interrupts);
+    KeLowerIrql(OldIrql);
 
     Status = PopSaveHiberContextStates(Context);
     if (!NT_SUCCESS(Status))
@@ -701,7 +1030,11 @@ PopHiberOpenFile(
         if (PopHiberContext == NULL)
             return STATUS_INSUFFICIENT_RESOURCES;
 
-        KeInitializeSpinLock(&PopHiberLock);
+        if (!PopHiberInitialized)
+        {
+            KeInitializeSpinLock(&PopHiberLock);
+            PopHiberInitialized = TRUE;
+        }
         PopInitializeHiberContext(PopHiberContext);
         NewContext = TRUE;
     }

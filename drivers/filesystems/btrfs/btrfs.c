@@ -4626,23 +4626,33 @@ static NTSTATUS mount_vol(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp) {
     if (!(Vcb->superblock.incompat_flags & BTRFS_INCOMPAT_FLAGS_METADATA_UUID))
         Vcb->superblock.metadata_uuid = Vcb->superblock.uuid;
 
-    Vcb->readonly = false;
+    InterlockedExchange(&Vcb->readonly, FALSE);
     if (Vcb->superblock.compat_ro_flags & ~COMPAT_RO_SUPPORTED) {
         WARN("mounting read-only because of unsupported flags (%I64x)\n", Vcb->superblock.compat_ro_flags & ~COMPAT_RO_SUPPORTED);
-        Vcb->readonly = true;
+        InterlockedExchange(&Vcb->readonly, TRUE);
     }
 
     if (Vcb->options.readonly)
-        Vcb->readonly = true;
+        InterlockedExchange(&Vcb->readonly, TRUE);
 
     calculate_sector_shift(Vcb);
 
     Vcb->superblock.generation++;
     Vcb->superblock.incompat_flags |= BTRFS_INCOMPAT_FLAGS_MIXED_BACKREF;
 
+    /*
+     * A non-zero log tree requires transaction-log replay before the main
+     * roots can be treated as consistent. Clearing this pointer without
+     * replay discards committed metadata after an unclean shutdown.
+     * Until replay is implemented, fail the mount rather than silently
+     * mounting a potentially inconsistent filesystem writable.
+     */
     if (Vcb->superblock.log_tree_addr != 0) {
-        FIXME("FIXME - replay transaction log (clearing for now)\n");
-        Vcb->superblock.log_tree_addr = 0;
+        ERR("transaction log replay is not implemented; refusing mount "
+            "instead of discarding log tree at %I64x\\n",
+            Vcb->superblock.log_tree_addr);
+        Status = STATUS_NOT_SUPPORTED;
+        goto exit;
     }
 
     switch (Vcb->superblock.csum_type) {
@@ -4767,7 +4777,7 @@ static NTSTATUS mount_vol(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp) {
         }
 
         if (dev->readonly && !Vcb->readonly) {
-            Vcb->readonly = true;
+            InterlockedExchange(&Vcb->readonly, TRUE);
 
             le = Vcb->devices.Flink;
             while (le != &Vcb->devices) {
@@ -4777,7 +4787,7 @@ static NTSTATUS mount_vol(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp) {
                     break;
 
                 if (!dev2->readonly) {
-                    Vcb->readonly = false;
+                    InterlockedExchange(&Vcb->readonly, FALSE);
                     break;
                 }
 
@@ -4790,7 +4800,7 @@ static NTSTATUS mount_vol(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP Irp) {
     } else {
         if (dev->readonly) {
             WARN("setting volume to readonly as device is readonly\n");
-            Vcb->readonly = true;
+            InterlockedExchange(&Vcb->readonly, TRUE);
         }
     }
 

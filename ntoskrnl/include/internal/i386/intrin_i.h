@@ -135,11 +135,11 @@ Ke386SaveFpuState(IN PFX_SAVE_AREA SaveArea)
     extern ULONG KeI386FxsrPresent;
     if (KeI386FxsrPresent)
     {
-        __asm__ __volatile__ ("fxsave %0\n" : : "m"(*SaveArea));
+        __asm__ __volatile__ ("fxsave %0\n" : "=m"(*SaveArea));
     }
     else
     {
-        __asm__ __volatile__ ("fnsave %0\n wait\n" : : "m"(*SaveArea));
+        __asm__ __volatile__ ("fnsave %0\n wait\n" : "=m"(*SaveArea));
     }
 }
 
@@ -154,7 +154,7 @@ Ke386RestoreFpuState(_In_ PFX_SAVE_AREA SaveArea)
     }
     else
     {
-        __asm__ __volatile__ ("frstor %0\n\t" : "=m" (*SaveArea));
+        __asm__ __volatile__ ("frstor %0\n\t" : : "m"(*SaveArea));
     }
 }
 

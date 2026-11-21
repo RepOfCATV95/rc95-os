@@ -1,10 +1,6 @@
 
 cmake_minimum_required(VERSION 3.17.0)
 
-if(NOT CMAKE_VERSION MATCHES "ReactOS")
-    message(WARNING "Building with \"${CMAKE_COMMAND}\", which is not the custom CMake included in RosBE, might cause build issues...")
-endif()
-
 include(CMakeDependentOption)
 
 # CMAKE_CROSSCOMPILING and MSVC_IDE are not set until project() is called, so let's test this instead
@@ -245,6 +241,13 @@ Enable this if the module uses typeid or dynamic_cast. You will probably need to
                     -DDXGKDDI_INTERFACE_VERSION=0x1052 # Vista
                     -DDLL_EXPORT_VERSION=${DLL_EXPORT_VERSION})
 
+    if(DLL_EXPORT_VERSION GREATER_EQUAL 0x600)
+        add_definitions(-DNEW_VISTA)
+        if(DLL_EXPORT_VERSION GREATER_EQUAL 0x601)
+            add_definitions(-DBT2_BOOT)
+        endif()
+    endif()
+
     # Arch Options
     if(ARCH STREQUAL "i386")
         # clang-cl defines this one for itself
@@ -363,6 +366,7 @@ Enable this if the module uses typeid or dynamic_cast. You will probably need to
 
     #begin with boot so reactos_cab target is defined before all other modules
     add_subdirectory(boot)
+    #add_subdirectory(bootloader)
     add_subdirectory(base)
     add_subdirectory(dll)
     add_subdirectory(drivers)

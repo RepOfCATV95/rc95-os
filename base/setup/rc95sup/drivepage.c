@@ -7,7 +7,7 @@
  *              Copyright 2018-2026 Hermès Bélusca-Maïto <hermes.belusca-maito@reactos.org>
  */
 
-#include "reactos.h"
+#include "rc95sup_header.h"
 #include <shlwapi.h>
 
 #include <math.h> // For pow()

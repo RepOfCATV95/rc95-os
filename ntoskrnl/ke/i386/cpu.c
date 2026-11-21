@@ -671,6 +671,34 @@ KiRestoreProcessorControlState(PKPROCESSOR_STATE ProcessorState)
     Ke386SetLocalDescriptorTable(ProcessorState->SpecialRegisters.Ldtr);
 }
 
+/*
+ * SYSENTER and PAT live in MSRs, which KPROCESSOR_STATE has no room for. They
+ * are programmed during boot and are reset by firmware when the machine goes
+ * through S4, so the resume path has to program them again.
+ */
+#define KI_MSR_PAT          0x277
+#define KI_PAT_KERNEL_VALUE 0x0007010600070106ULL /* WB WC UC- UC, twice */
+
+VOID
+NTAPI
+KiRestoreProcessorMsrState(VOID)
+{
+    if (KeFeatureBits & KF_FAST_SYSCALL)
+    {
+        __writemsr(0x174, KGDT_R0_CODE);
+        __writemsr(0x175, (ULONG_PTR)KeGetCurrentPrcb()->DpcStack);
+        __writemsr(0x176, (ULONG_PTR)KiFastCallEntry);
+    }
+
+    if (KeFeatureBits & KF_PAT)
+    {
+        KeFlushCurrentTb();
+        KeInvalidateAllCaches();
+        __writemsr(KI_MSR_PAT, KI_PAT_KERNEL_VALUE);
+        KeFlushCurrentTb();
+    }
+}
+
 VOID
 NTAPI
 KiSaveProcessorControlState(OUT PKPROCESSOR_STATE ProcessorState)

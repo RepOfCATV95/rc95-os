@@ -9,6 +9,7 @@
 /* INCLUDES ******************************************************************/
 
 #include "ntfslib.h"
+#include "mft.h"
 
 #define NDEBUG
 #include <debug.h>
@@ -16,8 +17,9 @@
 
 /* GLOBALS *******************************************************************/
 
-// The single, shared instance of the format state (declared extern in the header).
+// Legacy format state is serialized until it is moved into a per-operation context.
 NTFS_FORMAT_DATA NtfsFormatData;
+static volatile LONG NtfsFormatInProgress;
 
 
 /* FUNCTIONS *****************************************************************/
@@ -326,8 +328,16 @@ NtfsFormat(
     DISK_GEOMETRY          DiskGeometry;
     NTSTATUS               Status;
     BOOLEAN                Result = FALSE;
+    BOOLEAN                VolumeLocked = FALSE;
+    BOOLEAN                VolumeDismounted = FALSE;
 
     DPRINT1("NtfsFormat(DriveRoot '%wZ')\n", DriveRoot);
+
+    if (DriveRoot == NULL || DriveRoot->Buffer == NULL || DriveRoot->Length == 0 || DriveRoot->Length > DriveRoot->MaximumLength)
+        return FALSE;
+
+    if (InterlockedCompareExchange(&NtfsFormatInProgress, 1, 0) != 0)
+        return FALSE;
 
     // We always perform a quick format (metadata only); the volume body is
     // not zeroed.
@@ -347,6 +357,7 @@ NtfsFormat(
     if (!NT_SUCCESS(Status))
     {
         DPRINT1("NtOpenFile() failed with status 0x%.08x\n", Status);
+        InterlockedExchange(&NtfsFormatInProgress, 0);
         return FALSE;
     }
 
@@ -365,6 +376,7 @@ NtfsFormat(
     {
         DPRINT1("IOCTL_DISK_GET_LENGTH_INFO failed with status 0x%.08x\n", Status);
         NtClose(DiskHandle);
+        InterlockedExchange(&NtfsFormatInProgress, 0);
         return FALSE;
     }
 
@@ -383,6 +395,21 @@ NtfsFormat(
     {
         DPRINT1("IOCTL_DISK_GET_DRIVE_GEOMETRY failed with status 0x%.08x\n", Status);
         NtClose(DiskHandle);
+        InterlockedExchange(&NtfsFormatInProgress, 0);
+        return FALSE;
+    }
+
+    // Reject impossible geometry before it reaches the layout arithmetic.
+    if (LengthInformation.Length.QuadPart <= 0 ||
+        DiskGeometry.BytesPerSector < 512 ||
+        DiskGeometry.BytesPerSector > 4096 ||
+        (DiskGeometry.BytesPerSector & (DiskGeometry.BytesPerSector - 1)) != 0 ||
+        (LengthInformation.Length.QuadPart % DiskGeometry.BytesPerSector) != 0)
+    {
+        DPRINT1("Unsupported disk geometry: length=%I64d, bytes/sector=%lu\n",
+                LengthInformation.Length.QuadPart, DiskGeometry.BytesPerSector);
+        NtClose(DiskHandle);
+        InterlockedExchange(&NtfsFormatInProgress, 0);
         return FALSE;
     }
 
@@ -407,7 +434,11 @@ NtfsFormat(
                               IOCTL_DISK_GET_PARTITION_INFO_EX,
                               NULL, 0,
                               &PartitionInfo, sizeof(PartitionInfo));
-    if (NT_SUCCESS(PartStatus) && DiskGeometry.BytesPerSector != 0)
+    if (NT_SUCCESS(PartStatus) && NT_SUCCESS(Iosb.Status) &&
+        DiskGeometry.BytesPerSector != 0 &&
+        PartitionInfo.StartingOffset.QuadPart >= 0 &&
+        (PartitionInfo.StartingOffset.QuadPart % DiskGeometry.BytesPerSector) == 0 &&
+        (ULONGLONG)(PartitionInfo.StartingOffset.QuadPart / DiskGeometry.BytesPerSector) <= MAXULONG)
     {
         NtfsFormatData.HiddenSectors =
                 (ULONG)(PartitionInfo.StartingOffset.QuadPart / DiskGeometry.BytesPerSector);
@@ -433,8 +464,23 @@ NtfsFormat(
         goto end;
     }
 
-    NtFsControlFile(DiskHandle, NULL, NULL, NULL, &Iosb, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0);
-    NtFsControlFile(DiskHandle, NULL, NULL, NULL, &Iosb, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0);
+    Status = NtFsControlFile(DiskHandle, NULL, NULL, NULL, &Iosb, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0);
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(Iosb.Status))
+    {
+        if (NT_SUCCESS(Status)) Status = Iosb.Status;
+        DPRINT1("FSCTL_LOCK_VOLUME failed with status 0x%.08x\n", Status);
+        goto end;
+    }
+    VolumeLocked = TRUE;
+
+    Status = NtFsControlFile(DiskHandle, NULL, NULL, NULL, &Iosb, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0);
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(Iosb.Status))
+    {
+        if (NT_SUCCESS(Status)) Status = Iosb.Status;
+        DPRINT1("FSCTL_DISMOUNT_VOLUME failed with status 0x%.08x\n", Status);
+        goto end;
+    }
+    VolumeDismounted = TRUE;
 
     // Kill any stale boot sectors FIRST: the volume reads as RAW from here on,
     // so no partially-formatted state is ever recognizable as a filesystem.
@@ -467,18 +513,21 @@ NtfsFormat(
 
 end:
 
-    // Dismount and unlock volume
-    NtFsControlFile(DiskHandle, NULL, NULL, NULL, &Iosb, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0);
-    NtFsControlFile(DiskHandle, NULL, NULL, NULL, &Iosb, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0);
+    if (VolumeLocked)
+    {
+        if (VolumeDismounted)
+            NtFsControlFile(DiskHandle, NULL, NULL, NULL, &Iosb, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0);
+        NtFsControlFile(DiskHandle, NULL, NULL, NULL, &Iosb, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0);
+    }
 
     // Close the volume handle
     NtClose(DiskHandle);
 
-    // Clear global data structure
     DISK_HANDLE = NULL;
     DISK_GEO    = NULL;
     DISK_LEN    = NULL;
     LABEL       = NULL;
+    InterlockedExchange(&NtfsFormatInProgress, 0);
 
     // Update progress bar
     if (Callback)
@@ -505,18 +554,342 @@ NtfsChkdsk(
     IN PVOID pUnknown4,
     IN PULONG ExitStatus)
 {
-    // STUB
+    HANDLE DiskHandle = NULL;
+    OBJECT_ATTRIBUTES Attributes;
+    IO_STATUS_BLOCK Iosb;
+    GET_LENGTH_INFORMATION LengthInformation;
+    BOOT_SECTOR BootSector;
+    UCHAR *RecordBuffer = NULL, *Scratch = NULL, *MirrorBuffer = NULL, *PrefixBuffer = NULL;
+    PNTFS_MFT_RUN Runs = NULL;
+    NTFS_MFT_RECORD_VIEW RecordView;
+    NTFS_MFT_ATTRIBUTE_VIEW Attribute;
+    NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    ULONG BytesPerSector, SectorsPerCluster, ClusterBytes;
+    ULONG RecordSize, RunCapacity, RunCount, Cursor = 0;
+    ULONGLONG MftOffset;
+    BOOLEAN FoundMftData = FALSE, Success = FALSE;
+
+    UNREFERENCED_PARAMETER(Verbose);
+    UNREFERENCED_PARAMETER(CheckOnlyIfDirty);
+    UNREFERENCED_PARAMETER(pUnknown1);
+    UNREFERENCED_PARAMETER(pUnknown2);
+    UNREFERENCED_PARAMETER(pUnknown3);
+    UNREFERENCED_PARAMETER(pUnknown4);
+
+    if (ExitStatus)
+        *ExitStatus = (ULONG)STATUS_UNSUCCESSFUL;
+
+    if (!DriveRoot || !DriveRoot->Buffer || DriveRoot->Length == 0 ||
+        DriveRoot->Length > DriveRoot->MaximumLength)
+    {
+        Status = STATUS_INVALID_PARAMETER;
+        goto cleanup;
+    }
+
+    /* This first checker is deliberately read-only. Repair and surface scans
+       must not be advertised until their transaction/recovery paths exist. */
+    if (FixErrors || ScanDrive)
+    {
+        Status = STATUS_NOT_SUPPORTED;
+        goto cleanup;
+    }
+
+    InitializeObjectAttributes(&Attributes, DriveRoot, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    Status = NtOpenFile(&DiskHandle,
+                        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                        &Attributes,
+                        &Iosb,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        FILE_SYNCHRONOUS_IO_ALERT);
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(Iosb.Status))
+    {
+        if (NT_SUCCESS(Status)) Status = Iosb.Status;
+        goto cleanup;
+    }
+
+    Status = NtDeviceIoControlFile(DiskHandle, NULL, NULL, NULL, &Iosb,
+                                   IOCTL_DISK_GET_LENGTH_INFO, NULL, 0,
+                                   &LengthInformation, sizeof(LengthInformation));
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(Iosb.Status) ||
+        Iosb.Information < sizeof(LengthInformation))
+    {
+        if (NT_SUCCESS(Status))
+            Status = NT_SUCCESS(Iosb.Status) ? STATUS_DEVICE_DATA_ERROR : Iosb.Status;
+        goto cleanup;
+    }
+
+    {
+        LARGE_INTEGER Offset;
+        Offset.QuadPart = 0;
+        Status = NtReadFile(DiskHandle, NULL, NULL, NULL, &Iosb,
+                            &BootSector, sizeof(BootSector), &Offset, NULL);
+        if (!NT_SUCCESS(Status) || !NT_SUCCESS(Iosb.Status) ||
+            Iosb.Information != sizeof(BootSector))
+        {
+            if (NT_SUCCESS(Status))
+                Status = NT_SUCCESS(Iosb.Status) ? STATUS_DEVICE_DATA_ERROR : Iosb.Status;
+            goto cleanup;
+        }
+    }
+
+    BytesPerSector = BootSector.BPB.BytesPerSector;
+    SectorsPerCluster = BootSector.BPB.SectorsPerCluster;
+    if (BootSector.OEMID.QuadPart != OEM_ID ||
+        BootSector.EndSector != BOOT_SECTOR_END ||
+        BytesPerSector < 512 || BytesPerSector > 4096 ||
+        (BytesPerSector & (BytesPerSector - 1)) != 0 ||
+        SectorsPerCluster == 0 || SectorsPerCluster > 128 ||
+        (SectorsPerCluster & (SectorsPerCluster - 1)) != 0 ||
+        BootSector.EBPB.SectorCount == 0 ||
+        LengthInformation.Length.QuadPart <= 0 ||
+        BootSector.EBPB.SectorCount >
+            (ULONGLONG)LengthInformation.Length.QuadPart / BytesPerSector)
+    {
+        Status = STATUS_DISK_CORRUPT_ERROR;
+        goto cleanup;
+    }
+
+    ClusterBytes = BytesPerSector * SectorsPerCluster;
+    if (BootSector.EBPB.ClustersPerMftRecord > 0)
+    {
+        if ((ULONG)BootSector.EBPB.ClustersPerMftRecord > 64 ||
+            (ULONG)BootSector.EBPB.ClustersPerMftRecord > MAXULONG / ClusterBytes)
+        {
+            Status = STATUS_DISK_CORRUPT_ERROR;
+            goto cleanup;
+        }
+        RecordSize = (ULONG)BootSector.EBPB.ClustersPerMftRecord * ClusterBytes;
+    }
+    else if (BootSector.EBPB.ClustersPerMftRecord < 0)
+    {
+        ULONG Exponent = (ULONG)(-(LONG)BootSector.EBPB.ClustersPerMftRecord);
+        if (Exponent < 9 || Exponent > 16)
+        {
+            Status = STATUS_DISK_CORRUPT_ERROR;
+            goto cleanup;
+        }
+        RecordSize = 1UL << Exponent;
+    }
+    else
+    {
+        Status = STATUS_DISK_CORRUPT_ERROR;
+        goto cleanup;
+    }
+
+    if (RecordSize < BytesPerSector || RecordSize > 0x10000 ||
+        RecordSize % BytesPerSector != 0 ||
+        (ULONGLONG)LengthInformation.Length.QuadPart < RecordSize ||
+        ClusterBytes == 0 ||
+        BootSector.EBPB.MftLocation >
+            ((ULONGLONG)LengthInformation.Length.QuadPart - RecordSize) / ClusterBytes)
+    {
+        Status = STATUS_DISK_CORRUPT_ERROR;
+        goto cleanup;
+    }
+
+    MftOffset = BootSector.EBPB.MftLocation * (ULONGLONG)ClusterBytes;
+    RecordBuffer = RtlAllocateHeap(RtlGetProcessHeap(), 0, RecordSize);
+    Scratch = RtlAllocateHeap(RtlGetProcessHeap(), 0, RecordSize);
+    if (!RecordBuffer || !Scratch)
+    {
+        Status = STATUS_INSUFFICIENT_RESOURCES;
+        goto cleanup;
+    }
+
+    {
+        LARGE_INTEGER Offset;
+        Offset.QuadPart = (LONGLONG)MftOffset;
+        Status = NtReadFile(DiskHandle, NULL, NULL, NULL, &Iosb,
+                            RecordBuffer, RecordSize, &Offset, NULL);
+        if (!NT_SUCCESS(Status) || !NT_SUCCESS(Iosb.Status) ||
+            Iosb.Information != RecordSize)
+        {
+            if (NT_SUCCESS(Status))
+                Status = NT_SUCCESS(Iosb.Status) ? STATUS_DEVICE_DATA_ERROR : Iosb.Status;
+            goto cleanup;
+        }
+    }
+
+    Status = NtfsMftOpenRecord(RecordBuffer, RecordSize, BytesPerSector,
+                               Scratch, &RecordView);
+    if (!NT_SUCCESS(Status))
+        goto cleanup;
+
+    if (RecordView.RecordNumber != 0 ||
+        (RecordView.Flags & MFT_RECORD_IN_USE) == 0)
+    {
+        Status = STATUS_DISK_CORRUPT_ERROR;
+        goto cleanup;
+    }
+
+    while (TRUE)
+    {
+        Status = NtfsMftGetAttribute(&RecordView, &Cursor, &Attribute);
+        if (Status == STATUS_NO_MORE_ENTRIES)
+        {
+            Status = STATUS_SUCCESS;
+            break;
+        }
+        if (!NT_SUCCESS(Status))
+            goto cleanup;
+
+        if (!FoundMftData && Attribute.Type == AttributeData &&
+            Attribute.NameLength == 0 && Attribute.NonResident)
+        {
+            ULONG RunlistLength = Attribute.Length - Attribute.DataRunsOffset;
+            const UCHAR *Runlist = Attribute.Buffer + Attribute.DataRunsOffset;
+            RunCapacity = (RunlistLength / 2) + 1;
+            if (RunCapacity > MAXULONG / sizeof(NTFS_MFT_RUN))
+            {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                goto cleanup;
+            }
+
+            Runs = RtlAllocateHeap(RtlGetProcessHeap(), 0,
+                                   RunCapacity * sizeof(NTFS_MFT_RUN));
+            if (!Runs)
+            {
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+                goto cleanup;
+            }
+
+            Status = NtfsMftDecodeRunlist(Runlist, RunlistLength,
+                                          Attribute.LowestVcn, Runs,
+                                          RunCapacity, &RunCount);
+            if (!NT_SUCCESS(Status))
+                goto cleanup;
+
+            if (RunCount == 0 ||
+                Runs[0].StartingVcn != Attribute.LowestVcn ||
+                Runs[0].StartingLcn != (LONGLONG)BootSector.EBPB.MftLocation ||
+                Runs[RunCount - 1].StartingVcn +
+                    Runs[RunCount - 1].ClusterCount - 1 != Attribute.HighestVcn)
+            {
+                Status = STATUS_DISK_CORRUPT_ERROR;
+                goto cleanup;
+            }
+
+            {
+                ULONGLONG VolumeClusters =
+                    (ULONGLONG)LengthInformation.Length.QuadPart / ClusterBytes;
+                ULONG RunIndex;
+                for (RunIndex = 0; RunIndex < RunCount; ++RunIndex)
+                {
+                    if (!Runs[RunIndex].Sparse &&
+                        ((ULONGLONG)Runs[RunIndex].StartingLcn > VolumeClusters ||
+                         Runs[RunIndex].ClusterCount >
+                            VolumeClusters - (ULONGLONG)Runs[RunIndex].StartingLcn))
+                    {
+                        Status = STATUS_DISK_CORRUPT_ERROR;
+                        goto cleanup;
+                    }
+                }
+            }
+
+            FoundMftData = TRUE;
+        }
+    }
+
+    if (!FoundMftData)
+    {
+        Status = STATUS_DISK_CORRUPT_ERROR;
+        goto cleanup;
+    }
+
+    /*
+     * Verify the four-record $MFTMirr prefix without attempting repair.
+     * NTFS stores the first four MFT records in this stream. The boot-sector
+     * location is authoritative for finding the mirror; disagreement is
+     * reported as corruption and never resolved by blindly copying either side.
+     */
+    {
+        ULONGLONG MirrorOffset, VolumeBytes;
+        ULONG MirrorBytes = RecordSize * 4;
+        LARGE_INTEGER IoOffset;
+
+        VolumeBytes = (ULONGLONG)LengthInformation.Length.QuadPart;
+        if (VolumeBytes < MirrorBytes || ClusterBytes == 0 ||
+            BootSector.EBPB.MftMirrLocation >
+            (VolumeBytes - MirrorBytes) / ClusterBytes)
+        {
+            Status = STATUS_DISK_CORRUPT_ERROR;
+            goto cleanup;
+        }
+
+        /* The first MFT extent must contain the mirrored system-record prefix. */
+        if (Runs[0].Sparse ||
+            Runs[0].StartingVcn != 0 ||
+            Runs[0].ClusterCount < ((ULONGLONG)MirrorBytes + ClusterBytes - 1) / ClusterBytes)
+        {
+            Status = STATUS_NOT_SUPPORTED;
+            goto cleanup;
+        }
+
+        MirrorOffset = BootSector.EBPB.MftMirrLocation * (ULONGLONG)ClusterBytes;
+        MirrorBuffer = RtlAllocateHeap(RtlGetProcessHeap(), 0, MirrorBytes);
+        PrefixBuffer = RtlAllocateHeap(RtlGetProcessHeap(), 0, MirrorBytes);
+        if (!MirrorBuffer || !PrefixBuffer)
+        {
+            Status = STATUS_INSUFFICIENT_RESOURCES;
+            goto cleanup;
+        }
+
+        IoOffset.QuadPart = (LONGLONG)MftOffset;
+        Status = NtReadFile(DiskHandle, NULL, NULL, NULL, &Iosb,
+                            PrefixBuffer, MirrorBytes, &IoOffset, NULL);
+        if (!NT_SUCCESS(Status) || !NT_SUCCESS(Iosb.Status) ||
+            Iosb.Information != MirrorBytes)
+        {
+            if (NT_SUCCESS(Status))
+                Status = NT_SUCCESS(Iosb.Status) ? STATUS_DEVICE_DATA_ERROR : Iosb.Status;
+            goto cleanup;
+        }
+
+        IoOffset.QuadPart = (LONGLONG)MirrorOffset;
+        Status = NtReadFile(DiskHandle, NULL, NULL, NULL, &Iosb,
+                            MirrorBuffer, MirrorBytes, &IoOffset, NULL);
+        if (!NT_SUCCESS(Status) || !NT_SUCCESS(Iosb.Status) ||
+            Iosb.Information != MirrorBytes)
+        {
+            if (NT_SUCCESS(Status))
+                Status = NT_SUCCESS(Iosb.Status) ? STATUS_DEVICE_DATA_ERROR : Iosb.Status;
+            goto cleanup;
+        }
+
+        if (RtlCompareMemory(PrefixBuffer, MirrorBuffer, MirrorBytes) != MirrorBytes)
+        {
+            Status = STATUS_DISK_CORRUPT_ERROR;
+            goto cleanup;
+        }
+    }
+
+    Status = STATUS_SUCCESS;
+    Success = TRUE;
+
+cleanup:
+    if (PrefixBuffer) RtlFreeHeap(RtlGetProcessHeap(), 0, PrefixBuffer);
+    if (MirrorBuffer) RtlFreeHeap(RtlGetProcessHeap(), 0, MirrorBuffer);
+    if (Runs) RtlFreeHeap(RtlGetProcessHeap(), 0, Runs);
+    if (Scratch) RtlFreeHeap(RtlGetProcessHeap(), 0, Scratch);
+    if (RecordBuffer) RtlFreeHeap(RtlGetProcessHeap(), 0, RecordBuffer);
+    if (DiskHandle) NtClose(DiskHandle);
+
+    if (ExitStatus)
+        *ExitStatus = (ULONG)Status;
 
     if (Callback)
     {
         TEXTOUTPUT TextOut;
-
         TextOut.Lines = 1;
-        TextOut.Output = "stub, not implemented";
-
+        if (Success)
+            TextOut.Output = "NTFS basic read-only check passed (boot sector and $MFT record 0).";
+        else if (Status == STATUS_NOT_SUPPORTED)
+            TextOut.Output = "NTFS repair and surface scanning are not implemented; no changes were made.";
+        else
+            TextOut.Output = "NTFS basic read-only check failed; see the returned NTSTATUS.";
         Callback(OUTPUT, 0, &TextOut);
+        Callback(DONE, 0, &Success);
     }
-    
-    *ExitStatus = (ULONG)STATUS_SUCCESS;
-    return TRUE;
+
+    return Success;
 }

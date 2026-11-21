@@ -291,6 +291,69 @@ GetFileSystem(
     return STATUS_SUCCESS;
 }
 
+/*
+ * AUTOCHK must own an exclusive read/write volume handle before asking the
+ * NTFS provider to perform a repair pass. Keeping the handle open prevents a
+ * second opener from racing the check; FSCTL_LOCK_VOLUME additionally asks
+ * the filesystem to verify that the volume can be locked.
+ */
+#ifndef FSCTL_LOCK_VOLUME
+#define FSCTL_LOCK_VOLUME   CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+#ifndef FSCTL_UNLOCK_VOLUME
+#define FSCTL_UNLOCK_VOLUME CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 7, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#endif
+
+static NTSTATUS
+OpenNtfsVolumeForRepair(
+    IN PUNICODE_STRING VolumePath,
+    OUT PHANDLE VolumeHandle)
+{
+    NTSTATUS Status;
+    OBJECT_ATTRIBUTES Attributes;
+    IO_STATUS_BLOCK IoStatus;
+
+    *VolumeHandle = NULL;
+    InitializeObjectAttributes(&Attributes, VolumePath, OBJ_CASE_INSENSITIVE, NULL, NULL);
+    Status = NtOpenFile(VolumeHandle,
+                        FILE_GENERIC_READ | FILE_GENERIC_WRITE | SYNCHRONIZE,
+                        &Attributes,
+                        &IoStatus,
+                        0,
+                        FILE_SYNCHRONOUS_IO_ALERT);
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(IoStatus.Status))
+    {
+        if (NT_SUCCESS(Status)) Status = IoStatus.Status;
+        *VolumeHandle = NULL;
+        return Status;
+    }
+
+    Status = NtFsControlFile(*VolumeHandle, NULL, NULL, NULL, &IoStatus,
+                             FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0);
+    if (!NT_SUCCESS(Status) || !NT_SUCCESS(IoStatus.Status))
+    {
+        if (NT_SUCCESS(Status)) Status = IoStatus.Status;
+        NtClose(*VolumeHandle);
+        *VolumeHandle = NULL;
+        return Status;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static VOID
+CloseNtfsRepairVolume(IN HANDLE VolumeHandle)
+{
+    IO_STATUS_BLOCK IoStatus;
+
+    if (!VolumeHandle)
+        return;
+
+    NtFsControlFile(VolumeHandle, NULL, NULL, NULL, &IoStatus,
+                    FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0);
+    NtClose(VolumeHandle);
+}
+
 /* This is based on SysInternals' ChkDsk application */
 static BOOLEAN
 NTAPI
@@ -479,18 +542,33 @@ CheckVolume(
         if (!KeyboardHandle || WaitForKeyboard(KeyboardHandle, TimeOut) == STATUS_TIMEOUT)
         {
             PrintString("The system will now check the file system.\r\n\r\n");
+            HANDLE RepairVolumeHandle = NULL;
+            PVOID ProviderContext = NULL;
+
             Status = STATUS_SUCCESS;
+            if (wcscmp(FileSystem, L"NTFS") == 0)
+            {
+                Status = OpenNtfsVolumeForRepair(&VolumePathU, &RepairVolumeHandle);
+                if (!NT_SUCCESS(Status))
+                {
+                    PrintString("Unable to obtain exclusive read/write access to the NTFS volume (status 0x%08lx). Repair was not started.\r\n", Status);
+                    goto Quit;
+                }
+                ProviderContext = RepairVolumeHandle;
+            }
+
             Success = FileSystems[Count].ChkdskFunc(&VolumePathU,
                                                     ChkdskCallback,
                                                     TRUE,  // FixErrors
                                                     TRUE,  // Verbose
                                                     CheckOnlyIfDirty,
                                                     FALSE, // ScanDrive
-                                                    NULL,
+                                                    ProviderContext,
                                                     NULL,
                                                     NULL,
                                                     NULL,
                                                     (PULONG)&Status);
+            CloseNtfsRepairVolume(RepairVolumeHandle);
         }
         else
         {

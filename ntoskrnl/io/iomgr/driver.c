@@ -326,6 +326,7 @@ IopSuffixUnicodeString(
     return FALSE;
 }
 
+#if DBG
 /**
  * @brief   Displays a driver-loading message in SOS mode.
  **/
@@ -349,6 +350,7 @@ IopDisplayLoadingMessage(
                            ? "" : ".SYS");
     HalDisplayString(TextBuffer);
 }
+#endif
 
 /*
  * IopNormalizeImagePath
@@ -825,10 +827,12 @@ IopInitializeBuiltinDriver(IN PLDR_DATA_TABLE_ENTRY BootLdrEntry)
     UNICODE_STRING ServiceName;
     BOOLEAN Success;
 
+#if DBG
     /*
      * Display 'Loading XXX...' message
      */
     IopDisplayLoadingMessage(ModuleName);
+#endif
     InbvIndicateProgress();
 
     Buffer = ExAllocatePoolWithTag(PagedPool,
@@ -2051,8 +2055,9 @@ IopLoadDriver(
                     .MaximumLength = servName->NameLength,
                     .Buffer = servName->Name
                 };
-
+#if DBG
                 IopDisplayLoadingMessage(&serviceName);
+#endif
             }
             ExFreePoolWithTag(servName, TAG_IO);
         }

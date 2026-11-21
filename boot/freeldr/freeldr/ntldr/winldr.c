@@ -518,7 +518,7 @@ WinLdrDetectVersion(VOID)
     RegCloseKey(hKey);
 
     /* We may here want to read the value of ProductVersion */
-    return _WIN32_WINNT_WS03;
+    return TARGET_OS_VERSION;
 }
 
 static
@@ -1202,8 +1202,7 @@ LoadAndBootWindows(
     }
 
     /* Convert it to an OS version */
-    if (_stricmp(ArgValue, "Windows") == 0 ||
-        _stricmp(ArgValue, "Windows2003") == 0)
+    if (_stricmp(ArgValue, "Windows2003") == 0)
     {
         OperatingSystemVersion = _WIN32_WINNT_WS03;
     }
@@ -1214,6 +1213,10 @@ LoadAndBootWindows(
     else if (_stricmp(ArgValue, "WindowsVista") == 0)
     {
         OperatingSystemVersion = _WIN32_WINNT_VISTA;
+    }
+    else if (_stricmp(ArgValue, "Windows") == 0)
+    {
+        OperatingSystemVersion = TARGET_OS_VERSION;
     }
     else
     {

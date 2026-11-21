@@ -364,10 +364,37 @@ KeFlushCurrentTb(VOID)
     __writecr3(__readcr3());
 }
 
+/*
+ * EFER and PAT are not part of KSPECIAL_REGISTERS. They are programmed by
+ * KiInitializeCpu and are reset by firmware when the machine goes through S4,
+ * so they have to be set up again whenever the control state is restored.
+ */
+#define KI_MSR_PAT          0x277
+#define KI_PAT_KERNEL_VALUE 0x0007010600070106ULL /* WB WC UC- UC, twice */
+
+VOID
+NTAPI
+KiRestoreProcessorMsrState(VOID)
+{
+    /* Enable syscall and no-execute. LME/LMA are left alone. */
+    __writemsr(X86_MSR_EFER, __readmsr(X86_MSR_EFER) | EFER_SCE | EFER_NXE);
+
+    if (KeFeatureBits & KF_PAT)
+        __writemsr(KI_MSR_PAT, KI_PAT_KERNEL_VALUE);
+}
+
 VOID
 NTAPI
 KiRestoreProcessorControlState(PKPROCESSOR_STATE ProcessorState)
 {
+    PUCHAR TssDescriptor;
+
+    /*
+     * EFER.NXE has to be set before the kernel page tables are loaded, since
+     * their NX bits are reserved bits as long as it is clear.
+     */
+    KiRestoreProcessorMsrState();
+
     /* Restore the CR registers */
     __writecr0(ProcessorState->SpecialRegisters.Cr0);
 //    __writecr2(ProcessorState->SpecialRegisters.Cr2);
@@ -385,9 +412,16 @@ KiRestoreProcessorControlState(PKPROCESSOR_STATE ProcessorState)
 
     /* Restore GDT, IDT, LDT and TSS */
     __lgdt(&ProcessorState->SpecialRegisters.Gdtr.Limit);
-//    __lldt(&ProcessorState->SpecialRegisters.Ldtr);
-//    __ltr(&ProcessorState->SpecialRegisters.Tr);
     __lidt(&ProcessorState->SpecialRegisters.Idtr.Limit);
+    __lldt(ProcessorState->SpecialRegisters.Ldtr);
+    if (ProcessorState->SpecialRegisters.Tr != 0)
+    {
+        /* ltr faults on a busy TSS. Byte 5 holds the type, bit 1 is "busy". */
+        TssDescriptor = (PUCHAR)ProcessorState->SpecialRegisters.Gdtr.Base +
+                        (ProcessorState->SpecialRegisters.Tr & ~7);
+        TssDescriptor[5] &= ~0x02;
+        __ltr(ProcessorState->SpecialRegisters.Tr);
+    }
 
     _mm_setcsr(ProcessorState->SpecialRegisters.MxCsr);
 //    ProcessorState->SpecialRegisters.DebugControl

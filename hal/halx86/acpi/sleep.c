@@ -59,6 +59,7 @@ HalpSetPm1RtcWake(
         return;
     }
 
+    /* RTC_STS is write-one-to-clear. Drop a stale event before enabling... */
     if (Enable)
     {
         WRITE_PORT_USHORT((PUSHORT)(ULONG_PTR)EventPort, PM1_RTC_WAKE);
@@ -70,6 +71,26 @@ HalpSetPm1RtcWake(
     else
         Value &= ~PM1_RTC_WAKE;
     WRITE_PORT_USHORT((PUSHORT)(ULONG_PTR)EnablePort, Value);
+
+    /* ... and the one that is left after disabling, so it can't show up later */
+    if (!Enable)
+    {
+        WRITE_PORT_USHORT((PUSHORT)(ULONG_PTR)EventPort, PM1_RTC_WAKE);
+    }
+}
+
+/* Switch the RTC alarm interrupt off and drop an alarm that already fired */
+static
+VOID
+HalpCancelWakeAlarm(VOID)
+{
+    UCHAR RegisterB;
+
+    HalpAcquireCmosSpinLock();
+    RegisterB = HalpReadCmos(RTC_REGISTER_B);
+    HalpWriteCmos(RTC_REGISTER_B, RegisterB & ~RTC_AIE);
+    (VOID)HalpReadCmos(RTC_REGISTER_C);
+    HalpReleaseCmosSpinLock();
 }
 
 static
@@ -150,6 +171,9 @@ HalpSetWakeEnable(
         RegisterB |= RTC_AIE;
     else
         RegisterB &= ~RTC_AIE;
+
+    /* A flag latched in register C would hide the next alarm; reading clears it */
+    (VOID)HalpReadCmos(RTC_REGISTER_C);
     HalpWriteCmos(RTC_REGISTER_B, RegisterB);
     HalpReleaseCmosSpinLock();
 }
@@ -166,6 +190,16 @@ HalpSetWakeAlarm(
     UCHAR Hour;
 
     UNREFERENCED_PARAMETER(DcWakeTime);
+    if (HalpFixedAcpiDescTable.Header.Signature != FADT_SIGNATURE)
+        return;
+
+    /* Zero means "no alarm": remove the one that is set */
+    if (AlarmTime == 0)
+    {
+        HalpCancelWakeAlarm();
+        return;
+    }
+
     if (!HalpGetAlarmTimeFields(AlarmTime, NULL, &AlarmFields))
         return;
 #else
@@ -179,12 +213,19 @@ HalpSetWakeAlarm(
     UCHAR RegisterB;
     UCHAR Hour;
 
+    if (HalpFixedAcpiDescTable.Header.Signature != FADT_SIGNATURE)
+        return;
+
+    /* Zero means "no alarm": remove the one that is set */
+    if (AlarmTime == 0)
+    {
+        HalpCancelWakeAlarm();
+        return;
+    }
+
     if (!HalpGetAlarmTimeFields(AlarmTime, TimeFields, &AlarmFields))
         return;
 #endif
-
-    if (HalpFixedAcpiDescTable.Header.Signature != FADT_SIGNATURE)
-        return;
 
     HalpAcquireCmosSpinLock();
     RegisterB = HalpReadCmos(RTC_REGISTER_B);
@@ -223,6 +264,8 @@ HalpSetWakeAlarm(
                       HalpEncodeRtcValue(AlarmFields.Month, RegisterB));
     }
 
+    /* Drop a stale alarm flag before the interrupt can be enabled again */
+    (VOID)HalpReadCmos(RTC_REGISTER_C);
     HalpWriteCmos(RTC_REGISTER_B, RegisterB);
     HalpReleaseCmosSpinLock();
 }

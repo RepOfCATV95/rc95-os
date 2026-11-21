@@ -48,7 +48,7 @@
     #include	<malloc.h>
     #include	<tchar.h>
 #else
-    #include "reactos.h"
+    #include "rc95sup_header.h"
 #endif
 
 #define new(TYPE, numElems) \

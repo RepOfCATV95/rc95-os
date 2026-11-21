@@ -113,9 +113,9 @@ set(dir_quicklaunch             "Users/Default/AppData/Roaming/Microsoft/Interne
 
 cmdenvvar(envvar_systemdrive "SystemDrive" TRUE)
 cmdenvvar(envvar_archdir     "PROCESSOR_ARCHITECTURE:x86=I386" TRUE)
-add_livecd_shortcut("Install ReactOS"
+add_livecd_shortcut("Install CATV 95"
     "shell:system\\cmd.exe"
-    CMDLINE_ARGS "/D /E:ON /C \"start ${envvar_systemdrive}\\${envvar_archdir}\\reactos.exe\""
+    CMDLINE_ARGS "/D /E:ON /C \"start ${envvar_systemdrive}\\${envvar_archdir}\\rc95sup.exe\""
     ICON "${envvar_systemroot}\\system32\\msiexec.exe"
     MINIMIZE
     DESTINATION "${dir_allusers_desktop}")
@@ -124,7 +124,7 @@ add_livecd_shortcut("Read Me"
     "shell:windows\\readme.txt"
     ICON "${envvar_systemroot}\\system32\\shell32.dll" ICON_INDEX -152
     DESTINATION "${dir_allusers_desktop}")
-add_livecd_shortcut("ReactOS Explorer"
+add_livecd_shortcut("CATV 95 Explorer"
     "shell:windows\\explorer.exe" ICON_INDEX 1
     WORKDIR "${envvar_homedrive}${envvar_homepath}"
     DESTINATION "${dir_startmenu_programs}" "${dir_quicklaunch}")

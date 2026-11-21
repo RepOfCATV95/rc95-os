@@ -500,8 +500,7 @@ typedef struct _DEVICETREE_TRAVERSE_CONTEXT
 typedef struct _RESERVE_IRP_ALLOCATOR
 {
     PIRP ReserveIrp;
-    volatile LONG ReserveIrpInUse;
-    KEVENT WaitEvent;
+    KSEMAPHORE Available;
     CCHAR StackSize;
 } RESERVE_IRP_ALLOCATOR, *PRESERVE_IRP_ALLOCATOR;
 

@@ -9,7 +9,7 @@
 
 /* INCLUDES ******************************************************************/
 
-#include "reactos.h"
+#include "rc95sup_header.h"
 #include <winnls.h>
 
 #define NDEBUG

@@ -8,7 +8,7 @@
 
 /* INCLUDES *****************************************************************/
 
-#include "reactos.h"
+#include "rc95sup_header.h"
 
 #define NDEBUG
 #include <debug.h>

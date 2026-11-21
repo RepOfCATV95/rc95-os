@@ -778,9 +778,27 @@ WriteAt(IN ULONGLONG Lcn,
     LARGE_INTEGER   Offset;
     IO_STATUS_BLOCK IoStatusBlock;
 
-    Offset.QuadPart = (LONGLONG)Lcn * BYTES_PER_CLUSTER;
-    return NtWriteFile(DISK_HANDLE, NULL, NULL, NULL, &IoStatusBlock,
-                       Buffer, Length, &Offset, NULL);
+    NTSTATUS Status;
+
+    if (!Buffer || !DISK_HANDLE || !DISK_LEN || BYTES_PER_CLUSTER == 0 ||
+        Lcn > (ULONGLONG)MAXLONGLONG / BYTES_PER_CLUSTER)
+        return STATUS_INVALID_PARAMETER;
+
+    Offset.QuadPart = (LONGLONG)(Lcn * BYTES_PER_CLUSTER);
+    if (Offset.QuadPart < 0 ||
+        Offset.QuadPart > DISK_LEN->Length.QuadPart ||
+        (ULONGLONG)Length >
+            (ULONGLONG)(DISK_LEN->Length.QuadPart - Offset.QuadPart))
+        return STATUS_END_OF_FILE;
+
+    Status = NtWriteFile(DISK_HANDLE, NULL, NULL, NULL, &IoStatusBlock,
+                         Buffer, Length, &Offset, NULL);
+    if (NT_SUCCESS(Status) && !NT_SUCCESS(IoStatusBlock.Status))
+        Status = IoStatusBlock.Status;
+    else if (NT_SUCCESS(Status) && IoStatusBlock.Information != Length)
+        Status = STATUS_DEVICE_DATA_ERROR;
+
+    return Status;
 }
 
 /* Fills a contiguous run of clusters with a byte pattern in bounded chunks. */
