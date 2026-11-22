@@ -11,6 +11,16 @@
 
 #include "timedate.h"
 
+SHORT wLastDateMSec;
+SHORT wLastDateSec;
+SHORT wLastDateMin;
+SHORT wLastDateHour;
+SHORT wLastDateMonth;
+SHORT wLastDateDay;
+SHORT wLastDateYear;
+SHORT wLastDateWeekday;
+BOOLEAN bDirty;
+
 static WNDPROC pOldWndProc = NULL;
 
 BOOL
@@ -294,6 +304,44 @@ DTPProc(HWND hwnd,
     return CallWindowProcW(pOldWndProc, hwnd, uMsg, wParam, lParam);
 }
 
+static
+VOID
+UpdateSysTime(VOID)
+{
+    SYSTEMTIME st = {0};
+
+    if (bDirty)
+        return;
+
+    GetLocalTime(&st);
+    wLastDateMSec = st.wMilliseconds;
+    wLastDateSec = st.wSecond;
+    wLastDateMin = st.wMinute;
+    wLastDateHour = st.wHour;
+    wLastDateMonth = st.wMonth;
+    wLastDateDay = st.wDay;
+    wLastDateYear = st.wYear;
+    wLastDateWeekday = st.wDayOfWeek;
+}
+
+static
+VOID
+SendTimePickerToLastDate(HWND hWnd)
+{
+    SYSTEMTIME st;
+
+    if ( !hWnd )
+        return;
+
+    if ( DateTime_GetSystemtime(hWnd,&st) == GDT_VALID )
+    {
+        wLastDateMSec = 0;
+        wLastDateSec = st.wSecond;
+        wLastDateMin = st.wMinute;
+        wLastDateHour = st.wHour;
+    }
+}
+
 /* Property page dialog callback */
 INT_PTR CALLBACK
 DateTimePageProc(HWND hwndDlg,
@@ -301,9 +349,7 @@ DateTimePageProc(HWND hwndDlg,
          WPARAM wParam,
          LPARAM lParam)
 {
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-
+    UpdateSysTime();
     switch (uMsg)
     {
         case WM_INITDIALOG:
@@ -312,18 +358,27 @@ DateTimePageProc(HWND hwndDlg,
 
             /* Set range and current year */
             SendMessageW(GetDlgItem(hwndDlg, IDC_YEAR), UDM_SETRANGE, 0, MAKELONG ((short) 9999, (short) 1900));
-            SendMessageW(GetDlgItem(hwndDlg, IDC_YEAR), UDM_SETPOS, 0, MAKELONG( (short) st.wYear, 0));
+            SendMessageW(GetDlgItem(hwndDlg, IDC_YEAR), UDM_SETPOS, 0, MAKELONG( (short) wLastDateYear, 0));
 
             pOldWndProc = (WNDPROC)SetWindowLongPtrW(GetDlgItem(hwndDlg, IDC_TIMEPICKER), GWLP_WNDPROC, (LONG_PTR)DTPProc);
 
-            SetTimer(hwndDlg, ID_TIMER, 1000 - st.wMilliseconds, NULL);
+            SetTimer(hwndDlg, ID_TIMER, 1000 - wLastDateMSec, NULL);
             break;
 
         case WM_TIMER:
+            SYSTEMTIME st = {0};
+
+            st.wSecond = wLastDateSec;
+            st.wMinute = wLastDateMin;
+            st.wHour = wLastDateHour;
+            st.wMonth = wLastDateDay;
+            st.wDayOfWeek = wLastDateWeekday;
+            st.wMonth = wLastDateMonth;
+            st.wYear = wLastDateYear;
             SendMessageW(GetDlgItem(hwndDlg, IDC_TIMEPICKER), DTM_SETSYSTEMTIME, GDT_VALID, (LPARAM) &st);
 
             // Reset timeout.
-            SetTimer(hwndDlg, ID_TIMER, 1000 - st.wMilliseconds, NULL);
+            SetTimer(hwndDlg, ID_TIMER, 1000 - wLastDateMSec, NULL);
             break;
 
         case WM_COMMAND:
@@ -332,11 +387,14 @@ DateTimePageProc(HWND hwndDlg,
                 case IDC_MONTHCB:
                     if (HIWORD(wParam) == CBN_SELCHANGE)
                     {
+                        if (!bDirty)
+                            bDirty = TRUE;
                         ChangeMonthCalDate(GetDlgItem(hwndDlg,
                                                       IDC_MONTHCALENDAR),
                                                       (WORD) -1,
                                                       GetCBSelectedMonth((HWND)lParam),
                                                       (WORD) -1);
+                        wLastDateMonth = (SHORT)GetCBSelectedMonth((HWND)lParam);
                     }
                     break;
             }
@@ -361,13 +419,17 @@ DateTimePageProc(HWND hwndDlg,
                             SHORT wYear;
                             LPNMUPDOWN updown = (LPNMUPDOWN)lpnm;
                             wYear = (SHORT)SendMessageW(GetDlgItem(hwndDlg, IDC_YEAR), UDM_GETPOS, 0, 0);
+                            if (!bDirty)
+                                bDirty = TRUE;
                             /* Enable the 'Apply' button */
                             PropSheet_Changed(GetParent(hwndDlg), hwndDlg);
+
                             ChangeMonthCalDate(GetDlgItem(hwndDlg,
                                                IDC_MONTHCALENDAR),
                                                (WORD) -1,
                                                (WORD) -1,
                                                (WORD) (wYear + updown->iDelta));
+                            wLastDateYear = wYear;
                         }
                         break;
                     }
@@ -385,6 +447,10 @@ DateTimePageProc(HWND hwndDlg,
                                                 0, 0);
 
                             // TODO: Set the clock to the input time.
+                            if (!bDirty)
+                                bDirty = TRUE;
+
+                            SendTimePickerToLastDate(GetDlgItem(hwndDlg, IDC_TIMEPICKER));
 
                             /* Enable the 'Apply' button */
                             PropSheet_Changed(GetParent(hwndDlg), hwndDlg);
@@ -396,6 +462,8 @@ DateTimePageProc(HWND hwndDlg,
                     switch (lpnm->code)
                     {
                         case MCCN_SELCHANGE:
+                            if (!bDirty)
+                                bDirty = TRUE;
                             /* Enable the 'Apply' button */
                             PropSheet_Changed(GetParent(hwndDlg), hwndDlg);
                             break;
@@ -421,7 +489,12 @@ DateTimePageProc(HWND hwndDlg,
                             SendDlgItemMessageW(hwndDlg, IDC_CLOCKWND, CLM_STARTCLOCK,
                                                 0, 0);
 
-                            SetTimer(hwndDlg, ID_TIMER, 1000 - st.wMilliseconds, NULL);
+                            if (bDirty)
+                            {
+                                bDirty = FALSE;
+                                UpdateSysTime();
+                            }
+                            SetTimer(hwndDlg, ID_TIMER, 1000 - wLastDateMSec, NULL);
                             return TRUE;
                     }
                     break;
