@@ -230,19 +230,19 @@ Severity=Warning
 Facility=System
 SymbolicName=EVENT_EventLogProductInfo
 Language=English
-ReactOS %1 %2 %3 %4.
+Republic of CATV 95 %1 %2 %3 %4.
 .
 Language=Russian
-ReactOS %1 %2 %3 %4.
+Республика CATV 95 %1 %2 %3 %4.
 .
 Language=French
-ReactOS %1 %2 %3 %4.
+République de CATV 95 %1 %2 %3 %4.
 .
 Language=Polish
-ReactOS %1 %2 %3 %4.
+Republika CATV 95 %1 %2 %3 %4.
 .
 Language=Romanian
-ReactOS %1 %2 %3 %4.
+Republica CATV 95 %1 %2 %3 %4.
 .
 
 MessageId=6010
@@ -860,19 +860,19 @@ Severity=Error
 Facility=System
 SymbolicName=EVENT_RUNNING_LASTKNOWNGOOD
 Language=English
-ReactOS could not be started as configured.  A previous working configuration was used instead.
+Republic of CATV 95 could not be started as configured.  A previous working configuration was used instead.
 .
 Language=Russian
-ReactOS could not be started as configured.  A previous working configuration was used instead.
+Республика CATV 95 не могла быть запущена в соответствии с конфигурацией. Вместо этого была использована предыдущая рабочая конфигурация.
 .
 Language=French
-ReactOS n'a pas pu démarrer tel que configuré. Une précédente configuration fonctionnelle a été utilisé à la place.
+République de CATV 95 n'a pas pu démarrer tel que configuré. Une précédente configuration fonctionnelle a été utilisé à la place.
 .
 Language=Polish
-Nie można uruchomić systemu ReactOS zgodnie z aktualną konfiguracją. Zamiast niej użyto poprzedniej działającej konfiguracji.
+Nie można uruchomić systemu Republika CATV 95 zgodnie z aktualną konfiguracją. Zamiast niej użyto poprzedniej działającej konfiguracji.
 .
 Language=Romanian
-ReactOS nu a putut fi pornit după configurație. În locul ei, a fost folosită o configurație funcțională anterioară.
+Republica CATV 95 nu a putut fi pornit după configurație. În locul ei, a fost folosită o configurație funcțională anterioară.
 .
 
 MessageId=7028
@@ -1092,7 +1092,7 @@ dans un état imprévisible.
 Si vous ne corrigez pas cette configuration, vous pourriez ne plus être capable de
 redémarrer le service %1 ou pourriez rencontrer d'autres erreurs. Pour vous assurer
 que le service est configuré correctement, utilisez la console de gestion des services
-dans la console de gestion Microsoft (MMC).
+dans console de gestion de la République de CATV 95 (MMC).
 .
 Language=Polish
 Menedżer sterowania usługami napotkał błąd podczas cofania zmiany konfiguracji
@@ -1101,7 +1101,7 @@ usługi %1. Element usługi: %2 jest obecnie w stanie nieprzewidywalnym.
 Jeśli ta konfiguracja nie zostanie naprawiona, ponowne uruchomienie usługi
 %1 może okazać się niemożliwe lub mogą wystąpić inne błędy. Aby upewnić się,
 że usługa jest skonfigurowana właściwie, użyj przystawki Usługi w programie
-ReactOS Management Console (MMC).
+Republiką CATV 95 Management Console (MMC).
 .
 Language=Romanian
 Administratorul de control al serviciului a întâlnit o eroare în încercarea de a anula o schimbare de configurație
@@ -1109,7 +1109,7 @@ la serviciul %1. %2-ul serviciului este deocamdată într-un stadiu neprevăzut.
 
 Dacă nu corectați această configurație, nu veți putea reporni serviciul %1
 sau veți întâmpina alte erori. Pentru a vă asigura că serviciul este configurat
-corect, folosiți Administratorul de servicii în Consola de administrare (MMC).
+corect, folosiți Administratorul de servicii în consola de administrare a Republicii CATV 95 (MMC).
 .
 
 MessageId=7038
@@ -1138,7 +1138,7 @@ Language=Polish
 Usługa %1 nie mogła zalogować się jako %2 z aktualnie skonfigurowanym
 hasłem z powodu następującego błędu: %n%3%n%nAby upewnić się, że usługa
 jest skonfigurowana właściwie, użyj przystawki Usługi w programie
-ReactOS Management Console (MMC).
+CATV 95 Management Console (MMC).
 .
 Language=Romanian
 Serviciul %1 nu a putut fi logat la %2 cu parola configurată din prezent,
