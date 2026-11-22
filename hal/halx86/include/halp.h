@@ -346,6 +346,41 @@ HalpUnmapVirtualAddress(
     IN PFN_COUNT NumberPages
 );
 
+/* acpi/sleep.c */
+NTSTATUS
+NTAPI
+HalpAcpiSleep(
+    _In_ UCHAR SlpTypA,
+    _In_ UCHAR SlpTypB,
+    _In_ BOOLEAN ContextLost,
+    _Out_ PBOOLEAN Resumed
+);
+
+/* smp/<arch>/lowstub.c, smp/<arch>/wakestub.S: waking up from S2/S3 */
+NTSTATUS
+NTAPI
+HalpWakeBuildStub(
+    _Out_ PULONG StubPhysicalAddress
+);
+
+/* Returns twice, like setjmp: FALSE when the state was saved, TRUE after waking up */
+#if defined(__GNUC__)
+BOOLEAN
+HalpWakeSaveContext(
+    VOID
+) __attribute__((returns_twice));
+#else
+BOOLEAN
+HalpWakeSaveContext(
+    VOID
+);
+#endif
+
+VOID
+HalpWakeSaveControlState(
+    VOID
+);
+
 /* sysinfo.c */
 NTSTATUS
 NTAPI

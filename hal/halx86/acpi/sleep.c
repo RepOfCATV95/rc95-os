@@ -269,3 +269,184 @@ HalpSetWakeAlarm(
     HalpWriteCmos(RTC_REGISTER_B, RegisterB);
     HalpReleaseCmosSpinLock();
 }
+
+/* ENTERING SLEEP STATES ******************************************************/
+
+#define PM1_WAKE_STATUS     0x8000      /* WAK_STS */
+#define PM1_SLP_EN          0x2000
+#define PM1_SLP_TYP_MASK    0x1C00
+#define PM1_SLP_TYP_SHIFT   10
+
+/*
+ * Tell the firmware where to continue after S2/S3. This is the real-mode
+ * waking vector in the FACS. Zero removes the vector.
+ */
+static
+NTSTATUS
+HalpWakeSetFirmwareVector(
+    _In_ ULONG VectorPhysicalAddress)
+{
+    PHYSICAL_ADDRESS FacsAddress;
+    PFACS Facs;
+
+    FacsAddress.QuadPart = 0;
+    if (HalpFixedAcpiDescTable.Header.Length >=
+        FIELD_OFFSET(FADT, x_firmware_ctrl) + sizeof(PHYSICAL_ADDRESS))
+    {
+        FacsAddress = HalpFixedAcpiDescTable.x_firmware_ctrl;
+    }
+    if (FacsAddress.QuadPart == 0)
+        FacsAddress.QuadPart = HalpFixedAcpiDescTable.facs;
+    if (FacsAddress.QuadPart == 0)
+        return STATUS_NOT_SUPPORTED;
+
+    Facs = HalpMapPhysicalMemory64(FacsAddress, 1);
+    if (Facs == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    if (Facs->Signature != FACS_SIGNATURE ||
+        Facs->Length < FIELD_OFFSET(FACS, GlobalLock))
+    {
+        HalpUnmapVirtualAddress(Facs, 1);
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    Facs->pFirmwareWakingVector = VectorPhysicalAddress;
+
+    /* The 64-bit vector would be used instead, and it is not for real mode */
+    if (Facs->Length >= FIELD_OFFSET(FACS, Version))
+        Facs->x_FirmwareWakingVector.QuadPart = 0;
+
+    HalpUnmapVirtualAddress(Facs, 1);
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Enter the sleep state whose SLP_TYP values were found by the caller in the
+ * \_Sx object of the DSDT; the HAL can't evaluate AML.
+ *
+ * ContextLost is for S2/S3, where the processor is reset. The state of the
+ * processor is saved, the stub that takes over after the wake up is set up and
+ * the firmware is told about it. Then the function returns after the wake up
+ * with *Resumed set to TRUE and interrupts still disabled; the interrupt
+ * controller, the timers and the devices have to be set up again by the
+ * caller. Without ContextLost (S1) the function returns when the machine
+ * is awake again.
+ *
+ * Has to be called with interrupts disabled, at DISPATCH_LEVEL or above, on a
+ * uniprocessor machine for ContextLost. If the function returns with
+ * *Resumed FALSE and a success status, the machine did not go to sleep.
+ */
+NTSTATUS
+NTAPI
+HalpAcpiSleep(
+    _In_ UCHAR SlpTypA,
+    _In_ UCHAR SlpTypB,
+    _In_ BOOLEAN ContextLost,
+    _Out_ PBOOLEAN Resumed)
+{
+    ULONG ControlA, ControlB, StatusA, StatusB;
+    ULONG StubPhysicalAddress;
+    USHORT Value;
+    NTSTATUS Status;
+    ULONG i;
+
+    *Resumed = FALSE;
+
+    if (HalpFixedAcpiDescTable.Header.Signature != FADT_SIGNATURE ||
+        SlpTypA > 7 || SlpTypB > 7)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ControlA = HalpGetPm1EventPort(HalpFixedAcpiDescTable.pm1a_ctrl_blk_io_port,
+                                   &HalpFixedAcpiDescTable.x_pm1a_ctrl_blk,
+                                   FIELD_OFFSET(FADT, x_pm1a_ctrl_blk));
+    ControlB = HalpGetPm1EventPort(HalpFixedAcpiDescTable.pm1b_ctrl_blk_io_port,
+                                   &HalpFixedAcpiDescTable.x_pm1b_ctrl_blk,
+                                   FIELD_OFFSET(FADT, x_pm1b_ctrl_blk));
+    StatusA = HalpGetPm1EventPort(HalpFixedAcpiDescTable.pm1a_evt_blk_io_port,
+                                  &HalpFixedAcpiDescTable.x_pm1a_evt_blk,
+                                  FIELD_OFFSET(FADT, x_pm1a_evt_blk));
+    StatusB = HalpGetPm1EventPort(HalpFixedAcpiDescTable.pm1b_evt_blk_io_port,
+                                  &HalpFixedAcpiDescTable.x_pm1b_evt_blk,
+                                  FIELD_OFFSET(FADT, x_pm1b_evt_blk));
+    if (ControlA == 0 || StatusA == 0)
+        return STATUS_NOT_SUPPORTED;
+
+    if (ContextLost)
+    {
+        /* The other processors would have to be started again */
+        if (KeNumberProcessors != 1)
+            return STATUS_NOT_SUPPORTED;
+
+        Status = HalpWakeBuildStub(&StubPhysicalAddress);
+        if (!NT_SUCCESS(Status))
+            return Status;
+
+        Status = HalpWakeSetFirmwareVector(StubPhysicalAddress);
+        if (!NT_SUCCESS(Status))
+            return Status;
+
+        /* Returns TRUE here a second time after the wake up */
+        if (HalpWakeSaveContext())
+        {
+            HalpWakeSetFirmwareVector(0);
+            *Resumed = TRUE;
+            return STATUS_SUCCESS;
+        }
+    }
+
+    /* Forget an earlier wake up, WAK_STS is write-one-to-clear */
+    WRITE_PORT_USHORT((PUSHORT)(ULONG_PTR)StatusA, PM1_WAKE_STATUS);
+    if (StatusB != 0 && StatusB != StatusA)
+        WRITE_PORT_USHORT((PUSHORT)(ULONG_PTR)StatusB, PM1_WAKE_STATUS);
+
+    /* The caches have to be written back: memory is all that stays */
+    __wbinvd();
+
+    /* SLP_TYP first, then SLP_EN with it, as the specification wants it */
+    Value = READ_PORT_USHORT((PUSHORT)(ULONG_PTR)ControlA);
+    Value = (Value & ~(PM1_SLP_TYP_MASK | PM1_SLP_EN)) | (SlpTypA << PM1_SLP_TYP_SHIFT);
+    WRITE_PORT_USHORT((PUSHORT)(ULONG_PTR)ControlA, Value);
+    if (ControlB != 0 && ControlB != ControlA)
+    {
+        Value = READ_PORT_USHORT((PUSHORT)(ULONG_PTR)ControlB);
+        Value = (Value & ~(PM1_SLP_TYP_MASK | PM1_SLP_EN)) | (SlpTypB << PM1_SLP_TYP_SHIFT);
+        WRITE_PORT_USHORT((PUSHORT)(ULONG_PTR)ControlB, Value);
+    }
+
+    Value = READ_PORT_USHORT((PUSHORT)(ULONG_PTR)ControlA);
+    WRITE_PORT_USHORT((PUSHORT)(ULONG_PTR)ControlA, Value | PM1_SLP_EN);
+    if (ControlB != 0 && ControlB != ControlA)
+    {
+        Value = READ_PORT_USHORT((PUSHORT)(ULONG_PTR)ControlB);
+        WRITE_PORT_USHORT((PUSHORT)(ULONG_PTR)ControlB, Value | PM1_SLP_EN);
+    }
+
+    /*
+     * S2/S3: the processor stops here and the wake up goes through the stub.
+     * S1: the processor continues when the machine is woken up, WAK_STS says
+     * so. Wait for it for a while; if it does not come, nothing happened.
+     */
+    for (i = 0; i < 2000; i++)
+    {
+        if (READ_PORT_USHORT((PUSHORT)(ULONG_PTR)StatusA) & PM1_WAKE_STATUS)
+            break;
+        if (StatusB != 0 && StatusB != StatusA &&
+            (READ_PORT_USHORT((PUSHORT)(ULONG_PTR)StatusB) & PM1_WAKE_STATUS))
+        {
+            break;
+        }
+        KeStallExecutionProcessor(1000);
+    }
+
+    if (ContextLost)
+        HalpWakeSetFirmwareVector(0);
+
+    if (i == 2000)
+        return STATUS_UNSUCCESSFUL;
+
+    *Resumed = TRUE;
+    return STATUS_SUCCESS;
+}

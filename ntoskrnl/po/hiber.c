@@ -646,13 +646,11 @@ PopHiberInitSystem(
 
 #if defined(_M_IX86) || defined(_M_AMD64)
 /*
- * Called on the resumed system, right after KeSaveStateForHibernate returned
- * for the second time. By now WakeState holds the state of the machine as
- * the resume stub left it: the capture in KeSaveStateForHibernate runs again
- * on resume and overwrites the control registers that were saved before
- * hibernating. The original copy is in the image header, which comes back
- * with the rest of memory. Put it back in the processor, including the parts
- * that are not in the saved context (MSRs, FPU/SSE state).
+ * Called on the resumed system, right after RtlCaptureContext returned for
+ * the second time. The processor is in whatever state the resume stub left
+ * it in. The state saved before hibernating is in the image header, which
+ * comes back with the rest of memory. Put it back in the processor, including
+ * the parts that are not in the saved context (MSRs, FPU/SSE state).
  */
 static
 NTSTATUS
@@ -787,7 +785,18 @@ PopHiberSystemHandler(
      */
     KeRaiseIrql(DISPATCH_LEVEL, &OldIrql);
     Interrupts = KeDisableInterrupts();
-    KeSaveStateForHibernate(Context->WakeState);
+
+    /*
+     * The control state is saved once, before the context. The context is
+     * captured here and not in a helper such as KeSaveStateForHibernate: the
+     * resumed system continues right after the capture, and the frame of a
+     * helper that has returned is long gone by the time the image is taken
+     * (the calls below reuse that part of the stack), so returning from it
+     * would use a clobbered return address. This frame is alive until the
+     * function returns.
+     */
+    KiSaveProcessorControlState(Context->WakeState);
+    RtlCaptureContext(&Context->WakeState->ContextFrame);
 
     /*
      * On the resumed system execution continues right here. Nothing below

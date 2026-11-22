@@ -352,7 +352,8 @@ DateTimePageProc(HWND hwndDlg,
     UpdateSysTime();
     switch (uMsg)
     {
-        case WM_INITDIALOG:
+        case (WM_INITDIALOG):
+        {
             FillMonthsComboBox(GetDlgItem(hwndDlg,
                                           IDC_MONTHCB));
 
@@ -364,14 +365,16 @@ DateTimePageProc(HWND hwndDlg,
 
             SetTimer(hwndDlg, ID_TIMER, 1000 - wLastDateMSec, NULL);
             break;
+        }
 
-        case WM_TIMER:
+        case (WM_TIMER):
+        {
             SYSTEMTIME st = {0};
 
             st.wSecond = wLastDateSec;
             st.wMinute = wLastDateMin;
             st.wHour = wLastDateHour;
-            st.wMonth = wLastDateDay;
+            st.wDay = wLastDateDay;
             st.wDayOfWeek = wLastDateWeekday;
             st.wMonth = wLastDateMonth;
             st.wYear = wLastDateYear;
@@ -380,8 +383,10 @@ DateTimePageProc(HWND hwndDlg,
             // Reset timeout.
             SetTimer(hwndDlg, ID_TIMER, 1000 - wLastDateMSec, NULL);
             break;
+        }
 
-        case WM_COMMAND:
+        case (WM_COMMAND):
+        {
             switch (LOWORD(wParam))
             {
                 case IDC_MONTHCB:
@@ -399,11 +404,14 @@ DateTimePageProc(HWND hwndDlg,
                     break;
             }
             break;
+        }
 
-        case WM_CTLCOLORSTATIC:
+        case (WM_CTLCOLORSTATIC):
+        {
             if ((HWND)lParam == GetDlgItem(hwndDlg, IDC_YEARTEXT))
                 return (INT_PTR)GetSysColorBrush(COLOR_WINDOW);
             break;
+        }
 
         case WM_NOTIFY:
         {
@@ -411,10 +419,11 @@ DateTimePageProc(HWND hwndDlg,
 
             switch (lpnm->idFrom)
             {
-                case IDC_YEAR:
+                case (IDC_YEAR):
+                {
                     switch (lpnm->code)
                     {
-                        case UDN_DELTAPOS:
+                        case (UDN_DELTAPOS):
                         {
                             SHORT wYear;
                             LPNMUPDOWN updown = (LPNMUPDOWN)lpnm;
@@ -434,11 +443,13 @@ DateTimePageProc(HWND hwndDlg,
                         break;
                     }
                     break;
+                }
 
-                case IDC_TIMEPICKER:
+                case (IDC_TIMEPICKER):
+                {
                     switch (lpnm->code)
                     {
-                        case DTN_DATETIMECHANGE:
+                        case (DTN_DATETIMECHANGE):
                             /* Stop the timer */
                             KillTimer(hwndDlg, ID_TIMER);
 
@@ -457,8 +468,10 @@ DateTimePageProc(HWND hwndDlg,
                             break;
                     }
                     break;
+                }
 
-                case IDC_MONTHCALENDAR:
+                case (IDC_MONTHCALENDAR):
+                {
                     switch (lpnm->code)
                     {
                         case MCCN_SELCHANGE:
@@ -474,15 +487,17 @@ DateTimePageProc(HWND hwndDlg,
                             break;
                     }
                     break;
+                }
 
                 default:
+                {
                     switch (lpnm->code)
                     {
-                        case PSN_SETACTIVE:
+                        case (PSN_SETACTIVE):
                             SetTimeZoneName(hwndDlg);
                             break;
 
-                        case PSN_APPLY:
+                        case (PSN_APPLY):
                             SetLocalSystemTime(hwndDlg);
 
                             /* Tell the clock to start ticking */
@@ -498,11 +513,13 @@ DateTimePageProc(HWND hwndDlg,
                             return TRUE;
                     }
                     break;
+                }
             }
         }
         break;
 
-        case WM_TIMECHANGE:
+        case (WM_TIMECHANGE):
+        {
             /* FIXME: We don't get this message as we're not a top-level window... */
             SendMessageW(GetDlgItem(hwndDlg,
                                     IDC_MONTHCALENDAR),
@@ -510,10 +527,13 @@ DateTimePageProc(HWND hwndDlg,
                          0,
                          0);
             break;
+        }
 
-        case WM_DESTROY:
+        case (WM_DESTROY):
+        {
             KillTimer(hwndDlg, ID_TIMER);
             break;
+        }
     }
 
     return FALSE;
