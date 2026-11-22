@@ -360,6 +360,15 @@ HalpAcpiSleep(
 NTSTATUS
 NTAPI
 HalpWakeBuildStub(
+    _In_ PVOID LowStub,
+    _In_ PHYSICAL_ADDRESS LowStubPhysicalAddress,
+    _Out_ PULONG StubPhysicalAddress
+);
+
+/* acpi/halacpi.c: HalpWakeBuildStub with the low stub of HalpSetupAcpiPhase0 */
+NTSTATUS
+NTAPI
+HalpAcpiBuildWakeStub(
     _Out_ PULONG StubPhysicalAddress
 );
 

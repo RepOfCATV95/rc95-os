@@ -106,6 +106,16 @@ HalpWakeSaveContext:
     pop rcx
     and ecx, HEX(0FFFFFDFF)             /* interrupts stay off after the wake up */
     mov [rax + WS_RFLAGS], rcx
+
+    /* GDTR, IDTR, TR, LDTR: bytes, there are no intrinsics for them in the HAL */
+    .byte HEX(0F), HEX(01), HEX(80)                 /* sgdt [rax + WS_GDTRLIM] */
+    .long WS_GDTRLIM
+    .byte HEX(0F), HEX(01), HEX(88)                 /* sidt [rax + WS_IDTRLIM] */
+    .long WS_IDTRLIM
+    .byte HEX(0F), HEX(00), HEX(88)                 /* str word ptr [rax + WS_TR] */
+    .long WS_TR
+    .byte HEX(0F), HEX(00), HEX(80)                 /* sldt word ptr [rax + WS_LDTR] */
+    .long WS_LDTR
     mov cx, cs
     mov [rax + WS_SEGCS], cx
     mov cx, ds

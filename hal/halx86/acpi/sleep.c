@@ -380,7 +380,7 @@ HalpAcpiSleep(
         if (KeNumberProcessors != 1)
             return STATUS_NOT_SUPPORTED;
 
-        Status = HalpWakeBuildStub(&StubPhysicalAddress);
+        Status = HalpAcpiBuildWakeStub(&StubPhysicalAddress);
         if (!NT_SUCCESS(Status))
             return Status;
 

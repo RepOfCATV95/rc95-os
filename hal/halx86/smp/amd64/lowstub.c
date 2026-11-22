@@ -19,9 +19,6 @@
 
 /* GLOBALS *******************************************************************/
 
-extern PHYSICAL_ADDRESS HalpLowStubPhysicalAddress;
-extern PVOID HalpLowStub;
-
 /* The stub (wakestub.S) */
 extern UCHAR HalpWakeEntry16[];
 extern UCHAR HalpWakeTramp64[];
@@ -148,17 +145,19 @@ HALP_WAKE_STATE HalpWakeState;
 static
 NTSTATUS
 HalpWakeSetupTemporaryMappings(
+    _In_ PVOID LowStub,
+    _In_ PHYSICAL_ADDRESS LowStubPhysicalAddress,
     _Out_ PULONG PageTableRoot)
 {
     PHYSICAL_ADDRESS PhysicalAddress;
     PULONG64 CurrentRoot, Pml4, Pdpt, Pd, Pt;
-    ULONG64 StubPhysical = HalpLowStubPhysicalAddress.QuadPart;
+    ULONG64 StubPhysical = LowStubPhysicalAddress.QuadPart;
     ULONG StartPti, i;
 
-    Pml4 = (PULONG64)((PUCHAR)HalpLowStub + 1 * PAGE_SIZE);
-    Pdpt = (PULONG64)((PUCHAR)HalpLowStub + 2 * PAGE_SIZE);
-    Pd = (PULONG64)((PUCHAR)HalpLowStub + 3 * PAGE_SIZE);
-    Pt = (PULONG64)((PUCHAR)HalpLowStub + 4 * PAGE_SIZE);
+    Pml4 = (PULONG64)((PUCHAR)LowStub + 1 * PAGE_SIZE);
+    Pdpt = (PULONG64)((PUCHAR)LowStub + 2 * PAGE_SIZE);
+    Pd = (PULONG64)((PUCHAR)LowStub + 3 * PAGE_SIZE);
+    Pt = (PULONG64)((PUCHAR)LowStub + 4 * PAGE_SIZE);
 
     /* Copy the PML4 that is in use */
     PhysicalAddress.QuadPart = __readcr3() & ~(ULONG64)(PAGE_SIZE - 1);
@@ -191,6 +190,8 @@ HalpWakeSetupTemporaryMappings(
 NTSTATUS
 NTAPI
 HalpWakeBuildStub(
+    _In_ PVOID LowStub,
+    _In_ PHYSICAL_ADDRESS LowStubPhysicalAddress,
     _Out_ PULONG StubPhysicalAddress)
 {
     PHALP_WAKE_STUB_DATA Data;
@@ -200,29 +201,29 @@ HalpWakeBuildStub(
     *StubPhysicalAddress = 0;
 
     /* Real mode: the entry point has to be below 1MB */
-    if (HalpLowStub == NULL ||
-        HalpLowStubPhysicalAddress.QuadPart == 0 ||
-        HalpLowStubPhysicalAddress.QuadPart + HALP_LOW_STUB_SIZE_IN_PAGES * PAGE_SIZE > 0x100000 ||
-        (HalpLowStubPhysicalAddress.QuadPart & (PAGE_SIZE - 1)) != 0)
+    if (LowStub == NULL ||
+        LowStubPhysicalAddress.QuadPart == 0 ||
+        LowStubPhysicalAddress.QuadPart + HALP_LOW_STUB_SIZE_IN_PAGES * PAGE_SIZE > 0x100000 ||
+        (LowStubPhysicalAddress.QuadPart & (PAGE_SIZE - 1)) != 0)
     {
         return STATUS_NOT_SUPPORTED;
     }
 
     ASSERT((ULONG_PTR)HalpWakeEntry16End - (ULONG_PTR)HalpWakeEntry16 < PAGE_SIZE);
 
-    Status = HalpWakeSetupTemporaryMappings(&PageTableRoot);
+    Status = HalpWakeSetupTemporaryMappings(LowStub, LowStubPhysicalAddress, &PageTableRoot);
     if (!NT_SUCCESS(Status))
         return Status;
 
-    RtlCopyMemory(HalpLowStub,
+    RtlCopyMemory(LowStub,
                   HalpWakeEntry16,
                   (ULONG_PTR)HalpWakeEntry16End - (ULONG_PTR)HalpWakeEntry16);
 
-    Data = (PHALP_WAKE_STUB_DATA)((PUCHAR)HalpLowStub +
+    Data = (PHALP_WAKE_STUB_DATA)((PUCHAR)LowStub +
                                   ((ULONG_PTR)HalpWakeData - (ULONG_PTR)HalpWakeEntry16));
 
     /* Linear address of the trampoline, the page is mapped to itself */
-    Data->Jump64Offset = (ULONG)HalpLowStubPhysicalAddress.QuadPart +
+    Data->Jump64Offset = (ULONG)LowStubPhysicalAddress.QuadPart +
                          (ULONG)((ULONG_PTR)HalpWakeTramp64 - (ULONG_PTR)HalpWakeEntry16);
     Data->Jump64Selector = 8;
     Data->PageTableRoot = PageTableRoot;
@@ -234,11 +235,11 @@ HalpWakeBuildStub(
     Data->Gdt[1] = 0x00209A0000000000ULL;
     Data->Gdt[2] = 0x0000920000000000ULL;
     Data->GdtrLimit = sizeof(Data->Gdt) - 1;
-    Data->GdtrBase = (ULONG)HalpLowStubPhysicalAddress.QuadPart +
+    Data->GdtrBase = (ULONG)LowStubPhysicalAddress.QuadPart +
                      (ULONG)((ULONG_PTR)HalpWakeData - (ULONG_PTR)HalpWakeEntry16) +
                      FIELD_OFFSET(HALP_WAKE_STUB_DATA, Gdt);
 
-    *StubPhysicalAddress = (ULONG)HalpLowStubPhysicalAddress.QuadPart;
+    *StubPhysicalAddress = (ULONG)LowStubPhysicalAddress.QuadPart;
     return STATUS_SUCCESS;
 }
 
@@ -260,10 +261,7 @@ HalpWakeSaveControlState(VOID)
     State->Cr4 = __readcr4();
     State->Cr8 = __readcr8();
     State->Efer = __readmsr(X86_MSR_EFER) & ~(ULONG64)HALP_WAKE_EFER_LMA;
-    __sgdt(&State->GdtrLimit);
-    __sidt(&State->IdtrLimit);
-    __sldt(&State->Ldtr);
-    __str(&State->Tr);
+    /* GDTR, IDTR, TR and LDTR are saved by HalpWakeSaveContext */
     State->Dr0 = __readdr(0);
     State->Dr1 = __readdr(1);
     State->Dr2 = __readdr(2);
