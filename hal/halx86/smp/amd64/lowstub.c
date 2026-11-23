@@ -137,6 +137,44 @@ HALP_WAKE_STATE HalpWakeState;
 
 /* FUNCTIONS *****************************************************************/
 
+/* The pages of the stub: below 1MB, as the firmware enters it in real mode */
+static PVOID HalpWakeLowStub;
+static PHYSICAL_ADDRESS HalpWakeLowStubPhysicalAddress;
+
+/*
+ * Get the pages for the stub and the temporary page tables. Has to be called
+ * at PASSIVE_LEVEL, before HalpWakeBuildStub is needed. The pages are kept.
+ */
+NTSTATUS
+NTAPI
+HalpWakeAllocateStub(VOID)
+{
+    PHYSICAL_ADDRESS HighestAddress, PhysicalAddress;
+    PVOID LowStub;
+
+    if (HalpWakeLowStub != NULL)
+        return STATUS_SUCCESS;
+
+    HighestAddress.QuadPart = 0xFFFFF;
+    LowStub = MmAllocateContiguousMemory(HALP_LOW_STUB_SIZE_IN_PAGES * PAGE_SIZE,
+                                         HighestAddress);
+    if (LowStub == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    PhysicalAddress = MmGetPhysicalAddress(LowStub);
+    if ((PhysicalAddress.QuadPart & (PAGE_SIZE - 1)) != 0 ||
+        PhysicalAddress.QuadPart + HALP_LOW_STUB_SIZE_IN_PAGES * PAGE_SIZE > 0x100000)
+    {
+        MmFreeContiguousMemory(LowStub);
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    RtlZeroMemory(LowStub, HALP_LOW_STUB_SIZE_IN_PAGES * PAGE_SIZE);
+    HalpWakeLowStubPhysicalAddress = PhysicalAddress;
+    HalpWakeLowStub = LowStub;
+    return STATUS_SUCCESS;
+}
+
 /*
  * Page tables for the stub: the PML4 of the kernel with the first entry
  * replaced by a chain to a page table that maps the stub to itself.
@@ -145,19 +183,17 @@ HALP_WAKE_STATE HalpWakeState;
 static
 NTSTATUS
 HalpWakeSetupTemporaryMappings(
-    _In_ PVOID LowStub,
-    _In_ PHYSICAL_ADDRESS LowStubPhysicalAddress,
     _Out_ PULONG PageTableRoot)
 {
     PHYSICAL_ADDRESS PhysicalAddress;
     PULONG64 CurrentRoot, Pml4, Pdpt, Pd, Pt;
-    ULONG64 StubPhysical = LowStubPhysicalAddress.QuadPart;
+    ULONG64 StubPhysical = HalpWakeLowStubPhysicalAddress.QuadPart;
     ULONG StartPti, i;
 
-    Pml4 = (PULONG64)((PUCHAR)LowStub + 1 * PAGE_SIZE);
-    Pdpt = (PULONG64)((PUCHAR)LowStub + 2 * PAGE_SIZE);
-    Pd = (PULONG64)((PUCHAR)LowStub + 3 * PAGE_SIZE);
-    Pt = (PULONG64)((PUCHAR)LowStub + 4 * PAGE_SIZE);
+    Pml4 = (PULONG64)((PUCHAR)HalpWakeLowStub + 1 * PAGE_SIZE);
+    Pdpt = (PULONG64)((PUCHAR)HalpWakeLowStub + 2 * PAGE_SIZE);
+    Pd = (PULONG64)((PUCHAR)HalpWakeLowStub + 3 * PAGE_SIZE);
+    Pt = (PULONG64)((PUCHAR)HalpWakeLowStub + 4 * PAGE_SIZE);
 
     /* Copy the PML4 that is in use */
     PhysicalAddress.QuadPart = __readcr3() & ~(ULONG64)(PAGE_SIZE - 1);
@@ -190,10 +226,9 @@ HalpWakeSetupTemporaryMappings(
 NTSTATUS
 NTAPI
 HalpWakeBuildStub(
-    _In_ PVOID LowStub,
-    _In_ PHYSICAL_ADDRESS LowStubPhysicalAddress,
     _Out_ PULONG StubPhysicalAddress)
 {
+    PVOID LowStub = HalpWakeLowStub;
     PHALP_WAKE_STUB_DATA Data;
     ULONG PageTableRoot;
     NTSTATUS Status;
@@ -202,16 +237,16 @@ HalpWakeBuildStub(
 
     /* Real mode: the entry point has to be below 1MB */
     if (LowStub == NULL ||
-        LowStubPhysicalAddress.QuadPart == 0 ||
-        LowStubPhysicalAddress.QuadPart + HALP_LOW_STUB_SIZE_IN_PAGES * PAGE_SIZE > 0x100000 ||
-        (LowStubPhysicalAddress.QuadPart & (PAGE_SIZE - 1)) != 0)
+        HalpWakeLowStubPhysicalAddress.QuadPart == 0 ||
+        HalpWakeLowStubPhysicalAddress.QuadPart + HALP_LOW_STUB_SIZE_IN_PAGES * PAGE_SIZE > 0x100000 ||
+        (HalpWakeLowStubPhysicalAddress.QuadPart & (PAGE_SIZE - 1)) != 0)
     {
         return STATUS_NOT_SUPPORTED;
     }
 
     ASSERT((ULONG_PTR)HalpWakeEntry16End - (ULONG_PTR)HalpWakeEntry16 < PAGE_SIZE);
 
-    Status = HalpWakeSetupTemporaryMappings(LowStub, LowStubPhysicalAddress, &PageTableRoot);
+    Status = HalpWakeSetupTemporaryMappings(&PageTableRoot);
     if (!NT_SUCCESS(Status))
         return Status;
 
@@ -219,11 +254,11 @@ HalpWakeBuildStub(
                   HalpWakeEntry16,
                   (ULONG_PTR)HalpWakeEntry16End - (ULONG_PTR)HalpWakeEntry16);
 
-    Data = (PHALP_WAKE_STUB_DATA)((PUCHAR)LowStub +
+    Data = (PHALP_WAKE_STUB_DATA)((PUCHAR)HalpWakeLowStub +
                                   ((ULONG_PTR)HalpWakeData - (ULONG_PTR)HalpWakeEntry16));
 
     /* Linear address of the trampoline, the page is mapped to itself */
-    Data->Jump64Offset = (ULONG)LowStubPhysicalAddress.QuadPart +
+    Data->Jump64Offset = (ULONG)HalpWakeLowStubPhysicalAddress.QuadPart +
                          (ULONG)((ULONG_PTR)HalpWakeTramp64 - (ULONG_PTR)HalpWakeEntry16);
     Data->Jump64Selector = 8;
     Data->PageTableRoot = PageTableRoot;
@@ -235,11 +270,11 @@ HalpWakeBuildStub(
     Data->Gdt[1] = 0x00209A0000000000ULL;
     Data->Gdt[2] = 0x0000920000000000ULL;
     Data->GdtrLimit = sizeof(Data->Gdt) - 1;
-    Data->GdtrBase = (ULONG)LowStubPhysicalAddress.QuadPart +
+    Data->GdtrBase = (ULONG)HalpWakeLowStubPhysicalAddress.QuadPart +
                      (ULONG)((ULONG_PTR)HalpWakeData - (ULONG_PTR)HalpWakeEntry16) +
                      FIELD_OFFSET(HALP_WAKE_STUB_DATA, Gdt);
 
-    *StubPhysicalAddress = (ULONG)LowStubPhysicalAddress.QuadPart;
+    *StubPhysicalAddress = (ULONG)HalpWakeLowStubPhysicalAddress.QuadPart;
     return STATUS_SUCCESS;
 }
 
