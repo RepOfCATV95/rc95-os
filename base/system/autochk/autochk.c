@@ -293,7 +293,7 @@ GetFileSystem(
 
 /*
  * AUTOCHK must own an exclusive read/write volume handle before asking the
- * NTFS provider to perform a repair pass. Keeping the handle open prevents a
+ * NTFS or BTRFS provider to perform a repair pass. Keeping the handle open prevents a
  * second opener from racing the check; FSCTL_LOCK_VOLUME additionally asks
  * the filesystem to verify that the volume can be locked.
  */
@@ -304,8 +304,17 @@ GetFileSystem(
 #define FSCTL_UNLOCK_VOLUME CTL_CODE(FILE_DEVICE_FILE_SYSTEM, 7, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #endif
 
+/* File systems for which exclusive read/write access is required before repair */
+static BOOLEAN
+RequiresExclusiveRepairAccess(
+    IN PCWSTR FileSystem)
+{
+    return (wcscmp(FileSystem, L"NTFS") == 0) ||
+           (wcscmp(FileSystem, L"BTRFS") == 0);
+}
+
 static NTSTATUS
-OpenNtfsVolumeForRepair(
+OpenVolumeForRepair(
     IN PUNICODE_STRING VolumePath,
     OUT PHANDLE VolumeHandle)
 {
@@ -342,7 +351,7 @@ OpenNtfsVolumeForRepair(
 }
 
 static VOID
-CloseNtfsRepairVolume(IN HANDLE VolumeHandle)
+CloseVolumeForRepair(IN HANDLE VolumeHandle)
 {
     IO_STATUS_BLOCK IoStatus;
 
@@ -546,12 +555,12 @@ CheckVolume(
             PVOID ProviderContext = NULL;
 
             Status = STATUS_SUCCESS;
-            if (wcscmp(FileSystem, L"NTFS") == 0)
+            if (RequiresExclusiveRepairAccess(FileSystem))
             {
-                Status = OpenNtfsVolumeForRepair(&VolumePathU, &RepairVolumeHandle);
+                Status = OpenVolumeForRepair(&VolumePathU, &RepairVolumeHandle);
                 if (!NT_SUCCESS(Status))
                 {
-                    PrintString("Unable to obtain exclusive read/write access to the NTFS volume (status 0x%08lx). Repair was not started.\r\n", Status);
+                    PrintString("Unable to obtain exclusive read/write access to the %S volume (status 0x%08lx). Repair was not started.\r\n", FileSystem, Status);
                     goto Quit;
                 }
                 ProviderContext = RepairVolumeHandle;
@@ -568,7 +577,7 @@ CheckVolume(
                                                     NULL,
                                                     NULL,
                                                     (PULONG)&Status);
-            CloseNtfsRepairVolume(RepairVolumeHandle);
+            CloseVolumeForRepair(RepairVolumeHandle);
         }
         else
         {
