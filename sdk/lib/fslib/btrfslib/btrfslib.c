@@ -37,6 +37,7 @@
 #include <mountmgr.h>
 #ifdef __REACTOS__
 #include <winnls.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include "btrfs.h"
 #include "btrfsioctl.h"
@@ -244,40 +245,571 @@ typedef BOOLEAN (NTAPI* PFMIFSCALLBACK)(CALLBACKCOMMAND Command, ULONG SubAction
 #endif // __REACTOS__
 
 #ifdef __REACTOS__
-static BOOLEAN
-BtrfsCheckSuperblockChecksum(const superblock *Sb)
-{
-    const uint8_t *Data = (const uint8_t *)&Sb->uuid;
-    ULONG DataLength = (ULONG)sizeof(superblock) - sizeof(Sb->checksum);
+/* ------------------------------------------------------------------------
+ * BtrfsChkdsk
+ *
+ * What is checked:
+ *   - every superblock copy (0x10000, 64 MiB, 256 GiB, 1 PiB) that fits on
+ *     the device: magic, self address, checksum and field sanity;
+ *   - that all copies belong to the same filesystem and agree with the newest
+ *     valid copy;
+ *   - the sys_chunk_array, and the root node of the chunk tree it points to
+ *     (checksum, address, UUID, tree id, level, item count). If the chunk
+ *     tree root is stored more than once on this device (DUP, RAID1, ...) the
+ *     copies are compared with each other.
+ *
+ * What is repaired when FixErrors is set (and the volume could be locked):
+ *   - invalid, unreadable, foreign or out-of-date superblock copies are
+ *     rewritten from the newest valid copy;
+ *   - damaged or out-of-date mirrors of the chunk tree root are rewritten
+ *     from the newest valid mirror.
+ *
+ * The superblock/mirror that is used as the source of a repair is never
+ * written to, so at least one good copy always survives an interrupted
+ * repair. Every write is read back and verified before it is counted as
+ * fixed.
+ *
+ * Not (yet) checked: the rest of the trees, extent tree, checksum tree and
+ * free space.
+ * ---------------------------------------------------------------------- */
 
-    switch (Sb->csum_type)
+#define BTRFS_CHK_SB_COPIES     4
+#define BTRFS_CHK_MAX_MIRRORS   4
+
+typedef struct {
+    ULONGLONG Offset;
+    BOOLEAN Present;        /* copy lies entirely inside the device */
+    BOOLEAN Readable;
+    BOOLEAN Valid;          /* magic, address, checksum and sanity are OK */
+    BOOLEAN NeedsRepair;
+    const char *Problem;
+    superblock Sb;
+} BTRFS_SB_COPY;
+
+typedef struct {
+    BTRFS_SB_COPY Copy[BTRFS_CHK_SB_COPIES];
+    superblock Tmp;         /* scratch: image to be written */
+    superblock Verify;      /* scratch: read-back of the written image */
+} BTRFS_CHK_CTX;
+
+/* ---- small helpers ---------------------------------------------------- */
+
+/* Minimal printf replacement (this library does not link against the CRT).
+ * Supported: %s (const char*), %u and %x (both take a ULONGLONG), %%. */
+static VOID
+BtrfsVFormat(char *Out, ULONG Size, const char *Fmt, va_list Args)
+{
+    ULONG Pos = 0;
+
+#define BTRFS_PUT(c) do { if (Pos + 1 < Size) Out[Pos++] = (c); } while (0)
+
+    if (Size == 0)
+        return;
+
+    while (*Fmt)
+    {
+        if (*Fmt != '%')
+        {
+            BTRFS_PUT(*Fmt++);
+            continue;
+        }
+
+        Fmt++;
+        switch (*Fmt)
+        {
+            case 's':
+            {
+                const char *s = va_arg(Args, const char *);
+                while (s && *s)
+                    BTRFS_PUT(*s++);
+                break;
+            }
+            case 'u':
+            {
+                ULONGLONG v = va_arg(Args, ULONGLONG);
+                char t[24];
+                int n = 0;
+                do { t[n++] = (char)('0' + (int)(v % 10)); v /= 10; } while (v);
+                while (n)
+                    BTRFS_PUT(t[--n]);
+                break;
+            }
+            case 'x':
+            {
+                ULONGLONG v = va_arg(Args, ULONGLONG);
+                char t[24];
+                int n = 0;
+                do { t[n++] = "0123456789abcdef"[v & 0xf]; v >>= 4; } while (v);
+                BTRFS_PUT('0');
+                BTRFS_PUT('x');
+                while (n)
+                    BTRFS_PUT(t[--n]);
+                break;
+            }
+            case '%':
+                BTRFS_PUT('%');
+                break;
+            default:
+                break;
+        }
+
+        if (*Fmt)
+            Fmt++;
+    }
+
+    Out[Pos] = 0;
+#undef BTRFS_PUT
+}
+
+static VOID
+BtrfsOut(PFMIFSCALLBACK Callback, const char *Fmt, ...)
+{
+    char Buffer[256];
+    TEXTOUTPUT Message;
+    va_list Args;
+
+    if (!Callback)
+        return;
+
+    va_start(Args, Fmt);
+    BtrfsVFormat(Buffer, sizeof(Buffer), Fmt, Args);
+    va_end(Args);
+
+    Message.Lines = 1;
+    Message.Output = Buffer;
+    Callback(OUTPUT, 0, &Message);
+}
+
+static NTSTATUS
+BtrfsReadAt(HANDLE Handle, ULONGLONG Offset, PVOID Buffer, ULONG Length)
+{
+    IO_STATUS_BLOCK IoStatus;
+    LARGE_INTEGER Position;
+    NTSTATUS Status;
+
+    Position.QuadPart = (LONGLONG)Offset;
+    Status = NtReadFile(Handle, NULL, NULL, NULL, &IoStatus, Buffer, Length, &Position, NULL);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (!NT_SUCCESS(IoStatus.Status))
+        return IoStatus.Status;
+    if (IoStatus.Information != Length)
+        return STATUS_DEVICE_DATA_ERROR;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+BtrfsWriteAt(HANDLE Handle, ULONGLONG Offset, PVOID Buffer, ULONG Length)
+{
+    IO_STATUS_BLOCK IoStatus;
+    LARGE_INTEGER Position;
+    NTSTATUS Status;
+
+    Position.QuadPart = (LONGLONG)Offset;
+    Status = NtWriteFile(Handle, NULL, NULL, NULL, &IoStatus, Buffer, Length, &Position, NULL);
+    if (!NT_SUCCESS(Status))
+        return Status;
+    if (!NT_SUCCESS(IoStatus.Status))
+        return IoStatus.Status;
+    if (IoStatus.Information != Length)
+        return STATUS_DEVICE_DATA_ERROR;
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+BtrfsFlush(HANDLE Handle)
+{
+    IO_STATUS_BLOCK IoStatus;
+    NTSTATUS Status = NtFlushBuffersFile(Handle, &IoStatus);
+
+    if (NT_SUCCESS(Status) && !NT_SUCCESS(IoStatus.Status))
+        Status = IoStatus.Status;
+    return Status;
+}
+
+/* ---- checksums -------------------------------------------------------- */
+
+static ULONG
+BtrfsCsumSize(uint16_t Type)
+{
+    switch (Type)
+    {
+        case CSUM_TYPE_CRC32C:  return 4;
+        case CSUM_TYPE_XXHASH:  return 8;
+        case CSUM_TYPE_SHA256:  return SHA256_HASH_SIZE;
+        case CSUM_TYPE_BLAKE2:  return BLAKE2_HASH_SIZE;
+        default:                return 0;
+    }
+}
+
+/* Computes the checksum into Out (32 bytes, zero padded). */
+static BOOLEAN
+BtrfsComputeChecksum(uint16_t Type, const void *Data, ULONG Length, uint8_t *Out)
+{
+    RtlZeroMemory(Out, 32);
+
+    switch (Type)
     {
         case CSUM_TYPE_CRC32C:
         {
-            uint32_t Checksum = ~calc_crc32c_sw(0xffffffff, (uint8_t *)Data, DataLength);
-            return Checksum == *(const uint32_t *)Sb->checksum;
+            uint32_t Sum = ~calc_crc32c_sw(0xffffffff, (uint8_t *)Data, Length);
+            RtlCopyMemory(Out, &Sum, sizeof(Sum));
+            return TRUE;
         }
         case CSUM_TYPE_XXHASH:
         {
-            uint64_t Checksum = XXH64(Data, DataLength, 0);
-            return Checksum == *(const uint64_t *)Sb->checksum;
+            uint64_t Sum = XXH64(Data, Length, 0);
+            RtlCopyMemory(Out, &Sum, sizeof(Sum));
+            return TRUE;
         }
         case CSUM_TYPE_SHA256:
-        {
-            uint8_t Hash[SHA256_HASH_SIZE];
-            calc_sha256(Hash, Data, DataLength);
-            return RtlCompareMemory(Hash, Sb->checksum, sizeof(Hash)) == sizeof(Hash);
-        }
+            calc_sha256(Out, Data, Length);
+            return TRUE;
         case CSUM_TYPE_BLAKE2:
-        {
-            uint8_t Hash[BLAKE2_HASH_SIZE];
-            blake2b(Hash, sizeof(Hash), Data, DataLength);
-            return RtlCompareMemory(Hash, Sb->checksum, sizeof(Hash)) == sizeof(Hash);
-        }
+            blake2b(Out, BLAKE2_HASH_SIZE, Data, Length);
+            return TRUE;
         default:
             return FALSE;
     }
 }
+
+static BOOLEAN
+BtrfsVerifyChecksum(uint16_t Type, const void *Data, ULONG Length, const uint8_t *Stored)
+{
+    uint8_t Calc[32];
+    ULONG Size = BtrfsCsumSize(Type);
+
+    if (!Size || !BtrfsComputeChecksum(Type, Data, Length, Calc))
+        return FALSE;
+    return RtlCompareMemory(Calc, Stored, Size) == Size;
+}
+
+static BOOLEAN
+BtrfsCheckSuperblockChecksum(const superblock *Sb)
+{
+    return BtrfsVerifyChecksum(Sb->csum_type, &Sb->uuid,
+                               (ULONG)sizeof(superblock) - sizeof(Sb->checksum),
+                               Sb->checksum);
+}
+
+static VOID
+BtrfsSetSuperblockChecksum(superblock *Sb)
+{
+    BtrfsComputeChecksum(Sb->csum_type, &Sb->uuid,
+                         (ULONG)sizeof(superblock) - sizeof(Sb->checksum),
+                         Sb->checksum);
+}
+
+/* ---- superblock validation ------------------------------------------- */
+
+/* Returns NULL if the superblock read from Offset is sound, otherwise a
+ * short description of the first problem found. */
+static const char *
+BtrfsSuperblockProblem(const superblock *Sb, ULONGLONG Offset)
+{
+    if (Sb->magic != BTRFS_MAGIC)
+        return "is not a Btrfs superblock (bad magic)";
+    if (BtrfsCsumSize(Sb->csum_type) == 0)
+        return "uses an unknown checksum type";
+    if (!BtrfsCheckSuperblockChecksum(Sb))
+        return "has a bad checksum";
+    if (Sb->sb_phys_addr != Offset)
+        return "records the wrong physical address";
+
+    if (Sb->sector_size < 512 || Sb->sector_size > 65536 ||
+        (Sb->sector_size & (Sb->sector_size - 1)) != 0)
+        return "has an invalid sector size";
+    if (Sb->node_size < Sb->sector_size || Sb->node_size > 65536 ||
+        (Sb->node_size & (Sb->node_size - 1)) != 0)
+        return "has an invalid node size";
+    if (Sb->leaf_size != Sb->node_size)
+        return "has a leaf size different from the node size";
+    if (Sb->stripe_size == 0)
+        return "has an invalid stripe size";
+    if (Sb->total_bytes == 0 || Sb->bytes_used > Sb->total_bytes)
+        return "has inconsistent size accounting";
+    if (Sb->num_devices == 0)
+        return "records no devices";
+    if (Sb->root_tree_addr == 0 || Sb->chunk_tree_addr == 0)
+        return "has a missing tree root address";
+    if ((Sb->root_tree_addr % Sb->sector_size) != 0 ||
+        (Sb->chunk_tree_addr % Sb->sector_size) != 0)
+        return "has a misaligned tree root address";
+    if (Sb->n == 0 || Sb->n > SYS_CHUNK_ARRAY_SIZE)
+        return "has an invalid sys_chunk_array size";
+    if (Sb->dev_item.num_bytes == 0)
+        return "has an invalid device size";
+
+    return NULL;
+}
+
+/* True if two valid superblocks are identical apart from their own address
+ * and checksum. */
+static BOOLEAN
+BtrfsSuperblocksMatch(const superblock *A, const superblock *B, superblock *Scratch)
+{
+    RtlCopyMemory(Scratch, B, sizeof(superblock));
+    Scratch->sb_phys_addr = A->sb_phys_addr;
+
+    return RtlCompareMemory(&A->uuid, &Scratch->uuid,
+                            sizeof(superblock) - sizeof(A->checksum)) ==
+           sizeof(superblock) - sizeof(A->checksum);
+}
+
+/* ---- chunk tree root -------------------------------------------------- */
+
+/* Locates the sys_chunk_array entry covering Logical. Returns FALSE and sets
+ * *Malformed if the array cannot be parsed, or FALSE with *Malformed clear if
+ * no entry covers the address. */
+static BOOLEAN
+BtrfsFindSysChunk(const superblock *Sb, ULONGLONG Logical,
+                  const CHUNK_ITEM **Chunk, ULONGLONG *ChunkStart, BOOLEAN *Malformed)
+{
+    ULONG Pos = 0;
+
+    *Malformed = FALSE;
+
+    while (Pos < Sb->n)
+    {
+        const KEY *Key;
+        const CHUNK_ITEM *Item;
+        ULONGLONG Len;
+
+        if (Sb->n - Pos < sizeof(KEY) + sizeof(CHUNK_ITEM))
+            goto Bad;
+
+        Key = (const KEY *)(Sb->sys_chunk_array + Pos);
+        Item = (const CHUNK_ITEM *)(Sb->sys_chunk_array + Pos + sizeof(KEY));
+
+        if (Key->obj_type != TYPE_CHUNK_ITEM || Item->num_stripes == 0)
+            goto Bad;
+
+        Len = sizeof(KEY) + sizeof(CHUNK_ITEM) +
+              (ULONGLONG)Item->num_stripes * sizeof(CHUNK_ITEM_STRIPE);
+        if (Len > Sb->n - Pos)
+            goto Bad;
+
+        if (Logical >= Key->offset && Logical - Key->offset < Item->size)
+        {
+            *Chunk = Item;
+            *ChunkStart = Key->offset;
+            return TRUE;
+        }
+
+        Pos += (ULONG)Len;
+    }
+
+    return FALSE;
+
+Bad:
+    *Malformed = TRUE;
+    return FALSE;
+}
+
+static const char *
+BtrfsNodeProblem(const uint8_t *Buf, const superblock *Sb, ULONGLONG Logical, uint64_t TreeId,
+                 uint8_t ExpectedLevel)
+{
+    const tree_header *Th = (const tree_header *)Buf;
+    const BTRFS_UUID *ExpectedUuid;
+    ULONG Space, ItemSize;
+
+    if (!BtrfsVerifyChecksum(Sb->csum_type, Buf + sizeof(Th->csum),
+                             Sb->node_size - sizeof(Th->csum), Th->csum))
+        return "has a bad checksum";
+
+    if (Th->address != Logical)
+        return "records the wrong address";
+
+    ExpectedUuid = (Sb->incompat_flags & BTRFS_INCOMPAT_FLAGS_METADATA_UUID) ?
+                   &Sb->metadata_uuid : &Sb->uuid;
+    if (RtlCompareMemory(&Th->fs_uuid, ExpectedUuid, sizeof(BTRFS_UUID)) != sizeof(BTRFS_UUID))
+        return "belongs to a different filesystem";
+
+    if (!(Th->flags & HEADER_FLAG_WRITTEN))
+        return "is not marked as written";
+    if (Th->tree_id != TreeId)
+        return "belongs to the wrong tree";
+    if (Th->level != ExpectedLevel)
+        return "has an unexpected level";
+    if (Th->generation > Sb->generation)
+        return "is newer than the superblock";
+
+    Space = Sb->node_size - (ULONG)sizeof(tree_header);
+    ItemSize = Th->level == 0 ? (ULONG)sizeof(leaf_node) : (ULONG)sizeof(internal_node);
+    if (Th->num_items > Space / ItemSize)
+        return "has an impossible item count";
+
+    return NULL;
+}
+
+/* Checks the chunk tree root node, comparing all of its copies that live on
+ * this device. Updates *Errors / *Fixed. */
+static VOID
+BtrfsCheckChunkRoot(HANDLE Handle, const superblock *Sb, ULONGLONG DevLen, BOOLEAN DoRepair,
+                    PFMIFSCALLBACK Callback, BOOLEAN Verbose, ULONG *Errors, ULONG *Fixed)
+{
+    const CHUNK_ITEM *Chunk = NULL;
+    const CHUNK_ITEM_STRIPE *Stripes;
+    ULONGLONG ChunkStart = 0, Delta;
+    ULONG NodeSize = Sb->node_size;
+    ULONG k, Local = 0, BestIdx = (ULONG)-1, GoodCount = 0;
+    ULONGLONG Phys[BTRFS_CHK_MAX_MIRRORS];
+    BOOLEAN Good[BTRFS_CHK_MAX_MIRRORS];
+    const char *Why[BTRFS_CHK_MAX_MIRRORS];
+    uint8_t *Buf = NULL, *Verify = NULL;
+    BOOLEAN Malformed;
+
+    if (!BtrfsFindSysChunk(Sb, Sb->chunk_tree_addr, &Chunk, &ChunkStart, &Malformed))
+    {
+        if (Malformed)
+            BtrfsOut(Callback, "The superblock's sys_chunk_array is malformed.");
+        else
+            BtrfsOut(Callback, "The chunk tree root (%x) is not covered by the sys_chunk_array.",
+                     (ULONGLONG)Sb->chunk_tree_addr);
+        (*Errors)++;
+        return;
+    }
+
+    Delta = Sb->chunk_tree_addr - ChunkStart;
+    if (Delta + NodeSize > Chunk->size)
+    {
+        BtrfsOut(Callback, "The chunk tree root extends past the end of its chunk.");
+        (*Errors)++;
+        return;
+    }
+
+    if (Chunk->type & (BLOCK_FLAG_RAID0 | BLOCK_FLAG_RAID10 | BLOCK_FLAG_RAID5 | BLOCK_FLAG_RAID6))
+    {
+        if (Verbose)
+            BtrfsOut(Callback, "Chunk tree root is in a striped chunk; skipping its check.");
+        return;
+    }
+
+    Stripes = (const CHUNK_ITEM_STRIPE *)(Chunk + 1);
+    for (k = 0; k < Chunk->num_stripes && Local < BTRFS_CHK_MAX_MIRRORS; ++k)
+    {
+        if (Stripes[k].dev_id != Sb->dev_item.dev_id)
+            continue;
+        Phys[Local++] = Stripes[k].offset + Delta;
+    }
+
+    if (Local == 0)
+    {
+        if (Verbose)
+            BtrfsOut(Callback, "Chunk tree root is not stored on this device; skipping its check.");
+        return;
+    }
+
+    Buf = malloc((SIZE_T)NodeSize * Local);
+    Verify = malloc(NodeSize);
+    if (!Buf || !Verify)
+    {
+        BtrfsOut(Callback, "Not enough memory to check the chunk tree root.");
+        (*Errors)++;
+        goto Done;
+    }
+
+    for (k = 0; k < Local; ++k)
+    {
+        uint8_t *Node = Buf + (SIZE_T)k * NodeSize;
+        NTSTATUS Status;
+
+        Good[k] = FALSE;
+        Why[k] = NULL;
+
+        if (Phys[k] > DevLen || NodeSize > DevLen - Phys[k])
+        {
+            Why[k] = "lies outside the device";
+            continue;
+        }
+
+        Status = BtrfsReadAt(Handle, Phys[k], Node, NodeSize);
+        if (!NT_SUCCESS(Status))
+        {
+            Why[k] = "could not be read";
+            continue;
+        }
+
+        Why[k] = BtrfsNodeProblem(Node, Sb, Sb->chunk_tree_addr, BTRFS_ROOT_CHUNK, Sb->chunk_root_level);
+        if (!Why[k])
+        {
+            Good[k] = TRUE;
+            ++GoodCount;
+            if (BestIdx == (ULONG)-1 ||
+                ((tree_header *)Node)->generation >
+                ((tree_header *)(Buf + (SIZE_T)BestIdx * NodeSize))->generation)
+                BestIdx = k;
+        }
+    }
+
+    if (BestIdx == (ULONG)-1)
+    {
+        for (k = 0; k < Local; ++k)
+        {
+            BtrfsOut(Callback, "Chunk tree root copy at %x %s.", Phys[k], Why[k]);
+            (*Errors)++;
+        }
+        BtrfsOut(Callback, "No intact copy of the chunk tree root exists; it cannot be repaired.");
+        goto Done;
+    }
+
+    for (k = 0; k < Local; ++k)
+    {
+        const uint8_t *Node = Buf + (SIZE_T)k * NodeSize;
+        const uint8_t *Best = Buf + (SIZE_T)BestIdx * NodeSize;
+        const char *Problem = Why[k];
+
+        if (k == BestIdx)
+            continue;
+
+        if (Good[k])
+        {
+            if (RtlCompareMemory(Node, Best, NodeSize) == NodeSize)
+                continue;
+
+            if (((tree_header *)Node)->generation == ((tree_header *)Best)->generation)
+            {
+                BtrfsOut(Callback, "Chunk tree root copies at %x and %x disagree and cannot be told apart.",
+                         Phys[k], Phys[BestIdx]);
+                (*Errors)++;
+                continue;
+            }
+            Problem = "is out of date";
+        }
+
+        (*Errors)++;
+
+        if (!DoRepair)
+        {
+            BtrfsOut(Callback, "Chunk tree root copy at %x %s.", Phys[k], Problem);
+            continue;
+        }
+
+        if (NT_SUCCESS(BtrfsWriteAt(Handle, Phys[k], (PVOID)Best, NodeSize)) &&
+            NT_SUCCESS(BtrfsFlush(Handle)) &&
+            NT_SUCCESS(BtrfsReadAt(Handle, Phys[k], Verify, NodeSize)) &&
+            RtlCompareMemory(Verify, Best, NodeSize) == NodeSize)
+        {
+            BtrfsOut(Callback, "Chunk tree root copy at %x %s; repaired.", Phys[k], Problem);
+            (*Fixed)++;
+        }
+        else
+        {
+            BtrfsOut(Callback, "Chunk tree root copy at %x %s; repair FAILED.", Phys[k], Problem);
+        }
+    }
+
+    if (Verbose && GoodCount == Local)
+        BtrfsOut(Callback, "Chunk tree root verified (%u cop%s).", (ULONGLONG)Local,
+                 Local == 1 ? "y" : "ies");
+
+Done:
+    if (Buf) free(Buf);
+    if (Verify) free(Verify);
+}
+
+/* ---- entry point ------------------------------------------------------ */
 
 BOOLEAN
 NTAPI
@@ -298,16 +830,19 @@ BtrfsChkdsk(
     OBJECT_ATTRIBUTES Attributes;
     IO_STATUS_BLOCK IoStatus;
     GET_LENGTH_INFORMATION LengthInfo;
-    superblock *Sb = NULL, *Best = NULL;
+    BTRFS_CHK_CTX *Ctx = NULL;
+    const BTRFS_SB_COPY *Best = NULL;
     NTSTATUS Status = STATUS_UNSUCCESSFUL;
-    ULONG i, ValidCount = 0;
-    BOOLEAN Success = FALSE;
-    static const ULONGLONG SuperOffsets[] = {
+    BOOLEAN Success = FALSE, Locked = FALSE, CanRepair = FALSE;
+    ULONG i, j, ValidCount = 0, Errors = 0, Fixed = 0;
+    ULONGLONG DevLen;
+    BTRFS_UUID RefUuid;
+    ULONG RefVotes = 0;
+    static const ULONGLONG SuperOffsets[BTRFS_CHK_SB_COPIES] = {
         0x10000ULL, 0x4000000ULL, 0x4000000000ULL, 0x4000000000000ULL
     };
 
-    UNREFERENCED_PARAMETER(Verbose);
-    UNREFERENCED_PARAMETER(CheckOnlyIfDirty);
+    UNREFERENCED_PARAMETER(CheckOnlyIfDirty); /* Btrfs has no dirty bit */
     UNREFERENCED_PARAMETER(ScanDrive);
     UNREFERENCED_PARAMETER(pUnknown1);
     UNREFERENCED_PARAMETER(pUnknown2);
@@ -317,22 +852,6 @@ BtrfsChkdsk(
     if (ExitStatus)
         *ExitStatus = (ULONG)STATUS_UNSUCCESSFUL;
 
-    if (Callback)
-    {
-        TEXTOUTPUT Message;
-        Message.Lines = 1;
-        Message.Output = "Btrfs consistency checking is experimental and currently validates superblocks only.";
-        Callback(OUTPUT, 0, &Message);
-    }
-
-    if (FixErrors && Callback)
-    {
-        TEXTOUTPUT Warning;
-        Warning.Lines = 2;
-        Warning.Output = "WARNING: Btrfs repair is experimental. This checker will not modify the volume; make a verified backup before attempting repair.";
-        Callback(OUTPUT, 0, &Warning);
-    }
-
     if (!DriveRoot || !DriveRoot->Buffer || DriveRoot->Length == 0 ||
         DriveRoot->Length > DriveRoot->MaximumLength)
     {
@@ -340,22 +859,38 @@ BtrfsChkdsk(
         goto Done;
     }
 
-    /* No metadata writes are implemented; refuse repair requests explicitly. */
-    if (FixErrors)
-    {
-        Status = STATUS_NOT_SUPPORTED;
-        goto Done;
-    }
+    BtrfsOut(Callback, FixErrors ? "Checking and repairing Btrfs superblocks and chunk tree root."
+                                 : "Checking Btrfs superblocks and chunk tree root.");
 
+    /* ---- open the volume (writable only if we may repair) ---- */
     InitializeObjectAttributes(&Attributes, DriveRoot, OBJ_CASE_INSENSITIVE, NULL, NULL);
     Status = NtOpenFile(&VolumeHandle,
-                        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                        FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE |
+                        (FixErrors ? FILE_WRITE_DATA : 0),
                         &Attributes, &IoStatus, FILE_SHARE_READ | FILE_SHARE_WRITE,
                         FILE_SYNCHRONOUS_IO_ALERT);
     if (!NT_SUCCESS(Status) || !NT_SUCCESS(IoStatus.Status))
     {
         if (NT_SUCCESS(Status)) Status = IoStatus.Status;
+        BtrfsOut(Callback, "Unable to open the volume.");
         goto Done;
+    }
+
+    if (FixErrors)
+    {
+        /* Repairs need exclusive access so the driver cannot rewrite the
+         * superblocks underneath us. */
+        Status = NtFsControlFile(VolumeHandle, NULL, NULL, NULL, &IoStatus,
+                                 FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0);
+        if (NT_SUCCESS(Status) && NT_SUCCESS(IoStatus.Status))
+        {
+            Locked = TRUE;
+            CanRepair = TRUE;
+        }
+        else
+        {
+            BtrfsOut(Callback, "Could not lock the volume. It is in use, so it will be checked but not repaired.");
+        }
     }
 
     Status = NtDeviceIoControlFile(VolumeHandle, NULL, NULL, NULL, &IoStatus,
@@ -366,94 +901,207 @@ BtrfsChkdsk(
     {
         if (NT_SUCCESS(Status))
             Status = NT_SUCCESS(IoStatus.Status) ? STATUS_DEVICE_DATA_ERROR : IoStatus.Status;
+        BtrfsOut(Callback, "Unable to determine the size of the volume.");
         goto Done;
     }
 
-    if (LengthInfo.Length.QuadPart < 0x10000 + sizeof(superblock))
+    DevLen = (ULONGLONG)LengthInfo.Length.QuadPart;
+    if (DevLen < SuperOffsets[0] + sizeof(superblock))
     {
+        BtrfsOut(Callback, "The volume is too small to hold a Btrfs filesystem.");
         Status = STATUS_DISK_CORRUPT_ERROR;
         goto Done;
     }
 
-    Sb = malloc(sizeof(superblock));
-    if (!Sb)
+    Ctx = malloc(sizeof(*Ctx));
+    if (!Ctx)
     {
         Status = STATUS_INSUFFICIENT_RESOURCES;
         goto Done;
     }
+    RtlZeroMemory(Ctx, sizeof(*Ctx));
 
-    for (i = 0; i < (sizeof(SuperOffsets) / sizeof(SuperOffsets[0])); ++i)
+    /* ---- phase 1: read and validate every superblock copy ---- */
+    for (i = 0; i < BTRFS_CHK_SB_COPIES; ++i)
     {
-        LARGE_INTEGER Offset;
-        if (SuperOffsets[i] > (ULONGLONG)LengthInfo.Length.QuadPart ||
-            sizeof(superblock) > (ULONGLONG)LengthInfo.Length.QuadPart - SuperOffsets[i])
+        BTRFS_SB_COPY *C = &Ctx->Copy[i];
+
+        C->Offset = SuperOffsets[i];
+        C->Present = (C->Offset <= DevLen && sizeof(superblock) <= DevLen - C->Offset);
+        if (!C->Present)
             continue;
 
-        Offset.QuadPart = (LONGLONG)SuperOffsets[i];
-        RtlZeroMemory(Sb, sizeof(superblock));
-        Status = NtReadFile(VolumeHandle, NULL, NULL, NULL, &IoStatus,
-                            Sb, sizeof(superblock), &Offset, NULL);
-        if (!NT_SUCCESS(Status) || !NT_SUCCESS(IoStatus.Status) ||
-            IoStatus.Information != sizeof(superblock))
+        C->Readable = NT_SUCCESS(BtrfsReadAt(VolumeHandle, C->Offset, &C->Sb, sizeof(superblock)));
+        if (!C->Readable)
         {
-            if (NT_SUCCESS(Status))
-                Status = NT_SUCCESS(IoStatus.Status) ? STATUS_DEVICE_DATA_ERROR : IoStatus.Status;
+            C->Problem = "could not be read";
             continue;
         }
 
-        if (Sb->magic != BTRFS_MAGIC || Sb->sb_phys_addr != SuperOffsets[i] ||
-            !BtrfsCheckSuperblockChecksum(Sb))
-        {
-            Status = STATUS_DISK_CORRUPT_ERROR;
-            continue;
-        }
-
-        if (Sb->sector_size < 512 || Sb->sector_size > 65536 ||
-            (Sb->sector_size & (Sb->sector_size - 1)) != 0 ||
-            Sb->node_size < Sb->sector_size || Sb->node_size > 65536 ||
-            (Sb->node_size & (Sb->node_size - 1)) != 0 ||
-            Sb->leaf_size != Sb->node_size || Sb->stripe_size == 0 ||
-            Sb->total_bytes == 0 || Sb->bytes_used > Sb->total_bytes ||
-            Sb->num_devices == 0 || Sb->root_tree_addr == 0 ||
-            Sb->chunk_tree_addr == 0)
-        {
-            Status = STATUS_DISK_CORRUPT_ERROR;
-            continue;
-        }
-
-        ++ValidCount;
-        if (!Best || Sb->generation > Best->generation)
-        {
-            if (!Best)
-                Best = malloc(sizeof(superblock));
-            if (!Best)
-            {
-                Status = STATUS_INSUFFICIENT_RESOURCES;
-                goto Done;
-            }
-            RtlCopyMemory(Best, Sb, sizeof(superblock));
-        }
+        C->Problem = BtrfsSuperblockProblem(&C->Sb, C->Offset);
+        C->Valid = (C->Problem == NULL);
+        if (C->Valid)
+            ++ValidCount;
     }
 
-    if (ValidCount == 0 || !Best)
+    if (ValidCount == 0)
     {
+        BtrfsOut(Callback, "No valid Btrfs superblock was found; the volume cannot be checked or repaired.");
         Status = STATUS_DISK_CORRUPT_ERROR;
         goto Done;
     }
 
-    Status = STATUS_SUCCESS;
-    Success = TRUE;
-    if (Callback)
+    /* ---- phase 2: decide which filesystem and which copy is authoritative ----
+     * The primary superblock decides the identity if it is valid; otherwise
+     * the UUID shared by most valid copies wins. This stops a stale mirror left
+     * over from a previous filesystem from being treated as the newest copy. */
+    if (Ctx->Copy[0].Valid)
     {
-        TEXTOUTPUT Message;
-        Message.Lines = 1;
-        Message.Output = "Btrfs superblock check completed. Tree, extent, checksum-tree and free-space consistency have not yet been verified.";
-        Callback(OUTPUT, 0, &Message);
+        RefUuid = Ctx->Copy[0].Sb.uuid;
+    }
+    else
+    {
+        for (i = 0; i < BTRFS_CHK_SB_COPIES; ++i)
+        {
+            ULONG Votes = 0;
+
+            if (!Ctx->Copy[i].Valid)
+                continue;
+            for (j = 0; j < BTRFS_CHK_SB_COPIES; ++j)
+            {
+                if (Ctx->Copy[j].Valid &&
+                    RtlCompareMemory(&Ctx->Copy[j].Sb.uuid, &Ctx->Copy[i].Sb.uuid,
+                                     sizeof(BTRFS_UUID)) == sizeof(BTRFS_UUID))
+                    ++Votes;
+            }
+            if (Votes > RefVotes)
+            {
+                RefVotes = Votes;
+                RefUuid = Ctx->Copy[i].Sb.uuid;
+            }
+        }
     }
 
+    for (i = 0; i < BTRFS_CHK_SB_COPIES; ++i)
+    {
+        const BTRFS_SB_COPY *C = &Ctx->Copy[i];
+
+        if (!C->Valid ||
+            RtlCompareMemory(&C->Sb.uuid, &RefUuid, sizeof(BTRFS_UUID)) != sizeof(BTRFS_UUID))
+            continue;
+        if (!Best || C->Sb.generation > Best->Sb.generation)
+            Best = C;
+    }
+
+    /* ---- phase 3: compare every copy with the authoritative one ---- */
+    for (i = 0; i < BTRFS_CHK_SB_COPIES; ++i)
+    {
+        BTRFS_SB_COPY *C = &Ctx->Copy[i];
+
+        if (!C->Present || C == Best)
+            continue;
+
+        if (!C->Valid)
+        {
+            /* C->Problem was set in phase 1 */
+        }
+        else if (RtlCompareMemory(&C->Sb.uuid, &RefUuid, sizeof(BTRFS_UUID)) != sizeof(BTRFS_UUID))
+        {
+            C->Problem = "belongs to a different filesystem";
+        }
+        else if (!BtrfsSuperblocksMatch(&C->Sb, &Best->Sb, &Ctx->Tmp))
+        {
+            C->Problem = C->Sb.generation < Best->Sb.generation ?
+                         "is out of date" : "does not match the newest copy";
+        }
+        else
+        {
+            C->Problem = NULL;
+        }
+
+        if (C->Problem)
+        {
+            C->NeedsRepair = TRUE;
+            ++Errors;
+        }
+    }
+
+    if (Verbose)
+        BtrfsOut(Callback, "Newest superblock: generation %u at offset %x.",
+                 (ULONGLONG)Best->Sb.generation, (ULONGLONG)Best->Offset);
+
+    /* Things we can report but not fix. */
+    if (Best->Sb.dev_item.num_bytes > DevLen)
+    {
+        BtrfsOut(Callback, "The filesystem expects a device of %u bytes but the volume is only %u bytes. "
+                 "Cannot be repaired automatically.",
+                 (ULONGLONG)Best->Sb.dev_item.num_bytes, DevLen);
+        ++Errors;
+    }
+
+    /* ---- phase 4: chunk tree root ---- */
+    BtrfsCheckChunkRoot(VolumeHandle, &Best->Sb, DevLen, CanRepair, Callback, Verbose, &Errors, &Fixed);
+
+    /* ---- phase 5: repair superblock copies ---- */
+    for (i = 0; i < BTRFS_CHK_SB_COPIES; ++i)
+    {
+        BTRFS_SB_COPY *C = &Ctx->Copy[i];
+
+        if (!C->NeedsRepair)
+            continue;
+
+        if (!CanRepair)
+        {
+            BtrfsOut(Callback, "Superblock copy at %x %s.", C->Offset, C->Problem);
+            continue;
+        }
+
+        /* Rewrite from the authoritative copy, which itself is never touched. */
+        RtlCopyMemory(&Ctx->Tmp, &Best->Sb, sizeof(superblock));
+        Ctx->Tmp.sb_phys_addr = C->Offset;
+        BtrfsSetSuperblockChecksum(&Ctx->Tmp);
+
+        if (NT_SUCCESS(BtrfsWriteAt(VolumeHandle, C->Offset, &Ctx->Tmp, sizeof(superblock))) &&
+            NT_SUCCESS(BtrfsFlush(VolumeHandle)) &&
+            NT_SUCCESS(BtrfsReadAt(VolumeHandle, C->Offset, &Ctx->Verify, sizeof(superblock))) &&
+            RtlCompareMemory(&Ctx->Verify, &Ctx->Tmp, sizeof(superblock)) == sizeof(superblock))
+        {
+            BtrfsOut(Callback, "Superblock copy at %x %s; repaired.", C->Offset, C->Problem);
+            ++Fixed;
+        }
+        else
+        {
+            BtrfsOut(Callback, "Superblock copy at %x %s; repair FAILED.", C->Offset, C->Problem);
+        }
+    }
+
+    /* ---- summary ---- */
+    if (Errors == 0)
+    {
+        BtrfsOut(Callback, "No problems found.");
+    }
+    else if (Fixed == Errors)
+    {
+        BtrfsOut(Callback, "Found %u problem%s and repaired all of them. Remount the volume for the changes to take effect.",
+                 (ULONGLONG)Errors, Errors == 1 ? "" : "s");
+    }
+    else
+    {
+        BtrfsOut(Callback, "Found %u problem%s, %u repaired.%s",
+                 (ULONGLONG)Errors, Errors == 1 ? "" : "s", (ULONGLONG)Fixed,
+                 FixErrors ? "" : " Run the check again with repair enabled to fix them.");
+    }
+    BtrfsOut(Callback, "Note: only superblocks and the chunk tree root are verified; other trees, extents, "
+                       "data checksums and free space are not.");
+
+    Success = (Fixed >= Errors);
+    Status = Success ? STATUS_SUCCESS : STATUS_DISK_CORRUPT_ERROR;
+
 Done:
-    if (Best) free(Best);
-    if (Sb) free(Sb);
+    if (Locked)
+        NtFsControlFile(VolumeHandle, NULL, NULL, NULL, &IoStatus,
+                        FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0);
+    if (Ctx) free(Ctx);
     if (VolumeHandle) NtClose(VolumeHandle);
     if (ExitStatus) *ExitStatus = (ULONG)Status;
     if (Callback)
