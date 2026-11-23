@@ -359,16 +359,13 @@ HalpAcpiSleep(
 /* smp/<arch>/lowstub.c, smp/<arch>/wakestub.S: waking up from S2/S3 */
 NTSTATUS
 NTAPI
-HalpWakeBuildStub(
-    _In_ PVOID LowStub,
-    _In_ PHYSICAL_ADDRESS LowStubPhysicalAddress,
-    _Out_ PULONG StubPhysicalAddress
+HalpWakeAllocateStub(
+    VOID
 );
 
-/* acpi/halacpi.c: HalpWakeBuildStub with the low stub of HalpSetupAcpiPhase0 */
 NTSTATUS
 NTAPI
-HalpAcpiBuildWakeStub(
+HalpWakeBuildStub(
     _Out_ PULONG StubPhysicalAddress
 );
 

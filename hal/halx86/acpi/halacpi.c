@@ -47,15 +47,6 @@ PWCHAR HalName = L"ACPI Compatible Eisa/Isa HAL";
 
 /* PRIVATE FUNCTIONS **********************************************************/
 
-/* The wake stub (smp/<arch>/lowstub.c) lives in the low stub pages allocated in HalpSetupAcpiPhase0 */
-NTSTATUS
-NTAPI
-HalpAcpiBuildWakeStub(
-    _Out_ PULONG StubPhysicalAddress)
-{
-    return HalpWakeBuildStub(HalpLowStub, HalpLowStubPhysicalAddress, StubPhysicalAddress);
-}
-
 PDESCRIPTION_HEADER
 NTAPI
 HalpAcpiGetCachedTable(IN ULONG Signature)

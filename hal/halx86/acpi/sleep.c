@@ -333,6 +333,9 @@ HalpWakeSetFirmwareVector(
  * caller. Without ContextLost (S1) the function returns when the machine
  * is awake again.
  *
+ * For ContextLost HalpWakeAllocateStub has to be called first, at
+ * PASSIVE_LEVEL: it needs memory below 1MB, that can't be allocated here.
+ *
  * Has to be called with interrupts disabled, at DISPATCH_LEVEL or above, on a
  * uniprocessor machine for ContextLost. If the function returns with
  * *Resumed FALSE and a success status, the machine did not go to sleep.
@@ -380,7 +383,7 @@ HalpAcpiSleep(
         if (KeNumberProcessors != 1)
             return STATUS_NOT_SUPPORTED;
 
-        Status = HalpAcpiBuildWakeStub(&StubPhysicalAddress);
+        Status = HalpWakeBuildStub(&StubPhysicalAddress);
         if (!NT_SUCCESS(Status))
             return Status;
 
