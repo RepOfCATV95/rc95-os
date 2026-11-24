@@ -210,16 +210,22 @@ NTSTATUS add_space_entry(LIST_ENTRY* list, LIST_ENTRY* list_size, uint64_t offse
         else {
             LIST_ENTRY* le;
 
-            le = list->Flink;
-            while (le != list) {
-                s2 = CONTAINING_RECORD(le, space, list_entry);
+            s2 = CONTAINING_RECORD(list->Flink, space, list_entry);
+            if (s2->address > offset)
+                InsertHeadList(list, &s->list_entry);
+            else {
+                le = list->Flink;
+                while (le != list) {
+                    s2 = CONTAINING_RECORD(le, space, list_entry);
 
-                if (s2->address > offset) {
-                    InsertTailList(le, &s->list_entry);
-                    goto size;
+                    if (s2->address > offset) {
+                        InsertTailList(le, &s->list_entry);
+                        goto size;
+                    }
+
+                    le = le->Flink;
                 }
-
-                le = le->Flink;
+                InsertTailList(list, &s->list_entry);
             }
         }
     }
@@ -238,16 +244,22 @@ size:
         else {
             LIST_ENTRY* le;
 
-            le = list_size->Flink;
-            while (le != list_size) {
-                s2 = CONTAINING_RECORD(le, space, list_entry_size);
+            s2 = CONTAINING_RECORD(list_size->Flink, space, list_entry_size);
+            if (s2->size <= size)
+                InsertHeadList(list_size, &s->list_entry_size);
+            else {
+                le = list_size->Flink->Flink;
+                while (le != list_size) {
+                    s2 = CONTAINING_RECORD(le, space, list_entry_size);
 
-                if (s2->size <= size) {
-                    InsertHeadList(le->Blink, &s->list_entry_size);
-                    return STATUS_SUCCESS;
+                    if (s2->size <= size) {
+                        InsertHeadList(le->Blink, &s->list_entry_size);
+                        return STATUS_SUCCESS;
+                    }
+
+                    le = le->Flink;
                 }
-
-                le = le->Flink;
+                InsertTailList(list_size, &s->list_entry_size);
             }
         }
     }
@@ -1010,7 +1022,9 @@ static NTSTATUS insert_cache_extent(fcb* fcb, uint64_t start, uint64_t length, L
         if (!c->readonly && !c->reloc) {
             acquire_chunk_lock(c, fcb->Vcb);
 
-            if (c->chunk_item->type == flags && (c->chunk_item->size - c->used) >= length) {
+            if (c->chunk_item->type == flags && c->used <= c->chunk_item->size &&
+                c->chunk_item->size - c->used >= length && !IsListEmpty(&c->space_size) &&
+                CONTAINING_RECORD(c->space_size.Flink, space, list_entry_size)->size >= length) {
                 if (insert_extent_chunk(fcb->Vcb, fcb, c, start, length, false, NULL, NULL, rollback, BTRFS_COMPRESSION_NONE, length, false, 0))
                     return STATUS_SUCCESS;
             }
@@ -1030,7 +1044,9 @@ static NTSTATUS insert_cache_extent(fcb* fcb, uint64_t start, uint64_t length, L
 
     acquire_chunk_lock(c, fcb->Vcb);
 
-    if (c->chunk_item->type == flags && (c->chunk_item->size - c->used) >= length) {
+    if (c->chunk_item->type == flags && c->used <= c->chunk_item->size &&
+                c->chunk_item->size - c->used >= length && !IsListEmpty(&c->space_size) &&
+                CONTAINING_RECORD(c->space_size.Flink, space, list_entry_size)->size >= length) {
         if (insert_extent_chunk(fcb->Vcb, fcb, c, start, length, false, NULL, NULL, rollback, BTRFS_COMPRESSION_NONE, length, false, 0))
             return STATUS_SUCCESS;
     }

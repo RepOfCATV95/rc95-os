@@ -775,45 +775,38 @@ bool find_metadata_address_in_chunk(device_extension* Vcb, chunk* c, uint64_t* a
         }
     }
 
-    le = c->space.Flink;
+    /*
+     * The address list is ascending. Allocations normally advance from the
+     * previous address, so walk backwards from the tail instead of rescanning
+     * every earlier free extent on each metadata-tree block allocation.
+     */
+    le = c->space.Blink;
     while (le != &c->space) {
         s = CONTAINING_RECORD(le, space, list_entry);
 
-        if (s->address <= c->last_alloc && s->address + s->size >= c->last_alloc + Vcb->superblock.node_size) {
-            *address = c->last_alloc;
-            c->last_alloc += Vcb->superblock.node_size;
-            return true;
+        if (s->address <= c->last_alloc) {
+            if (s->size >= Vcb->superblock.node_size &&
+                c->last_alloc - s->address <= s->size - Vcb->superblock.node_size) {
+                *address = c->last_alloc;
+                c->last_alloc += Vcb->superblock.node_size;
+                return true;
+            }
+
+            /* Earlier address-ordered extents cannot contain last_alloc. */
+            break;
         }
 
-        le = le->Flink;
+        le = le->Blink;
     }
 
-    le = c->space_size.Flink;
-    while (le != &c->space_size) {
-        s = CONTAINING_RECORD(le, space, list_entry_size);
+    /*
+     * space_size is kept in descending size order. Its head is therefore the
+     * largest extent; one check is sufficient to determine whether a
+     * contiguous metadata block can be allocated.
+     */
+    s = CONTAINING_RECORD(c->space_size.Flink, space, list_entry_size);
 
-        if (s->size == Vcb->superblock.node_size) {
-            *address = s->address;
-            c->last_alloc = s->address + Vcb->superblock.node_size;
-            return true;
-        } else if (s->size < Vcb->superblock.node_size) {
-            if (le == c->space_size.Flink)
-                return false;
-
-            s = CONTAINING_RECORD(le->Blink, space, list_entry_size);
-
-            *address = s->address;
-            c->last_alloc = s->address + Vcb->superblock.node_size;
-
-            return true;
-        }
-
-        le = le->Flink;
-    }
-
-    s = CONTAINING_RECORD(c->space_size.Blink, space, list_entry_size);
-
-    if (s->size > Vcb->superblock.node_size) {
+    if (s->size >= Vcb->superblock.node_size) {
         *address = s->address;
         c->last_alloc = s->address + Vcb->superblock.node_size;
         return true;
@@ -4289,11 +4282,29 @@ static NTSTATUS create_chunk(device_extension* Vcb, chunk* c, PIRP Irp) {
             return Status;
         }
 
-        // FIXME - no point in calling this twice for the same device
-        Status = update_dev_item(Vcb, c->devices[i], Irp);
-        if (!NT_SUCCESS(Status)) {
-            ERR("update_dev_item returned %08lx\n", Status);
-            return Status;
+        /*
+         * A RAID chunk can contain multiple stripes on the same device.
+         * DEV_EXTENT records are per stripe, but DEV_ITEM accounting is
+         * device-wide; update it only once per distinct device.
+         */
+        {
+            bool update_device = true;
+            uint16_t j;
+
+            for (j = 0; j < i; j++) {
+                if (c->devices[j] == c->devices[i]) {
+                    update_device = false;
+                    break;
+                }
+            }
+
+            if (update_device) {
+                Status = update_dev_item(Vcb, c->devices[i], Irp);
+                if (!NT_SUCCESS(Status)) {
+                    ERR("update_dev_item returned %08lx\n", Status);
+                    return Status;
+                }
+            }
         }
     }
 
@@ -7196,7 +7207,8 @@ static NTSTATUS test_not_full(device_extension* Vcb) {
             device* dev = CONTAINING_RECORD(le, device, list_entry);
 
             if (!dev->readonly) {
-                uint64_t space = dev->devitem.num_bytes - dev->devitem.bytes_used;
+                uint64_t space = dev->devitem.bytes_used < dev->devitem.num_bytes ?
+                    dev->devitem.num_bytes - dev->devitem.bytes_used : 0;
 
                 if (space >= s1) {
                     s3 = s2;
@@ -7221,7 +7233,8 @@ static NTSTATUS test_not_full(device_extension* Vcb) {
             device* dev = CONTAINING_RECORD(le, device, list_entry);
 
             if (!dev->readonly) {
-                uint64_t space = dev->devitem.num_bytes - dev->devitem.bytes_used;
+                uint64_t space = dev->devitem.bytes_used < dev->devitem.num_bytes ?
+                    dev->devitem.num_bytes - dev->devitem.bytes_used : 0;
 
                 if (space >= s1) {
                     s4 = s3;
@@ -7251,7 +7264,8 @@ static NTSTATUS test_not_full(device_extension* Vcb) {
             device* dev = CONTAINING_RECORD(le, device, list_entry);
 
             if (!dev->readonly) {
-                uint64_t space = dev->devitem.num_bytes - dev->devitem.bytes_used;
+                uint64_t space = dev->devitem.bytes_used < dev->devitem.num_bytes ?
+                    dev->devitem.num_bytes - dev->devitem.bytes_used : 0;
 
                 if (space >= s1) {
                     s2 = s1;
@@ -7288,7 +7302,8 @@ static NTSTATUS test_not_full(device_extension* Vcb) {
             device* dev = CONTAINING_RECORD(le, device, list_entry);
 
             if (!dev->readonly) {
-                uint64_t space = dev->devitem.num_bytes - dev->devitem.bytes_used;
+                uint64_t space = dev->devitem.bytes_used < dev->devitem.num_bytes ?
+                    dev->devitem.num_bytes - dev->devitem.bytes_used : 0;
 
                 if (space >= s1) {
                     s3 = s2;
@@ -7313,7 +7328,8 @@ static NTSTATUS test_not_full(device_extension* Vcb) {
             device* dev = CONTAINING_RECORD(le, device, list_entry);
 
             if (!dev->readonly) {
-                uint64_t space = dev->devitem.num_bytes - dev->devitem.bytes_used;
+                uint64_t space = dev->devitem.bytes_used < dev->devitem.num_bytes ?
+                    dev->devitem.num_bytes - dev->devitem.bytes_used : 0;
 
                 if (space >= s1) {
                     s4 = s3;
@@ -7341,7 +7357,8 @@ static NTSTATUS test_not_full(device_extension* Vcb) {
             device* dev = CONTAINING_RECORD(le, device, list_entry);
 
             if (!dev->readonly) {
-                uint64_t space = dev->devitem.num_bytes - dev->devitem.bytes_used;
+                uint64_t space = dev->devitem.bytes_used < dev->devitem.num_bytes ?
+                    dev->devitem.num_bytes - dev->devitem.bytes_used : 0;
 
                 could_alloc = max(could_alloc, space);
             }
@@ -7355,15 +7372,24 @@ static NTSTATUS test_not_full(device_extension* Vcb) {
 
     free_space = 0;
 
+    /*
+     * could_alloc is known to be below reserve here. Compare against the
+     * remaining requirement instead of adding two potentially large byte
+     * counts, which could wrap on large volumes.
+     */
     le = Vcb->chunks.Flink;
     while (le != &Vcb->chunks) {
         chunk* c = CONTAINING_RECORD(le, chunk, list_entry);
 
-        if (!c->reloc && !c->readonly && c->chunk_item->type & BLOCK_FLAG_METADATA) {
-            free_space += c->chunk_item->size - c->used;
+        if (!c->reloc && !c->readonly && (c->chunk_item->type & BLOCK_FLAG_METADATA) &&
+            c->used < c->chunk_item->size) {
+            uint64_t chunk_free = c->chunk_item->size - c->used;
+            uint64_t remaining = reserve - could_alloc;
 
-            if (free_space + could_alloc >= reserve)
+            if (chunk_free >= remaining - free_space)
                 return STATUS_SUCCESS;
+
+            free_space += chunk_free;
         }
 
         le = le->Flink;
@@ -7883,9 +7909,28 @@ NTSTATUS do_write(device_extension* Vcb, PIRP Irp) {
     Status = do_write2(Vcb, Irp, &rollback);
 
     if (!NT_SUCCESS(Status)) {
-        ERR("do_write2 returned %08lx, dropping into readonly mode\n", Status);
-        InterlockedExchange(&Vcb->readonly, TRUE);
-        FsRtlNotifyVolumeEvent(Vcb->root_file, FSRTL_VOLUME_FORCED_CLOSED);
+        /*
+         * A failed transaction is rolled back below, but not every failure
+         * means that the on-disk state is unsafe. In particular, the
+         * metadata-reserve check deliberately returns STATUS_DISK_FULL when
+         * space is tight. Latching the whole volume read-only for that
+         * recoverable condition prevents users from deleting files or
+         * freeing space and makes the condition permanent until remount.
+         *
+         * Keep the volume online for capacity/resource failures so that
+         * callers can free space and a later flush can retry. Actual I/O,
+         * checksum, and consistency failures still force read-only mode.
+         */
+        if (Status != STATUS_DISK_FULL &&
+            Status != STATUS_INSUFFICIENT_RESOURCES &&
+            Status != STATUS_QUOTA_EXCEEDED) {
+            ERR("do_write2 returned %08lx, dropping into readonly mode\n", Status);
+            InterlockedExchange(&Vcb->readonly, TRUE);
+            FsRtlNotifyVolumeEvent(Vcb->root_file, FSRTL_VOLUME_FORCED_CLOSED);
+        } else {
+            WARN("do_write2 returned recoverable capacity/resource status %08lx; keeping volume writable\n", Status);
+        }
+
         do_rollback(Vcb, &rollback);
     } else
         clear_rollback(&rollback);
