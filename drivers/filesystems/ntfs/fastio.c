@@ -144,8 +144,7 @@ NtfsFastIoCheckIfPossible(
                                          FileObject, PsGetCurrentProcess());
     }
 
-    if (!NtfsGlobalData->EnableWriteSupport ||
-        !FsRtlFastCheckLockForWrite(&Fcb->FileLock, FileOffset, &LargeLength, LockKey,
+    if (!FsRtlFastCheckLockForWrite(&Fcb->FileLock, FileOffset, &LargeLength, LockKey,
                                     FileObject, PsGetCurrentProcess()))
     {
         return FALSE;
@@ -185,7 +184,7 @@ NtfsFastIoWrite(
     _Out_ PIO_STATUS_BLOCK IoStatus,
     _In_ PDEVICE_OBJECT DeviceObject)
 {
-    if (!NtfsIsRegularFileObject(FileObject) || !NtfsGlobalData->EnableWriteSupport)
+    if (!NtfsIsRegularFileObject(FileObject))
         return FALSE;
 
     return FsRtlCopyWrite(FileObject, FileOffset, Length, Wait, LockKey, Buffer, IoStatus, DeviceObject);

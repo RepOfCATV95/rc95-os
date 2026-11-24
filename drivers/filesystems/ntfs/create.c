@@ -686,13 +686,6 @@ NtfsCreateFile(PDEVICE_OBJECT DeviceObject,
             LARGE_INTEGER Zero;
             Zero.QuadPart = 0;
 
-            if (!NtfsGlobalData->EnableWriteSupport)
-            {
-                DPRINT1("NTFS write-support is EXPERIMENTAL and is disabled by default!\n");
-                NtfsCloseFile(DeviceExt, FileObject);
-                return STATUS_ACCESS_DENIED;
-            }
-
             // TODO: check for appropriate access
 
             ExAcquireResourceExclusiveLite(&(Fcb->MainResource), TRUE);
@@ -751,13 +744,6 @@ NtfsCreateFile(PDEVICE_OBJECT DeviceObject,
             RequestedDisposition == FILE_OVERWRITE_IF ||
             RequestedDisposition == FILE_SUPERSEDE)
         {
-            if (!NtfsGlobalData->EnableWriteSupport)
-            {
-                DPRINT1("NTFS write-support is EXPERIMENTAL and is disabled by default!\n");
-                NtfsCloseFile(DeviceExt, FileObject);
-                return STATUS_ACCESS_DENIED;
-            }
-
             // Was the user trying to create a directory?
             if (RequestedOptions & FILE_DIRECTORY_FILE)
             {

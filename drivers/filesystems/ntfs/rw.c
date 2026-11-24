@@ -640,6 +640,9 @@ NTSTATUS NtfsWriteFile(PDEVICE_EXTENSION DeviceExt,
 
     ASSERT(DeviceExt);
 
+    if (Length != 0 && WriteOffset > (ULONGLONG)-1 - Length)
+        return STATUS_INTEGER_OVERFLOW;
+
     if (Length == 0)
     {
         if (Buffer == NULL)
@@ -785,6 +788,47 @@ NTSTATUS NtfsWriteFile(PDEVICE_EXTENSION DeviceExt,
 
     DPRINT("Length: %lu\tWriteOffset: %I64u\tStreamSize: %I64u\n", Length, WriteOffset, StreamSize);
 
+    /*
+     * Non-paging writes own MainResource exclusively. Serialize sparse
+     * mapping changes against paging I/O before the data path consumes runs.
+     */
+    if (!(IrpFlags & IRP_PAGING_IO) &&
+        DataContext->pRecord->IsNonResident &&
+        (DataContext->pRecord->Flags & NTFS_ATTR_SPARSE))
+    {
+        ULONGLONG OldAllocationSize = DataContext->pRecord->NonResident.AllocatedSize;
+
+        ExAcquireResourceExclusiveLite(&Fcb->PagingIoResource, TRUE);
+        Status = NtfsAllocateSparseWriteRange(DeviceExt,
+                                              DataContext,
+                                              WriteOffset,
+                                              Length,
+                                              FileRecord,
+                                              TRUE);
+        ExReleaseResourceLite(&Fcb->PagingIoResource);
+
+        if (NT_SUCCESS(Status) &&
+            DataContext->pRecord->NonResident.AllocatedSize > OldAllocationSize)
+        {
+            Fcb->RFCB.AllocationSize.QuadPart =
+                DataContext->pRecord->NonResident.AllocatedSize;
+            CcSetFileSizes(FileObject, (PCC_FILE_SIZES)&Fcb->RFCB.AllocationSize);
+            (VOID)NtfsUpdateDuplicatedInformation(DeviceExt,
+                                                  FileRecord,
+                                                  Fcb->MFTIndex,
+                                                  NTFS_FILENAME_UPDATE_SIZES,
+                                                  CaseSensitive);
+        }
+
+        if (!NT_SUCCESS(Status))
+        {
+            ReleaseAttributeContext(DataContext);
+            ExFreeToNPagedLookasideList(&DeviceExt->FileRecLookasideList, FileRecord);
+            *LengthWritten = 0;
+            return Status;
+        }
+    }
+
     // Write the data to the attribute
     /* Buffer is the system mapping of this IRP's MDL, so hand the IRP down too
      * and let the run layer borrow it instead of locking these pages twice,
@@ -856,6 +900,79 @@ NtfsGrowFileForWrite(
     return Status;
 }
 
+/*
+ * Reserve sparse clusters before dirty cache pages can be written through
+ * the paging-I/O path. Paging I/O itself must never mutate allocation
+ * metadata because it holds PagingIoResource shared.
+ */
+static
+NTSTATUS
+NtfsPrepareSparseCachedWrite(
+    _In_ PFILE_OBJECT FileObject,
+    _In_ PNTFS_FCB Fcb,
+    _In_ ULONGLONG Offset,
+    _In_ ULONG Length,
+    _In_ BOOLEAN CaseSensitive)
+{
+    PDEVICE_EXTENSION DeviceExt = Fcb->Vcb;
+    PFILE_RECORD_HEADER FileRecord;
+    PNTFS_ATTR_CONTEXT DataContext = NULL;
+    ULONG AttributeOffset;
+    ULONGLONG OldAllocationSize;
+    NTSTATUS Status;
+
+    FileRecord = ExAllocateFromNPagedLookasideList(&DeviceExt->FileRecLookasideList);
+    if (FileRecord == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    Status = ReadFileRecord(DeviceExt, Fcb->MFTIndex, FileRecord);
+    if (!NT_SUCCESS(Status))
+        goto Cleanup;
+
+    Status = FindAttribute(DeviceExt, FileRecord, AttributeData,
+                           Fcb->Stream, wcslen(Fcb->Stream),
+                           &DataContext, &AttributeOffset);
+    if (!NT_SUCCESS(Status))
+        goto Cleanup;
+
+    if (!DataContext->pRecord->IsNonResident ||
+        !(DataContext->pRecord->Flags & NTFS_ATTR_SPARSE))
+    {
+        Status = STATUS_SUCCESS;
+        goto Cleanup;
+    }
+
+    OldAllocationSize = DataContext->pRecord->NonResident.AllocatedSize;
+    ExAcquireResourceExclusiveLite(&Fcb->PagingIoResource, TRUE);
+    Status = NtfsAllocateSparseWriteRange(DeviceExt,
+                                          DataContext,
+                                          Offset,
+                                          Length,
+                                          FileRecord,
+                                          TRUE);
+    ExReleaseResourceLite(&Fcb->PagingIoResource);
+    if (NT_SUCCESS(Status) &&
+        DataContext->pRecord->NonResident.AllocatedSize > OldAllocationSize)
+    {
+        Fcb->RFCB.AllocationSize.QuadPart =
+            DataContext->pRecord->NonResident.AllocatedSize;
+        CcSetFileSizes(FileObject, (PCC_FILE_SIZES)&Fcb->RFCB.AllocationSize);
+
+        /* Keep the duplicated $FILE_NAME sizes in the parent index current. */
+        (VOID)NtfsUpdateDuplicatedInformation(DeviceExt,
+                                              FileRecord,
+                                              Fcb->MFTIndex,
+                                              NTFS_FILENAME_UPDATE_SIZES,
+                                              CaseSensitive);
+    }
+
+Cleanup:
+    if (DataContext != NULL)
+        ReleaseAttributeContext(DataContext);
+    ExFreeToNPagedLookasideList(&DeviceExt->FileRecLookasideList, FileRecord);
+    return Status;
+}
+
 static
 NTSTATUS
 NTAPI
@@ -869,12 +986,19 @@ NtfsCachedWrite(
     _Out_ PULONG LengthWritten)
 {
     PFILE_OBJECT FileObject = IrpContext->FileObject;
-    LONGLONG WriteEnd = WriteOffset->QuadPart + Length;
+    LONGLONG WriteEnd;
     LARGE_INTEGER OldValidData;
     BOOLEAN HideNewData = FALSE;
     NTSTATUS Status = STATUS_SUCCESS;
 
     *LengthWritten = 0;
+
+    if (WriteOffset == NULL || WriteOffset->QuadPart < 0 ||
+        WriteOffset->QuadPart > MAXLONGLONG - (LONGLONG)Length)
+    {
+        return STATUS_INTEGER_OVERFLOW;
+    }
+    WriteEnd = WriteOffset->QuadPart + Length;
 
     if (NtfsFCBIsCompressed(Fcb))
     {
@@ -899,6 +1023,14 @@ NtfsCachedWrite(
             if (!NT_SUCCESS(Status))
                 _SEH2_LEAVE;
         }
+
+        Status = NtfsPrepareSparseCachedWrite(FileObject,
+                                              Fcb,
+                                              (ULONGLONG)WriteOffset->QuadPart,
+                                              Length,
+                                              CaseSensitive);
+        if (!NT_SUCCESS(Status))
+            _SEH2_LEAVE;
 
         /* Don't let Cc read from disk what we are about to overwrite, and
          * make whatever lies before the write read as zeroes */

@@ -41,6 +41,7 @@
 #if defined(_M_IX86) || defined(_M_AMD64)
 
 #include <ntdddisk.h>
+#include "hibdump_ata.h"
 
 #define PO_DUMP_SIGNATURE       'pmDP'
 #define PO_DUMP_TAG             'pDoP'
@@ -84,6 +85,8 @@ typedef struct _PO_DUMP_STACK
     PUCHAR ControlBase;
     ULONG Device;
     BOOLEAN Lba48;
+    BOOLEAN FlushCache;
+    BOOLEAN FlushCacheExt;
     ULONGLONG TotalSectors;
 
     /* The hibernation file */
@@ -184,8 +187,18 @@ PopAtaCheckRange(
         return STATUS_INVALID_PARAMETER;
     if (Lba >= Stack->TotalSectors || Count > Stack->TotalSectors - Lba)
         return STATUS_DISK_FULL;
-    if (!Stack->Lba48 && Lba + Count > 0x0FFFFFFFULL)
+    /*
+     * LBA28 addresses sectors 0 through 0x0FFFFFFF inclusive. Count is a
+     * sector count, so compare the final addressed sector rather than the
+     * exclusive end; the old comparison incorrectly rejected the last
+     * representable LBA even for a one-sector request.
+     */
+    if (!Stack->Lba48 &&
+        (Lba > 0x0FFFFFFFULL ||
+         (ULONGLONG)(Count - 1) > 0x0FFFFFFFULL - Lba))
+    {
         return STATUS_DISK_FULL;
+    }
     return STATUS_SUCCESS;
 }
 
@@ -198,28 +211,29 @@ PopAtaLoadAddress(
 {
     PUCHAR Base = Stack->CommandBase;
 
+    PO_DUMP_ATA_ADDRESS Address;
+
+    ASSERT(PopDumpAtaBuildAddress(Stack->Lba48,
+                                  Stack->Device,
+                                  Lba,
+                                  Count,
+                                  &Address));
+
+    WRITE_PORT_UCHAR(Base + 6, Address.DeviceHead);
     if (Stack->Lba48)
     {
-        WRITE_PORT_UCHAR(Base + 6, (UCHAR)(0x40 | (Stack->Device << 4)));
-        WRITE_PORT_UCHAR(Base + 2, (UCHAR)(Count >> 8));
-        WRITE_PORT_UCHAR(Base + 3, (UCHAR)(Lba >> 24));
-        WRITE_PORT_UCHAR(Base + 4, (UCHAR)(Lba >> 32));
-        WRITE_PORT_UCHAR(Base + 5, (UCHAR)(Lba >> 40));
-        WRITE_PORT_UCHAR(Base + 2, (UCHAR)Count);
-        WRITE_PORT_UCHAR(Base + 3, (UCHAR)Lba);
-        WRITE_PORT_UCHAR(Base + 4, (UCHAR)(Lba >> 8));
-        WRITE_PORT_UCHAR(Base + 5, (UCHAR)(Lba >> 16));
+        /* ATA LBA48 requires high-order task-file bytes first. */
+        WRITE_PORT_UCHAR(Base + 1, Address.HighFeatures);
+        WRITE_PORT_UCHAR(Base + 2, Address.HighCount);
+        WRITE_PORT_UCHAR(Base + 3, Address.HighLbaLow);
+        WRITE_PORT_UCHAR(Base + 4, Address.HighLbaMid);
+        WRITE_PORT_UCHAR(Base + 5, Address.HighLbaHigh);
     }
-    else
-    {
-        WRITE_PORT_UCHAR(Base + 6,
-                         (UCHAR)(0xE0 | (Stack->Device << 4) |
-                                 ((ULONG)(Lba >> 24) & 0x0F)));
-        WRITE_PORT_UCHAR(Base + 2, (UCHAR)Count);
-        WRITE_PORT_UCHAR(Base + 3, (UCHAR)Lba);
-        WRITE_PORT_UCHAR(Base + 4, (UCHAR)(Lba >> 8));
-        WRITE_PORT_UCHAR(Base + 5, (UCHAR)(Lba >> 16));
-    }
+    WRITE_PORT_UCHAR(Base + 1, Address.LowFeatures);
+    WRITE_PORT_UCHAR(Base + 2, Address.LowCount);
+    WRITE_PORT_UCHAR(Base + 3, Address.LowLbaLow);
+    WRITE_PORT_UCHAR(Base + 4, Address.LowLbaMid);
+    WRITE_PORT_UCHAR(Base + 5, Address.LowLbaHigh);
 }
 
 static
@@ -327,8 +341,15 @@ PopAtaFlushCache(
     if (!NT_SUCCESS(Status))
         return Status;
 
+    /*
+     * FLUSH CACHE and FLUSH CACHE EXT are independent optional features.
+     * Prefer the extended command, but never issue an unsupported command.
+     */
+    if (!Stack->FlushCacheExt && !Stack->FlushCache)
+        return STATUS_NOT_SUPPORTED;
+
     WRITE_PORT_UCHAR(Stack->CommandBase + 7,
-                     Stack->Lba48 ? ATA_CMD_FLUSH_EXT : ATA_CMD_FLUSH);
+                     Stack->FlushCacheExt ? ATA_CMD_FLUSH_EXT : ATA_CMD_FLUSH);
     PopAtaDelay(Stack);
 
     Status = PopAtaPoll(Stack, PO_DUMP_FLUSH_TIMEOUT_US, FALSE, TRUE);
@@ -382,17 +403,18 @@ PopAtaIdentify(
             return STATUS_NOT_SUPPORTED;
     }
 
-    Stack->Lba48 = (Id[83] & 0x0400) && (Id[86] & 0x0400);
-    if (Stack->Lba48)
     {
-        Stack->TotalSectors = (ULONGLONG)Id[100] |
-                              ((ULONGLONG)Id[101] << 16) |
-                              ((ULONGLONG)Id[102] << 32) |
-                              ((ULONGLONG)Id[103] << 48);
-    }
-    else
-    {
-        Stack->TotalSectors = (ULONGLONG)Id[60] | ((ULONGLONG)Id[61] << 16);
+        PO_DUMP_ATA_INFO AtaInfo;
+
+        if (!PopDumpAtaParseIdentify(Id, &AtaInfo))
+            return STATUS_NO_SUCH_DEVICE;
+
+        Stack->Lba48 = AtaInfo.Lba48;
+        Stack->FlushCache = AtaInfo.FlushCache;
+        Stack->FlushCacheExt = AtaInfo.FlushCacheExt;
+        Stack->TotalSectors = AtaInfo.TotalSectors;
+        if (!Stack->FlushCache && !Stack->FlushCacheExt)
+            return STATUS_NOT_SUPPORTED;
     }
 
     return Stack->TotalSectors != 0 ? STATUS_SUCCESS : STATUS_NO_SUCH_DEVICE;
@@ -487,8 +509,17 @@ PopDumpFindExtent(
     _In_ PPO_DUMP_STACK Stack,
     _In_ ULONGLONG FileSector)
 {
-    ULONG Low = 0, High = Stack->ExtentCount, Mid;
+    ULONG Low, High, Mid;
     PPO_DUMP_EXTENT Extent;
+
+    if (Stack == NULL || Stack->Extents == NULL ||
+        Stack->ExtentCount == 0 || Stack->LastExtent >= Stack->ExtentCount)
+    {
+        return NULL;
+    }
+
+    Low = 0;
+    High = Stack->ExtentCount;
 
     /* Writes are mostly sequential */
     Extent = &Stack->Extents[Stack->LastExtent];
@@ -528,9 +559,16 @@ PopDumpFileToDisk(
     _Out_ PULONGLONG DiskSector,
     _Out_ PULONG Contiguous)
 {
-    PPO_DUMP_EXTENT Extent = PopDumpFindExtent(Stack, FileSector);
+    PPO_DUMP_EXTENT Extent;
     ULONGLONG Offset, Left;
 
+    if (Stack == NULL || DiskSector == NULL || Contiguous == NULL ||
+        Stack->Extents == NULL || Stack->ExtentCount == 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    Extent = PopDumpFindExtent(Stack, FileSector);
     if (Extent == NULL || FileSector >= Stack->FileSectors)
         return STATUS_DISK_FULL;
 
@@ -585,9 +623,13 @@ PopDumpStackWrite(
     ULONG InSector, Chunk, Run;
     NTSTATUS Status;
 
-    if (Stack == NULL || Stack->Signature != PO_DUMP_SIGNATURE)
+    if (Stack == NULL || Stack->Signature != PO_DUMP_SIGNATURE ||
+        (Length != 0 && Buffer == NULL))
+    {
         return STATUS_INVALID_PARAMETER;
-    if (Offset + Length < Offset ||
+    }
+    if (Stack->FileSectors > (~0ULL / PO_DUMP_SECTOR_SIZE) ||
+        Offset + Length < Offset ||
         Offset + Length > Stack->FileSectors * PO_DUMP_SECTOR_SIZE)
     {
         return STATUS_DISK_FULL;
@@ -706,6 +748,8 @@ PopDumpIoctl(
     NTSTATUS Status;
 
     KeInitializeEvent(&Event, NotificationEvent, FALSE);
+    IoStatusBlock.Status = STATUS_UNSUCCESSFUL;
+    IoStatusBlock.Information = 0;
     Irp = IoBuildDeviceIoControlRequest(IoControlCode,
                                         DeviceObject,
                                         NULL,
@@ -722,6 +766,10 @@ PopDumpIoctl(
     if (Status == STATUS_PENDING)
     {
         KeWaitForSingleObject(&Event, Executive, KernelMode, FALSE, NULL);
+        Status = IoStatusBlock.Status;
+    }
+    else if (NT_SUCCESS(Status))
+    {
         Status = IoStatusBlock.Status;
     }
 
@@ -758,13 +806,43 @@ PopDumpAddExtent(
     _In_ ULONGLONG DiskSector,
     _In_ ULONGLONG Count)
 {
+    if (Stack == NULL || Stack->Extents == NULL ||
+        Stack->ExtentCapacity == 0 ||
+        Stack->ExtentCount > Stack->ExtentCapacity ||
+        Count == 0 ||
+        FileSector > (~0ULL - Count) ||
+        DiskSector > (~0ULL - Count))
+    {
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
+
+    /*
+     * Retrieval-pointer extents describe one contiguous file stream even
+     * when their disk clusters are fragmented. Reject gaps, overlaps and
+     * wrapped ranges before the dump stack can translate an image offset.
+     */
+    if (Stack->ExtentCount != 0)
+    {
+        PPO_DUMP_EXTENT Previous = &Stack->Extents[Stack->ExtentCount - 1];
+
+        if (Previous->FileSector > (~0ULL - Previous->Count) ||
+            FileSector != Previous->FileSector + Previous->Count)
+        {
+            return STATUS_FILE_CORRUPT_ERROR;
+        }
+    }
+
     if (Stack->ExtentCount == Stack->ExtentCapacity)
     {
         PPO_DUMP_EXTENT NewExtents;
-        ULONG NewCapacity = Stack->ExtentCapacity * 2;
+        ULONG NewCapacity;
 
-        if (NewCapacity > PO_DUMP_MAX_EXTENTS)
+        if (Stack->ExtentCapacity >= PO_DUMP_MAX_EXTENTS)
             return STATUS_BUFFER_OVERFLOW;
+
+        NewCapacity = Stack->ExtentCapacity * 2;
+        if (NewCapacity > PO_DUMP_MAX_EXTENTS)
+            NewCapacity = PO_DUMP_MAX_EXTENTS;
 
         NewExtents = ExAllocatePoolWithTag(NonPagedPool,
                                            NewCapacity * sizeof(*NewExtents),
@@ -801,8 +879,11 @@ PopDumpQueryExtents(
     IO_STATUS_BLOCK IoStatusBlock;
     ULONG BufferSize, i;
     ULONGLONG Vcn = 0, Next, Lcn, Length;
-    ULONGLONG Sectors = 0;
-    NTSTATUS Status;
+    ULONGLONG Sectors = 0, RequiredSectors;
+    NTSTATUS Status, QueryStatus;
+
+    if (SectorsPerCluster == 0)
+        return STATUS_FILE_CORRUPT_ERROR;
 
     BufferSize = FIELD_OFFSET(RETRIEVAL_POINTERS_BUFFER, Extents) +
                  PO_DUMP_RP_EXTENTS * sizeof(Pointers->Extents[0]);
@@ -823,9 +904,22 @@ PopDumpQueryExtents(
                                  sizeof(Input),
                                  Pointers,
                                  BufferSize);
-        if (Status != STATUS_SUCCESS && Status != STATUS_BUFFER_OVERFLOW)
+        QueryStatus = Status;
+        if (QueryStatus != STATUS_SUCCESS &&
+            QueryStatus != STATUS_BUFFER_OVERFLOW)
+        {
             break;
-        if (Pointers->ExtentCount == 0 ||
+        }
+        if (IoStatusBlock.Information <
+                FIELD_OFFSET(RETRIEVAL_POINTERS_BUFFER, Extents) ||
+            IoStatusBlock.Information > BufferSize ||
+            Pointers->ExtentCount == 0 ||
+            Pointers->ExtentCount > PO_DUMP_RP_EXTENTS ||
+            Pointers->ExtentCount >
+                (IoStatusBlock.Information -
+                 FIELD_OFFSET(RETRIEVAL_POINTERS_BUFFER, Extents)) /
+                    sizeof(Pointers->Extents[0]) ||
+            Pointers->StartingVcn.QuadPart < 0 ||
             (ULONGLONG)Pointers->StartingVcn.QuadPart != Vcn)
         {
             Status = STATUS_UNSUCCESSFUL;
@@ -834,15 +928,39 @@ PopDumpQueryExtents(
 
         for (i = 0; i < Pointers->ExtentCount; i++)
         {
+            /*
+             * Retrieval-pointer LCNs are signed: -1 denotes a sparse range.
+             * Reject every negative value, not just -1, before converting it
+             * to an unsigned disk address.  Check all cluster-to-sector and
+             * partition-offset arithmetic before adding an extent; corrupt
+             * filesystem metadata must never wrap into a different disk area.
+             */
+            if (Pointers->Extents[i].Lcn.QuadPart < 0 ||
+                Pointers->Extents[i].NextVcn.QuadPart < 0)
+            {
+                Status = STATUS_NOT_SUPPORTED;      /* sparse or invalid */
+                goto Done;
+            }
+
             Next = (ULONGLONG)Pointers->Extents[i].NextVcn.QuadPart;
             Lcn = (ULONGLONG)Pointers->Extents[i].Lcn.QuadPart;
-            if (Pointers->Extents[i].Lcn.QuadPart == -1 || Next <= Vcn)
+            if (Next <= Vcn ||
+                Next > (~0ULL / SectorsPerCluster) ||
+                (Next - Vcn) > (~0ULL / SectorsPerCluster) ||
+                Lcn > ((~0ULL - PartitionStartSector) / SectorsPerCluster))
             {
-                Status = STATUS_NOT_SUPPORTED;      /* sparse or garbage */
+                Status = STATUS_FILE_CORRUPT_ERROR;
                 goto Done;
             }
 
             Length = (Next - Vcn) * SectorsPerCluster;
+            if (Vcn > (~0ULL / SectorsPerCluster) ||
+                Sectors > (~0ULL - Length))
+            {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto Done;
+            }
+
             Status = PopDumpAddExtent(Stack,
                                       Vcn * SectorsPerCluster,
                                       PartitionStartSector + Lcn * SectorsPerCluster,
@@ -854,7 +972,11 @@ PopDumpQueryExtents(
             Vcn = Next;
         }
 
-        if (Status == STATUS_SUCCESS)
+        /*
+         * PopDumpAddExtent updates Status, so retain the original FSCTL
+         * result separately to continue when the retrieval buffer overflowed.
+         */
+        if (QueryStatus == STATUS_SUCCESS)
             break;
     }
 
@@ -863,11 +985,19 @@ Done:
     if (!NT_SUCCESS(Status))
         return Status;
 
-    /* Every byte up to the end of the file must be on disk */
-    if (Sectors < (EndOfFile + PO_DUMP_SECTOR_SIZE - 1) / PO_DUMP_SECTOR_SIZE)
+    /*
+     * Compute the rounded-up sector count without adding sector_size - 1
+     * to EndOfFile: the latter can overflow for a corrupt or hostile size.
+     */
+    RequiredSectors = EndOfFile / PO_DUMP_SECTOR_SIZE;
+    if ((EndOfFile % PO_DUMP_SECTOR_SIZE) != 0)
+        ++RequiredSectors;
+
+    /* Every byte up to the end of the file must be on disk. */
+    if (Sectors < RequiredSectors)
         return STATUS_NOT_SUPPORTED;
 
-    Stack->FileSectors = (EndOfFile + PO_DUMP_SECTOR_SIZE - 1) / PO_DUMP_SECTOR_SIZE;
+    Stack->FileSectors = RequiredSectors;
     return STATUS_SUCCESS;
 }
 
@@ -1048,7 +1178,9 @@ PopDumpStackInitialize(
     if (!NT_SUCCESS(Status))
         goto Quit;
     if (SizeInfo.BytesPerSector != PO_DUMP_SECTOR_SIZE ||
-        SizeInfo.SectorsPerAllocationUnit == 0)
+        SizeInfo.SectorsPerAllocationUnit == 0 ||
+        SizeInfo.SectorsPerAllocationUnit >
+            MAXULONG / SizeInfo.BytesPerSector)
     {
         Status = STATUS_NOT_SUPPORTED;
         goto Quit;
@@ -1136,6 +1268,17 @@ PopDumpStackInitialize(
         if (Stack->Extents[i].FileSector < LastSector)
             TestSectors[TestCount++] = Stack->Extents[i].FileSector;
     }
+    /*
+     * PopDumpQueryExtents guarantees coverage of the file, but keep this
+     * boundary explicit: never index the test-sector array when no extent
+     * contributed a sector before the final sector.
+     */
+    if (TestCount == 0)
+    {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto Quit;
+    }
+
     if (TestSectors[TestCount - 1] != LastSector - 1)
         TestSectors[TestCount++] = LastSector - 1;
 

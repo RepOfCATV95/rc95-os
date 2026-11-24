@@ -39,6 +39,9 @@
 VOID
 NtfsInitIoRunList(OUT PNTFS_IO_RUN_LIST RunList)
 {
+    if (RunList == NULL)
+        return;
+
     RunList->Runs = RunList->StackRuns;
     RunList->Capacity = NTFS_MAX_IO_RUNS_ON_STACK;
     RunList->Count = 0;
@@ -79,8 +82,29 @@ NtfsAddIoRun(IN OUT PNTFS_IO_RUN_LIST RunList,
     PNTFS_IO_RUN NewRuns;
     ULONG NewCapacity;
 
+    /* Validate the list even for a zero-length append; a NULL or corrupt
+     * descriptor is never a valid initialized run list. */
+    if (RunList == NULL || RunList->Runs == NULL ||
+        RunList->Count > RunList->Capacity)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (ByteCount == 0)
         return STATUS_SUCCESS;
+
+    if (RunList->TotalLength > MAXULONG - ByteCount)
+    {
+        return STATUS_INTEGER_OVERFLOW;
+    }
+
+    /* -1 is reserved for sparse runs; every other physical offset must be
+     * nonnegative and its end must remain representable. */
+    if (Lbo != NTFS_SPARSE_LBO &&
+        (Lbo < 0 || Lbo > MAXLONGLONG - (LONGLONG)ByteCount))
+    {
+        return STATUS_INTEGER_OVERFLOW;
+    }
 
     /* Does this piece simply continue the previous one? */
     if (RunList->Count != 0)
@@ -90,6 +114,8 @@ NtfsAddIoRun(IN OUT PNTFS_IO_RUN_LIST RunList,
         if (LastRun->ByteCount <= MAXULONG - ByteCount &&
             ((Lbo == NTFS_SPARSE_LBO && LastRun->Lbo == NTFS_SPARSE_LBO) ||
              (Lbo != NTFS_SPARSE_LBO && LastRun->Lbo != NTFS_SPARSE_LBO &&
+              LastRun->Lbo >= 0 &&
+              LastRun->Lbo <= MAXLONGLONG - (LONGLONG)LastRun->ByteCount &&
               LastRun->Lbo + LastRun->ByteCount == Lbo)))
         {
             LastRun->ByteCount += ByteCount;
@@ -100,7 +126,17 @@ NtfsAddIoRun(IN OUT PNTFS_IO_RUN_LIST RunList,
 
     if (RunList->Count == RunList->Capacity)
     {
+        if (RunList->Capacity == 0 ||
+            RunList->Capacity > MAXULONG / 2)
+        {
+            return STATUS_INTEGER_OVERFLOW;
+        }
+
         NewCapacity = RunList->Capacity * 2;
+        if (NewCapacity > MAXULONG / sizeof(NTFS_IO_RUN))
+        {
+            return STATUS_INTEGER_OVERFLOW;
+        }
 
         /* Non-paged: a run list stays live across the transfer, and a request
          * on the paging path must not fault while walking it. */
@@ -139,6 +175,9 @@ NtfsAddIoRun(IN OUT PNTFS_IO_RUN_LIST RunList,
 VOID
 NtfsFreeIoRunList(IN OUT PNTFS_IO_RUN_LIST RunList)
 {
+    if (RunList == NULL)
+        return;
+
     if (RunList->Runs != RunList->StackRuns && RunList->Runs != NULL)
     {
         ExFreePoolWithTag(RunList->Runs, TAG_IO_RUNS);
@@ -169,8 +208,23 @@ NtfsIoRunCompletionRoutine(IN PDEVICE_OBJECT DeviceObject,
 
     if (NT_SUCCESS(Irp->IoStatus.Status))
     {
-        InterlockedExchangeAdd(&IoContext->BytesTransferred,
-                               (LONG)Irp->IoStatus.Information);
+        ULONG RequestedLength =
+            IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length;
+
+        /* A short or oversized run cannot be represented as a contiguous
+         * prefix of the caller's buffer. Reject the entire batch. */
+        if (Irp->IoStatus.Information > MAXULONG ||
+            Irp->IoStatus.Information != RequestedLength)
+        {
+            InterlockedCompareExchange(&IoContext->Status,
+                                       STATUS_UNEXPECTED_IO_ERROR,
+                                       STATUS_SUCCESS);
+        }
+        else
+        {
+            InterlockedExchangeAdd64(&IoContext->BytesTransferred,
+                                     (LONG64)Irp->IoStatus.Information);
+        }
     }
     else
     {
@@ -439,7 +493,18 @@ NtfsIssueIoRuns(IN PDEVICE_OBJECT DeviceObject,
     Status = (NTSTATUS)IoContext.Status;
     if (NT_SUCCESS(Status))
     {
-        *BytesTransferred += (ULONG)IoContext.BytesTransferred;
+        /* The device must not claim more bytes than the physical runs asked
+         * it to transfer. Keep the public ULONG count bounded by the request. */
+        if (IoContext.BytesTransferred >
+            (LONG64)(RunList->TotalLength - *BytesTransferred))
+        {
+            *BytesTransferred = RunList->TotalLength;
+            Status = STATUS_DEVICE_DATA_ERROR;
+        }
+        else
+        {
+            *BytesTransferred += (ULONG)IoContext.BytesTransferred;
+        }
     }
 
     return Status;
@@ -500,14 +565,49 @@ NtfsPerformIoRunsInternal(IN PDEVICE_OBJECT DeviceObject,
     ULONG Transferred = 0;
     ULONG Index;
     ULONG Length;
+    ULONG ExpectedOffset = 0;
 
     if (BytesTransferred != NULL)
         *BytesTransferred = 0;
 
-    if (RunList->Count == 0 || RunList->TotalLength == 0)
-        return STATUS_SUCCESS;
+    if (RunList == NULL || DeviceObject == NULL || Buffer == NULL ||
+        RunList->Runs == NULL || RunList->Count > RunList->Capacity ||
+        SectorSize == 0 || (SectorSize & (SectorSize - 1)) != 0 ||
+        (MajorFunction != IRP_MJ_READ && MajorFunction != IRP_MJ_WRITE))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
 
-    ASSERT(SectorSize != 0);
+    if (RunList->Count == 0 || RunList->TotalLength == 0)
+    {
+        return (RunList->Count == 0 && RunList->TotalLength == 0) ?
+               STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
+    }
+
+    /* Check the complete tiling before the alignment code mutates the list.
+     * This also makes the last-run end and all later buffer offsets safe. */
+    for (Index = 0; Index < RunList->Count; Index++)
+    {
+        PNTFS_IO_RUN Run = &RunList->Runs[Index];
+
+        if (Run->ByteCount == 0 || Run->BufferOffset != ExpectedOffset ||
+            ExpectedOffset > MAXULONG - Run->ByteCount)
+        {
+            return STATUS_INVALID_PARAMETER;
+        }
+
+        if (Run->Lbo != NTFS_SPARSE_LBO &&
+            (Run->Lbo < 0 ||
+             Run->Lbo > MAXLONGLONG - (LONGLONG)Run->ByteCount))
+        {
+            return STATUS_INTEGER_OVERFLOW;
+        }
+
+        ExpectedOffset += Run->ByteCount;
+    }
+
+    if (ExpectedOffset != RunList->TotalLength)
+        return STATUS_INVALID_PARAMETER;
 
     Length = RunList->TotalLength;
     FirstRun = &RunList->Runs[0];
@@ -523,6 +623,9 @@ NtfsPerformIoRunsInternal(IN PDEVICE_OBJECT DeviceObject,
     if (LastRun->Lbo != NTFS_SPARSE_LBO)
     {
         EndLbo = LastRun->Lbo + LastRun->ByteCount;
+        if (EndLbo > MAXLONGLONG - ((LONGLONG)SectorSize - 1))
+            return STATUS_INTEGER_OVERFLOW;
+
         BackPad = (ULONG)(ROUND_UP(EndLbo, (LONGLONG)SectorSize) - EndLbo);
     }
 
@@ -540,6 +643,12 @@ NtfsPerformIoRunsInternal(IN PDEVICE_OBJECT DeviceObject,
             *BytesTransferred = min(Transferred, Length);
 
         return Status;
+    }
+
+    if (FrontPad > MAXULONG - Length ||
+        FrontPad + Length > MAXULONG - BackPad)
+    {
+        return STATUS_INTEGER_OVERFLOW;
     }
 
     BounceLength = FrontPad + Length + BackPad;
@@ -648,7 +757,26 @@ NtfsForwardedIrpCompletionRoutine(IN PDEVICE_OBJECT DeviceObject,
     UNREFERENCED_PARAMETER(DeviceObject);
 
     IoContext->Status = Irp->IoStatus.Status;
-    IoContext->BytesTransferred = (LONG)Irp->IoStatus.Information;
+    if (NT_SUCCESS(Irp->IoStatus.Status))
+    {
+        ULONG RequestedLength =
+            IoGetCurrentIrpStackLocation(Irp)->Parameters.Read.Length;
+
+        if (Irp->IoStatus.Information > MAXULONG ||
+            Irp->IoStatus.Information != RequestedLength)
+        {
+            IoContext->Status = STATUS_UNEXPECTED_IO_ERROR;
+            IoContext->BytesTransferred = 0;
+        }
+        else
+        {
+            IoContext->BytesTransferred = (LONG64)Irp->IoStatus.Information;
+        }
+    }
+    else
+    {
+        IoContext->BytesTransferred = 0;
+    }
 
     KeSetEvent(&IoContext->SyncEvent, IO_NO_INCREMENT, FALSE);
 
@@ -673,6 +801,7 @@ NtfsForwardIrpToRun(IN PDEVICE_OBJECT DeviceObject,
     DPRINT("Forwarding IRP %p for a single run at %I64x, %lu bytes\n",
            Irp, Run->Lbo, Run->ByteCount);
 
+    *BytesTransferred = 0;
     RtlZeroMemory(&IoContext, sizeof(IoContext));
     KeInitializeEvent(&IoContext.SyncEvent, NotificationEvent, FALSE);
     IoContext.Status = STATUS_SUCCESS;
@@ -697,9 +826,19 @@ NtfsForwardIrpToRun(IN PDEVICE_OBJECT DeviceObject,
 
     KeWaitForSingleObject(&IoContext.SyncEvent, Executive, KernelMode, FALSE, NULL);
 
-    *BytesTransferred = (ULONG)IoContext.BytesTransferred;
+    if (!NT_SUCCESS((NTSTATUS)IoContext.Status))
+        return (NTSTATUS)IoContext.Status;
 
-    return (NTSTATUS)IoContext.Status;
+    if (IoContext.BytesTransferred > Run->ByteCount)
+        return STATUS_DEVICE_DATA_ERROR;
+
+    /* Keep the forwarded-IRP fast path consistent with the run completion
+     * path: a successful short transfer is not a complete filesystem I/O. */
+    if (IoContext.BytesTransferred != Run->ByteCount)
+        return STATUS_UNEXPECTED_IO_ERROR;
+
+    *BytesTransferred = (ULONG)IoContext.BytesTransferred;
+    return STATUS_SUCCESS;
 }
 
 /**
@@ -751,6 +890,19 @@ NtfsPerformIrpIoRuns(IN PDEVICE_OBJECT DeviceObject,
 {
     PMDL BorrowedMdl = NULL;
 
+    if (BytesTransferred == NULL)
+        return STATUS_INVALID_PARAMETER;
+
+    *BytesTransferred = 0;
+
+    if (DeviceObject == NULL || Buffer == NULL || RunList == NULL ||
+        RunList->Runs == NULL || RunList->Count > RunList->Capacity ||
+        SectorSize == 0 || (SectorSize & (SectorSize - 1)) != 0 ||
+        (MajorFunction != IRP_MJ_READ && MajorFunction != IRP_MJ_WRITE))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     if (Irp != NULL &&
         Irp->MdlAddress != NULL &&
         RunList->TotalLength <= MmGetMdlByteCount(Irp->MdlAddress))
@@ -761,6 +913,13 @@ NtfsPerformIrpIoRuns(IN PDEVICE_OBJECT DeviceObject,
 
         /* One aligned run covering the lot goes straight down to the disk */
         if (RunList->Count == 1 &&
+            RunList->Runs[0].BufferOffset == 0 &&
+            RunList->Runs[0].ByteCount != 0 &&
+            RunList->Runs[0].ByteCount == RunList->TotalLength &&
+            RunList->Runs[0].SavedIrp == NULL &&
+            RunList->Runs[0].Lbo >= 0 &&
+            RunList->Runs[0].Lbo <=
+                MAXLONGLONG - (LONGLONG)RunList->Runs[0].ByteCount &&
             RunList->Runs[0].Lbo != NTFS_SPARSE_LBO &&
             (RunList->Runs[0].Lbo % SectorSize) == 0 &&
             (RunList->Runs[0].ByteCount % SectorSize) == 0)
