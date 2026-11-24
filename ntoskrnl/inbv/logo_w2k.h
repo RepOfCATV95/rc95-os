@@ -1,7 +1,7 @@
 /*
- * PROJECT:     ReactOS Kernel
+ * PROJECT:     RC95-OS Kernel
  * LICENSE:     GPL-2.0-or-later (https://spdx.org/licenses/GPL-2.0-or-later)
- * PURPOSE:     Boot Theme & Animation header
+ * PURPOSE:     Boot Theme & Animation header (ReactOS 0.2.x)
  * COPYRIGHT:   Copyright 2020 Dmitry Borisov (di.sean@protonmail.com)
  *              Copyright 1997-2028 Republic of CATV 95 (catv95republic@proton.me)
  */

@@ -1,9 +1,10 @@
 /*
- * PROJECT:     ReactOS Kernel
+ * PROJECT:     RC95-OS Kernel
  * LICENSE:     BSD - See COPYING.ARM in the top level directory
  * PURPOSE:     Serial Port Boot Driver for Headless Terminal Support
  * COPYRIGHT:   Copyright 2010 ReactOS Portable Systems Group
  *              Copyright 2022-2026 Hermès Bélusca-Maïto <hermes.belusca-maito@reactos.org>
+ *              Copyright 1997-2028 Republic of CATV 95 <catv95republic@proton.me>
  */
 
 /* INCLUDES ******************************************************************/

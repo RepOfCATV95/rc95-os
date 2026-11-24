@@ -1,10 +1,11 @@
 /*
- * PROJECT:     ReactOS Kernel
+ * PROJECT:     RC95-OS Kernel
  * LICENSE:     BSD - See COPYING.ARM in the top level directory
  * PURPOSE:     Boot Video Driver support
  * COPYRIGHT:   Copyright 2007 Alex Ionescu (alex.ionescu@reactos.org)
  *              Copyright 2010 Aleksey Bragin (aleksey@reactos.org)
  *              Copyright 2015-2022 Hermès Bélusca-Maïto
+ *              Copyright 1997-2028 Republic of CATV 95 (catv95republic@proton.me)
  */
 
 /* INCLUDES ******************************************************************/
