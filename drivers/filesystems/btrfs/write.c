@@ -4631,6 +4631,12 @@ NTSTATUS write_file(device_extension* Vcb, PIRP Irp, bool wait, bool deferred_wr
     if (Status == STATUS_PENDING)
         goto exit;
     else if (!NT_SUCCESS(Status)) {
+        if (Status == STATUS_FILE_CORRUPT_ERROR || Status == STATUS_DISK_CORRUPT_ERROR) {
+            // Preserve the volume's dirty state when a write detects on-disk corruption.
+            Vcb->need_write = true;
+            ERR("write rejected because the Btrfs volume is corrupt; marking volume dirty (%08lx)\n", Status);
+        }
+
         ERR("write_file2 returned %08lx\n", Status);
         goto exit;
     }

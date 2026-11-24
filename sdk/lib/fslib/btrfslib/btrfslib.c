@@ -286,6 +286,15 @@ typedef struct {
     superblock Sb;
 } BTRFS_SB_COPY;
 
+/*
+ * Btrfs uses superblock flag bit 0 to record that the filesystem has
+ * encountered an error. This is the on-disk error/dirty marker; it is not
+ * the same as a generic transaction-dirty bit.
+ */
+#ifndef BTRFS_SUPER_FLAG_ERROR
+#define BTRFS_SUPER_FLAG_ERROR (1ULL << 0)
+#endif
+
 typedef struct {
     BTRFS_SB_COPY Copy[BTRFS_CHK_SB_COPIES];
     superblock Tmp;         /* scratch: image to be written */
@@ -809,6 +818,110 @@ Done:
     if (Verify) free(Verify);
 }
 
+/*
+ * Persist the Btrfs superblock error flag after a check discovers corruption.
+ * Update every valid copy belonging to this filesystem so that selecting an
+ * older mirror on the next mount does not silently lose the error indication.
+ */
+static VOID
+BtrfsMarkSuperblocksDirty(HANDLE Handle, BTRFS_CHK_CTX *Ctx, const BTRFS_UUID *FsUuid,
+                          PFMIFSCALLBACK Callback, ULONG *Marked, ULONG *Failed)
+{
+    ULONG i;
+
+    *Marked = 0;
+    *Failed = 0;
+
+    for (i = 0; i < BTRFS_CHK_SB_COPIES; ++i)
+    {
+        BTRFS_SB_COPY *C = &Ctx->Copy[i];
+
+        if (!C->Valid ||
+            RtlCompareMemory(&C->Sb.uuid, FsUuid, sizeof(BTRFS_UUID)) != sizeof(BTRFS_UUID))
+            continue;
+
+        C->Sb.flags |= BTRFS_SUPER_FLAG_ERROR;
+        BtrfsSetSuperblockChecksum(&C->Sb);
+
+        if (NT_SUCCESS(BtrfsWriteAt(Handle, C->Offset, &C->Sb, sizeof(superblock))) &&
+            NT_SUCCESS(BtrfsFlush(Handle)) &&
+            NT_SUCCESS(BtrfsReadAt(Handle, C->Offset, &Ctx->Verify, sizeof(superblock))) &&
+            RtlCompareMemory(&Ctx->Verify, &C->Sb, sizeof(superblock)) == sizeof(superblock))
+        {
+            ++(*Marked);
+        }
+        else
+        {
+            ++(*Failed);
+            BtrfsOut(Callback, "Could not persist the Btrfs error flag to superblock copy at %x.",
+                     C->Offset);
+        }
+    }
+
+    if (*Marked != 0)
+        BtrfsOut(Callback, "Marked %u Btrfs superblock cop%s with the filesystem error flag.",
+                 (ULONGLONG)*Marked, *Marked == 1 ? "y" : "ies");
+}
+
+/*
+ * Clear the Btrfs error flag only after all detected repairs have succeeded.
+ * Re-read each on-disk copy so copies repaired earlier in BtrfsChkdsk are
+ * included, while stale or foreign-filesystem mirrors are left untouched.
+ */
+static VOID
+BtrfsClearSuperblocksDirty(HANDLE Handle, BTRFS_CHK_CTX *Ctx, const BTRFS_UUID *FsUuid,
+                           PFMIFSCALLBACK Callback, ULONG *Cleared, ULONG *Failed)
+{
+    ULONG i;
+
+    *Cleared = 0;
+    *Failed = 0;
+
+    for (i = 0; i < BTRFS_CHK_SB_COPIES; ++i)
+    {
+        BTRFS_SB_COPY *C = &Ctx->Copy[i];
+
+        if (!C->Present)
+            continue;
+
+        if (!NT_SUCCESS(BtrfsReadAt(Handle, C->Offset, &Ctx->Tmp, sizeof(superblock))))
+        {
+            ++(*Failed);
+            BtrfsOut(Callback, "Could not read superblock copy at %x while clearing the filesystem error flag.",
+                     C->Offset);
+            continue;
+        }
+
+        if (BtrfsSuperblockProblem(&Ctx->Tmp, C->Offset) != NULL ||
+            RtlCompareMemory(&Ctx->Tmp.uuid, FsUuid, sizeof(BTRFS_UUID)) != sizeof(BTRFS_UUID))
+            continue;
+
+        if ((Ctx->Tmp.flags & BTRFS_SUPER_FLAG_ERROR) == 0)
+            continue;
+
+        Ctx->Tmp.flags &= ~BTRFS_SUPER_FLAG_ERROR;
+        BtrfsSetSuperblockChecksum(&Ctx->Tmp);
+
+        if (NT_SUCCESS(BtrfsWriteAt(Handle, C->Offset, &Ctx->Tmp, sizeof(superblock))) &&
+            NT_SUCCESS(BtrfsFlush(Handle)) &&
+            NT_SUCCESS(BtrfsReadAt(Handle, C->Offset, &Ctx->Verify, sizeof(superblock))) &&
+            RtlCompareMemory(&Ctx->Verify, &Ctx->Tmp, sizeof(superblock)) == sizeof(superblock))
+        {
+            ++(*Cleared);
+        }
+        else
+        {
+            ++(*Failed);
+            BtrfsOut(Callback, "Could not clear the Btrfs error flag on superblock copy at %x.",
+                     C->Offset);
+        }
+    }
+
+    if (*Cleared != 0)
+        BtrfsOut(Callback, "Cleared and verified the filesystem error flag on %u superblock cop%s.",
+                 (ULONGLONG)*Cleared, *Cleared == 1 ? "y" : "ies");
+}
+
 /* ---- entry point ------------------------------------------------------ */
 
 BOOLEAN
@@ -834,7 +947,8 @@ BtrfsChkdsk(
     const BTRFS_SB_COPY *Best = NULL;
     NTSTATUS Status = STATUS_UNSUCCESSFUL;
     BOOLEAN Success = FALSE, Locked = FALSE, CanRepair = FALSE;
-    ULONG i, j, ValidCount = 0, Errors = 0, Fixed = 0;
+    ULONG i, j, ValidCount = 0, Errors = 0, Fixed = 0, DirtyMarked = 0, DirtyMarkFailed = 0;
+    ULONG DirtyCleared = 0, DirtyClearFailed = 0;
     ULONGLONG DevLen;
     BTRFS_UUID RefUuid;
     ULONG RefVotes = 0;
@@ -1042,6 +1156,20 @@ BtrfsChkdsk(
     /* ---- phase 4: chunk tree root ---- */
     BtrfsCheckChunkRoot(VolumeHandle, &Best->Sb, DevLen, CanRepair, Callback, Verbose, &Errors, &Fixed);
 
+    /*
+     * If the check found corruption, persist Btrfs' on-disk error marker.
+     * This requires FixErrors and an exclusive volume lock; never attempt
+     * metadata writes during a read-only check or while the volume is busy.
+     */
+    if (Errors != 0)
+    {
+        if (CanRepair)
+            BtrfsMarkSuperblocksDirty(VolumeHandle, Ctx, &RefUuid, Callback,
+                                      &DirtyMarked, &DirtyMarkFailed);
+        else
+            BtrfsOut(Callback, "Corruption was found, but the volume could not be locked for writing; the error flag was not changed.");
+    }
+
     /* ---- phase 5: repair superblock copies ---- */
     for (i = 0; i < BTRFS_CHK_SB_COPIES; ++i)
     {
@@ -1075,6 +1203,15 @@ BtrfsChkdsk(
         }
     }
 
+    /*
+     * Clear the on-disk error flag only after every detected problem has been
+     * repaired and all earlier dirty-flag writes succeeded. This is a repair
+     * completion operation, not part of a read-only check.
+     */
+    if (FixErrors && CanRepair && Fixed >= Errors && DirtyMarkFailed == 0)
+        BtrfsClearSuperblocksDirty(VolumeHandle, Ctx, &RefUuid, Callback,
+                                   &DirtyCleared, &DirtyClearFailed);
+
     /* ---- summary ---- */
     if (Errors == 0)
     {
@@ -1091,10 +1228,22 @@ BtrfsChkdsk(
                  (ULONGLONG)Errors, Errors == 1 ? "" : "s", (ULONGLONG)Fixed,
                  FixErrors ? "" : " Run the check again with repair enabled to fix them.");
     }
+    if (DirtyMarked != 0 && DirtyMarkFailed == 0)
+        BtrfsOut(Callback, "The filesystem error flag was written and verified before repair.");
+    else if (DirtyMarked != 0 || DirtyMarkFailed != 0)
+        BtrfsOut(Callback, "The filesystem error flag was only partially persisted before repair (%u copies updated, %u failed).",
+                 (ULONGLONG)DirtyMarked, (ULONGLONG)DirtyMarkFailed);
+
+    if (DirtyCleared != 0 && DirtyClearFailed == 0)
+        BtrfsOut(Callback, "The filesystem error flag was cleared after successful repair.");
+    else if (DirtyClearFailed != 0)
+        BtrfsOut(Callback, "The filesystem error flag could not be cleared on %u superblock cop%s.",
+                 (ULONGLONG)DirtyClearFailed, DirtyClearFailed == 1 ? "y" : "ies");
+
     BtrfsOut(Callback, "Note: only superblocks and the chunk tree root are verified; other trees, extents, "
                        "data checksums and free space are not.");
 
-    Success = (Fixed >= Errors);
+    Success = (Fixed >= Errors) && (DirtyMarkFailed == 0) && (DirtyClearFailed == 0);
     Status = Success ? STATUS_SUCCESS : STATUS_DISK_CORRUPT_ERROR;
 
 Done:
