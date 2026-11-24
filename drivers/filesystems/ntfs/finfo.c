@@ -222,6 +222,115 @@ NtfsGetNameInformation(PFILE_OBJECT FileObject,
 }
 
 
+/*
+ * Retrieve the DOS 8.3 alias from the resident $FILE_NAME attributes.
+ * NTFS stores the short-name entry separately from the Win32 long name.
+ */
+static
+NTSTATUS
+NtfsGetAlternateNameInformation(PNTFS_FCB Fcb,
+                                PDEVICE_EXTENSION DeviceExt,
+                                PFILE_NAME_INFORMATION NameInfo,
+                                PULONG BufferLength)
+{
+    PFILE_RECORD_HEADER FileRecord;
+    PNTFS_ATTR_RECORD Attribute;
+    FIND_ATTR_CONTXT Context;
+    PFILENAME_ATTRIBUTE FileName;
+    ULONG HeaderLength;
+    ULONG NameBytes;
+    NTSTATUS Status;
+
+    HeaderLength = FIELD_OFFSET(FILE_NAME_INFORMATION, FileName);
+    if (*BufferLength < HeaderLength)
+        return STATUS_BUFFER_TOO_SMALL;
+
+    NameInfo->FileNameLength = 0;
+    NameBytes = 0;
+    FileRecord = ExAllocateFromNPagedLookasideList(&DeviceExt->FileRecLookasideList);
+    if (FileRecord == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    Status = ReadFileRecord(DeviceExt, Fcb->MFTIndex, FileRecord);
+    if (!NT_SUCCESS(Status))
+    {
+        ExFreeToNPagedLookasideList(&DeviceExt->FileRecLookasideList, FileRecord);
+        return Status;
+    }
+
+    Status = FindFirstAttribute(&Context, DeviceExt, FileRecord, TRUE, &Attribute);
+    while (NT_SUCCESS(Status))
+    {
+        if (Attribute->Type == AttributeFileName && !Attribute->IsNonResident)
+        {
+            /*
+             * A resident value must start after the complete resident
+             * attribute header, not merely somewhere inside the attribute.
+             * Validate the header before using ValueOffset/ValueLength.
+             */
+            if (Attribute->Length <
+                    FIELD_OFFSET(NTFS_ATTR_RECORD, Resident) +
+                    sizeof(Attribute->Resident) ||
+                Attribute->Resident.ValueOffset <
+                    FIELD_OFFSET(NTFS_ATTR_RECORD, Resident) +
+                    sizeof(Attribute->Resident) ||
+                Attribute->Resident.ValueOffset > Attribute->Length ||
+                Attribute->Resident.ValueLength >
+                    Attribute->Length - Attribute->Resident.ValueOffset ||
+                Attribute->Resident.ValueLength <
+                    FIELD_OFFSET(FILENAME_ATTRIBUTE, Name))
+            {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                break;
+            }
+
+            FileName = (PFILENAME_ATTRIBUTE)
+                ((PCHAR)Attribute + Attribute->Resident.ValueOffset);
+            if (FileName->NameType == NTFS_FILE_NAME_DOS)
+            {
+                NameBytes = (ULONG)FileName->NameLength * sizeof(WCHAR);
+                if (FIELD_OFFSET(FILENAME_ATTRIBUTE, Name) + NameBytes >
+                    Attribute->Resident.ValueLength)
+                {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    break;
+                }
+
+                NameInfo->FileNameLength = NameBytes;
+                if (NameBytes > *BufferLength - HeaderLength)
+                {
+                    NameBytes = *BufferLength - HeaderLength;
+                    NameBytes &= ~(sizeof(WCHAR) - 1);
+                    RtlCopyMemory(NameInfo->FileName, FileName->Name, NameBytes);
+                    NameInfo->FileNameLength =
+                        (ULONG)FileName->NameLength * sizeof(WCHAR);
+                    Status = STATUS_BUFFER_OVERFLOW;
+                }
+                else
+                {
+                    RtlCopyMemory(NameInfo->FileName, FileName->Name, NameBytes);
+                    Status = STATUS_SUCCESS;
+                }
+                break;
+            }
+        }
+
+        Status = FindNextAttribute(&Context, &Attribute);
+    }
+
+    FindCloseAttribute(&Context);
+    ExFreeToNPagedLookasideList(&DeviceExt->FileRecLookasideList, FileRecord);
+
+    if (Status == STATUS_END_OF_FILE)
+        Status = STATUS_SUCCESS;
+
+    if (NT_SUCCESS(Status) || Status == STATUS_BUFFER_OVERFLOW)
+        *BufferLength -= HeaderLength + NameBytes;
+
+    return Status;
+}
+
+
 static
 NTSTATUS
 NtfsGetInternalInformation(PNTFS_FCB Fcb,
@@ -464,6 +573,79 @@ GetInfoClassName(FILE_INFORMATION_CLASS infoClass)
 }
 
 /*
+ * Build FILE_ALL_INFORMATION from the information classes implemented by
+ * this driver.  Keep the variable-length name at the end of the caller's
+ * buffer and account for it separately from the fixed portion.
+ */
+static
+NTSTATUS
+NtfsGetAllInformation(PFILE_OBJECT FileObject,
+                      PNTFS_FCB Fcb,
+                      PDEVICE_OBJECT DeviceObject,
+                      PFILE_ALL_INFORMATION AllInfo,
+                      PULONG BufferLength)
+{
+    ULONG OriginalLength = *BufferLength;
+    ULONG ComponentLength = OriginalLength;
+    ULONG NameOffset = FIELD_OFFSET(FILE_ALL_INFORMATION, NameInformation);
+    ULONG NameLength = OriginalLength - NameOffset;
+    NTSTATUS Status;
+
+    if (OriginalLength < FIELD_OFFSET(FILE_ALL_INFORMATION, NameInformation.FileName))
+        return STATUS_BUFFER_TOO_SMALL;
+
+    RtlZeroMemory(AllInfo,
+                  FIELD_OFFSET(FILE_ALL_INFORMATION, NameInformation.FileName));
+
+    Status = NtfsGetBasicInformation(FileObject, Fcb, DeviceObject,
+                                     &AllInfo->BasicInformation,
+                                     &ComponentLength);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    ComponentLength = OriginalLength;
+    Status = NtfsGetStandardInformation(Fcb, DeviceObject,
+                                        &AllInfo->StandardInformation,
+                                        &ComponentLength);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    Status = NtfsGetInternalInformation(Fcb,
+                                        &AllInfo->InternalInformation,
+                                        &ComponentLength);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    Status = NtfsGetEaInformation(Fcb,
+                                  &AllInfo->EaInformation,
+                                  &ComponentLength);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    Status = NtfsGetPositionInformation(FileObject,
+                                        &AllInfo->PositionInformation,
+                                        &ComponentLength);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    Status = NtfsGetNameInformation(FileObject, Fcb, DeviceObject,
+                                    &AllInfo->NameInformation,
+                                    &NameLength);
+    if (Status != STATUS_SUCCESS && Status != STATUS_BUFFER_OVERFLOW)
+        return Status;
+
+    /*
+     * AccessInformation and ModeInformation are not tracked by this
+     * filesystem yet.  Leave their zeroed values intact instead of
+     * fabricating access or mode state.
+     */
+    /* NameLength is the remaining capacity after the name was copied. */
+    *BufferLength = NameLength;
+
+    return Status;
+}
+
+/*
  * FUNCTION: Retrieve the specified file information
  */
 NTSTATUS
@@ -560,10 +742,19 @@ NtfsQueryInformation(PNTFS_IRP_CONTEXT IrpContext)
                                                     &BufferLength);
             break;
 
-        case FileAlternateNameInformation:
         case FileAllInformation:
-            DPRINT1("Unimplemented information class: %s\n", GetInfoClassName(FileInformationClass));
-            Status = STATUS_NOT_IMPLEMENTED;
+            Status = NtfsGetAllInformation(FileObject,
+                                            Fcb,
+                                            DeviceObject,
+                                            SystemBuffer,
+                                            &BufferLength);
+            break;
+
+        case FileAlternateNameInformation:
+            Status = NtfsGetAlternateNameInformation(Fcb,
+                                                     DeviceObject->DeviceExtension,
+                                                     SystemBuffer,
+                                                     &BufferLength);
             break;
 
         default:
@@ -573,7 +764,12 @@ NtfsQueryInformation(PNTFS_IRP_CONTEXT IrpContext)
 
     ExReleaseResourceLite(&Fcb->MainResource);
 
-    if (NT_SUCCESS(Status))
+    /*
+     * STATUS_BUFFER_OVERFLOW is a warning status, but the caller still
+     * receives a valid, truncated information buffer.  Report those bytes
+     * just as the I/O manager expects instead of discarding the byte count.
+     */
+    if (NT_SUCCESS(Status) || Status == STATUS_BUFFER_OVERFLOW)
         Irp->IoStatus.Information =
             Stack->Parameters.QueryFile.Length - BufferLength;
     else
@@ -954,12 +1150,6 @@ NtfsSetDispositionInformation(PDEVICE_EXTENSION DeviceExt,
         return STATUS_SUCCESS;
     }
 
-    if (!NtfsGlobalData->EnableWriteSupport)
-    {
-        DPRINT1("NTFS write-support is EXPERIMENTAL and is disabled by default!\n");
-        return STATUS_ACCESS_DENIED;
-    }
-
     /* The volume root has no parent index to be removed from */
     if (NtfsFCBIsRoot(Fcb))
         return STATUS_CANNOT_DELETE;
@@ -1213,6 +1403,48 @@ NtfsCheckRenamePaths(
     return Status;
 }
 
+/*
+ * Validate a resident $FILE_NAME attribute before following its value.
+ * The attribute is contained in a fixed-size MFT record, so every offset and
+ * length must be checked against both the attribute and the record.
+ */
+static
+NTSTATUS
+NtfsGetResidentFileName(
+    _In_ PNTFS_ATTR_RECORD Attribute,
+    _In_ ULONG RemainingRecordBytes,
+    _Out_ PFILENAME_ATTRIBUTE *FileName)
+{
+    ULONG HeaderLength = FIELD_OFFSET(NTFS_ATTR_RECORD, Resident) +
+                         sizeof(Attribute->Resident);
+    ULONG NameBytes;
+
+    *FileName = NULL;
+    if (Attribute->Length < HeaderLength ||
+        Attribute->Length > RemainingRecordBytes ||
+        Attribute->Resident.ValueOffset < HeaderLength ||
+        Attribute->Resident.ValueOffset > Attribute->Length ||
+        Attribute->Resident.ValueLength >
+            Attribute->Length - Attribute->Resident.ValueOffset ||
+        Attribute->Resident.ValueLength <
+            FIELD_OFFSET(FILENAME_ATTRIBUTE, Name))
+    {
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
+
+    *FileName = (PFILENAME_ATTRIBUTE)((ULONG_PTR)Attribute +
+                                      Attribute->Resident.ValueOffset);
+    NameBytes = (ULONG)(*FileName)->NameLength * sizeof(WCHAR);
+    if (NameBytes > Attribute->Resident.ValueLength -
+                    FIELD_OFFSET(FILENAME_ATTRIBUTE, Name))
+    {
+        *FileName = NULL;
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
+
+    return STATUS_SUCCESS;
+}
+
 /**
 * @name NtfsRelinkFileNames
 *
@@ -1220,7 +1452,7 @@ NtfsCheckRenamePaths(
 * to undo a rename that failed after those names were taken out.
 */
 static
-VOID
+NTSTATUS
 NtfsRelinkFileNames(
     _In_ PDEVICE_EXTENSION DeviceExt,
     _In_ PFILE_RECORD_HEADER FileRecord,
@@ -1230,25 +1462,41 @@ NtfsRelinkFileNames(
 {
     PNTFS_ATTR_RECORD Attribute;
     ULONG Offset = FileRecord->AttributeOffset;
+    NTSTATUS Status;
 
     while (Count != 0 && Offset + sizeof(ULONG) <= DeviceExt->NtfsInfo.BytesPerFileRecord)
     {
         Attribute = (PNTFS_ATTR_RECORD)((ULONG_PTR)FileRecord + Offset);
-        if (Attribute->Type == AttributeEnd || Attribute->Length == 0)
+        if (Attribute->Type == AttributeEnd)
             break;
+
+        if (Attribute->Length < sizeof(ULONG) ||
+            Attribute->Length > DeviceExt->NtfsInfo.BytesPerFileRecord - Offset)
+            return STATUS_FILE_CORRUPT_ERROR;
 
         if (Attribute->Type == AttributeFileName && !Attribute->IsNonResident)
         {
-            PFILENAME_ATTRIBUTE Name = (PFILENAME_ATTRIBUTE)((ULONG_PTR)Attribute + Attribute->Resident.ValueOffset);
+            PFILENAME_ATTRIBUTE Name;
 
-            if (!NT_SUCCESS(NtfsAddFilenameToDirectory(DeviceExt,
-                                                       Name->DirectoryFileReferenceNumber & NTFS_MFT_MASK,
-                                                       FileReference,
-                                                       Name,
-                                                       CaseSensitive)))
+            Status = NtfsGetResidentFileName(
+                Attribute,
+                DeviceExt->NtfsInfo.BytesPerFileRecord - Offset,
+                &Name);
+            if (!NT_SUCCESS(Status))
+                return Status;
+
+            Status = NtfsAddFilenameToDirectory(DeviceExt,
+                                                 Name->DirectoryFileReferenceNumber & NTFS_MFT_MASK,
+                                                 FileReference,
+                                                 Name,
+                                                 CaseSensitive);
+            if (!NT_SUCCESS(Status))
             {
-                DPRINT1("Couldn't restore '%.*S' in directory %I64u\n",
-                        Name->NameLength, Name->Name, Name->DirectoryFileReferenceNumber & NTFS_MFT_MASK);
+                DPRINT1("Couldn't restore '%.*S' in directory %I64u (0x%lx)\\n",
+                        Name->NameLength, Name->Name,
+                        Name->DirectoryFileReferenceNumber & NTFS_MFT_MASK,
+                        Status);
+                return Status;
             }
 
             Count--;
@@ -1256,8 +1504,9 @@ NtfsRelinkFileNames(
 
         Offset += Attribute->Length;
     }
-}
 
+    return (Count == 0) ? STATUS_SUCCESS : STATUS_FILE_CORRUPT_ERROR;
+}
 /**
 * @name NtfsBuildRenamePath
 *
@@ -1367,8 +1616,16 @@ NtfsFindLongFileName(
 
         if (Attribute->Type == AttributeFileName && !Attribute->IsNonResident)
         {
-            PFILENAME_ATTRIBUTE Name = (PFILENAME_ATTRIBUTE)((ULONG_PTR)Attribute + Attribute->Resident.ValueOffset);
-            ULONGLONG Parent = Name->DirectoryFileReferenceNumber & NTFS_MFT_MASK;
+            PFILENAME_ATTRIBUTE Name;
+            ULONGLONG Parent;
+
+            if (!NT_SUCCESS(NtfsGetResidentFileName(
+                    Attribute,
+                    DeviceExt->NtfsInfo.BytesPerFileRecord - Offset,
+                    &Name)))
+                return STATUS_FILE_CORRUPT_ERROR;
+
+            Parent = Name->DirectoryFileReferenceNumber & NTFS_MFT_MASK;
 
             if (SeenName && Parent != *ParentMft)
                 return STATUS_NOT_IMPLEMENTED;
@@ -1536,9 +1793,18 @@ NtfsUnlinkFileNames(
 
         if (Attribute->Type == AttributeFileName && !Attribute->IsNonResident)
         {
+            PFILENAME_ATTRIBUTE Name;
+
+            Status = NtfsGetResidentFileName(
+                Attribute,
+                DeviceExt->NtfsInfo.BytesPerFileRecord - Offset,
+                &Name);
+            if (!NT_SUCCESS(Status))
+                return Status;
+
             Status = NtfsRemoveFilenameFromDirectory(DeviceExt,
                                                      ParentMft,
-                                                     (PFILENAME_ATTRIBUTE)((ULONG_PTR)Attribute + Attribute->Resident.ValueOffset),
+                                                     Name,
                                                      CaseSensitive);
             if (!NT_SUCCESS(Status))
                 break;
@@ -1600,11 +1866,21 @@ NtfsCommitRename(
 
     if (!NT_SUCCESS(Status))
     {
-        /* Put the old record back, then the names that were taken out */
-        if (RecordChanged)
-            UpdateFileRecord(DeviceExt, Fcb->MFTIndex, Original);
+        NTSTATUS RollbackStatus = STATUS_SUCCESS;
 
-        NtfsRelinkFileNames(DeviceExt, Original, FileReference, Removed, CaseSensitive);
+        /* Restore the MFT record before rebuilding its old index entries. */
+        if (RecordChanged)
+            RollbackStatus = UpdateFileRecord(DeviceExt, Fcb->MFTIndex, Original);
+
+        if (NT_SUCCESS(RollbackStatus))
+            RollbackStatus = NtfsRelinkFileNames(DeviceExt, Original, FileReference, Removed, CaseSensitive);
+
+        if (!NT_SUCCESS(RollbackStatus))
+        {
+            DPRINT1("Rename rollback failed for MFT record %I64u (0x%lx)\\n",
+                    Fcb->MFTIndex, RollbackStatus);
+            return STATUS_FILE_CORRUPT_ERROR;
+        }
     }
 
     return Status;
@@ -1667,9 +1943,6 @@ NtfsSetRenameInformation(
     PFILENAME_ATTRIBUTE NewValue = NULL;
     ULONG NewValueLength;
     NTSTATUS Status;
-
-    if (!NtfsGlobalData->EnableWriteSupport)
-        return STATUS_ACCESS_DENIED;
 
     if ((Fcb->Flags & (FCB_IS_VOLUME | FCB_IS_VOLUME_STREAM)) || NtfsFCBIsRoot(Fcb))
         return STATUS_INVALID_PARAMETER;

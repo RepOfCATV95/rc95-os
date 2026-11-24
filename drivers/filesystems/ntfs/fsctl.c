@@ -519,7 +519,8 @@ NtfsMountVolume(PDEVICE_OBJECT DeviceObject,
     Vcb->StreamFileObject->Vpb = Vcb->Vpb;
     Ccb->PtrFileObject = Vcb->StreamFileObject;
     Fcb->FileObject = Vcb->StreamFileObject;
-    Fcb->Vcb = (PDEVICE_EXTENSION)Vcb->StorageDevice;
+    /* FCB operations resolve through the mounted VCB, not the lower disk device. */
+    Fcb->Vcb = Vcb;
 
     Fcb->Flags = FCB_IS_VOLUME_STREAM;
 
@@ -692,6 +693,7 @@ GetNtfsFileRecord(PDEVICE_EXTENSION DeviceExt,
     PFILE_RECORD_HEADER FileRecord;
     PNTFS_FILE_RECORD_OUTPUT_BUFFER OutputBuffer;
     ULONGLONG MFTRecord;
+    ULONGLONG MftRecordCount;
 
     Stack = IoGetCurrentIrpStackLocation(Irp);
 
@@ -717,24 +719,59 @@ GetNtfsFileRecord(PDEVICE_EXTENSION DeviceExt,
 
     InputBuffer = (PNTFS_FILE_RECORD_INPUT_BUFFER)Irp->AssociatedIrp.SystemBuffer;
 
-    MFTRecord = InputBuffer->FileReferenceNumber.QuadPart;
-    DPRINT1("Requesting: %I64x\n", MFTRecord);
+    /*
+     * A file reference stores the MFT index in its low 48 bits and the
+     * sequence number in its high 16 bits. Bound the backwards search by
+     * the actual $MFT stream to prevent sequence bits, invalid indices, or
+     * a deleted record at index zero from causing an unbounded lookup.
+     */
+    if (DeviceExt->NtfsInfo.BytesPerFileRecord == 0 ||
+        DeviceExt->MFTContext == NULL ||
+        DeviceExt->MFTContext->pRecord == NULL)
+    {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto CleanupFileRecord;
+    }
 
-    do
+    MftRecordCount = AttributeDataLength(DeviceExt->MFTContext->pRecord) /
+                     DeviceExt->NtfsInfo.BytesPerFileRecord;
+    if (MftRecordCount == 0)
+    {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto CleanupFileRecord;
+    }
+
+    MFTRecord = InputBuffer->FileReferenceNumber.QuadPart & NTFS_MFT_MASK;
+    if (MFTRecord >= MftRecordCount)
+    {
+        Status = STATUS_INVALID_PARAMETER;
+        goto CleanupFileRecord;
+    }
+
+    DPRINT1("Requesting: %I64x\\n", MFTRecord);
+
+    for (;;)
     {
         Status = ReadFileRecord(DeviceExt, MFTRecord, FileRecord);
-        if (NT_SUCCESS(Status))
+        if (!NT_SUCCESS(Status))
         {
-            if (FileRecord->Flags & FRH_IN_USE)
-            {
-                break;
-            }
+            /* I/O and metadata failures must not be mistaken for free slots. */
+            goto CleanupFileRecord;
+        }
+
+        if (FileRecord->Flags & FRH_IN_USE)
+            break;
+
+        if (MFTRecord == 0)
+        {
+            Status = STATUS_FILE_INVALID;
+            goto CleanupFileRecord;
         }
 
         --MFTRecord;
-    } while (TRUE);
+    }
 
-    DPRINT1("Returning: %I64x\n", MFTRecord);
+    DPRINT1("Returning: %I64x\\n", MFTRecord);
     OutputBuffer = (PNTFS_FILE_RECORD_OUTPUT_BUFFER)Irp->AssociatedIrp.SystemBuffer;
     OutputBuffer->FileReferenceNumber.QuadPart = MFTRecord;
     OutputBuffer->FileRecordLength = DeviceExt->NtfsInfo.BytesPerFileRecord;
@@ -744,6 +781,73 @@ GetNtfsFileRecord(PDEVICE_EXTENSION DeviceExt,
 
     Irp->IoStatus.Information = FIELD_OFFSET(NTFS_FILE_RECORD_OUTPUT_BUFFER, FileRecordBuffer) + DeviceExt->NtfsInfo.BytesPerFileRecord;
 
+    return STATUS_SUCCESS;
+
+CleanupFileRecord:
+    ExFreeToNPagedLookasideList(&DeviceExt->FileRecLookasideList, FileRecord);
+    return Status;
+}
+
+
+NTSTATUS
+NtfsCalculateVolumeBitmapRange(
+    _In_ LONGLONG RequestedStart,
+    _In_ ULONGLONG ClusterCount,
+    _In_ ULONG OutputLength,
+    _Out_ PULONGLONG AlignedStart,
+    _Out_ PULONG ByteCount,
+    _Out_ PULONGLONG BitCount,
+    _Out_ PBOOLEAN Overflow)
+{
+    ULONGLONG Start;
+    ULONGLONG Remaining;
+    ULONGLONG RequiredBytes;
+    ULONGLONG Capacity;
+    ULONG Bytes;
+
+    if (AlignedStart == NULL || ByteCount == NULL ||
+        BitCount == NULL || Overflow == NULL)
+        return STATUS_INVALID_PARAMETER;
+
+    if (RequestedStart < 0 ||
+        (ULONGLONG)RequestedStart > ClusterCount ||
+        OutputLength < FIELD_OFFSET(VOLUME_BITMAP_BUFFER, Buffer))
+        return STATUS_INVALID_PARAMETER;
+
+    Start = (ULONGLONG)RequestedStart & ~7ULL;
+    Remaining = ClusterCount - Start;
+    RequiredBytes = (Remaining / 8) + ((Remaining % 8) != 0);
+    Capacity = OutputLength - FIELD_OFFSET(VOLUME_BITMAP_BUFFER, Buffer);
+    Bytes = (RequiredBytes > Capacity) ? (ULONG)Capacity : (ULONG)RequiredBytes;
+
+    *AlignedStart = Start;
+    *ByteCount = Bytes;
+    *BitCount = (Remaining < (ULONGLONG)Bytes * 8) ?
+                Remaining : (ULONGLONG)Bytes * 8;
+    *Overflow = (RequiredBytes > Capacity);
+    return STATUS_SUCCESS;
+}
+
+
+NTSTATUS
+NtfsCalculateBitmapStorageRange(
+    _In_ ULONGLONG StartingLcn,
+    _In_ ULONG ByteCount,
+    _In_ ULONG BitmapSize,
+    _Out_ PULONG ByteOffset)
+{
+    ULONGLONG Offset;
+
+    if (ByteOffset == NULL || (StartingLcn & 7) != 0)
+        return STATUS_INVALID_PARAMETER;
+
+    Offset = StartingLcn / 8;
+    if (Offset > BitmapSize ||
+        (ULONGLONG)ByteCount > (ULONGLONG)BitmapSize - Offset ||
+        Offset > MAXULONG)
+        return STATUS_FILE_CORRUPT_ERROR;
+
+    *ByteOffset = (ULONG)Offset;
     return STATUS_SUCCESS;
 }
 
@@ -757,8 +861,10 @@ GetVolumeBitmap(PDEVICE_EXTENSION DeviceExt,
     PIO_STACK_LOCATION Stack;
     PVOLUME_BITMAP_BUFFER BitmapBuffer;
     LONGLONG StartingLcn;
-    ULONGLONG TotalClusters;
-    ULONGLONG ToCopy;
+    ULONGLONG AlignedStart;
+    ULONGLONG BitCount;
+    ULONG ByteCount;
+    ULONG BitmapByteOffset;
     BOOLEAN Overflow = FALSE;
 
     DPRINT("GetVolumeBitmap(%p, %p)\n", DeviceExt, Irp);
@@ -783,10 +889,12 @@ GetVolumeBitmap(PDEVICE_EXTENSION DeviceExt,
         _SEH2_TRY
         {
             ProbeForRead(Stack->Parameters.FileSystemControl.Type3InputBuffer,
-                         Stack->Parameters.FileSystemControl.InputBufferLength,
-                         sizeof(CHAR));
+                         sizeof(STARTING_LCN_INPUT_BUFFER),
+                         sizeof(ULONG));
             ProbeForWrite(BitmapBuffer, Stack->Parameters.FileSystemControl.OutputBufferLength,
                           sizeof(CHAR));
+            StartingLcn =
+                ((PSTARTING_LCN_INPUT_BUFFER)Stack->Parameters.FileSystemControl.Type3InputBuffer)->StartingLcn.QuadPart;
         }
         _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER)
         {
@@ -801,6 +909,11 @@ GetVolumeBitmap(PDEVICE_EXTENSION DeviceExt,
         {
             Status = STATUS_INVALID_PARAMETER;
         }
+        else
+        {
+            StartingLcn =
+                ((PSTARTING_LCN_INPUT_BUFFER)Stack->Parameters.FileSystemControl.Type3InputBuffer)->StartingLcn.QuadPart;
+        }
     }
 
     if (!NT_SUCCESS(Status))
@@ -809,26 +922,19 @@ GetVolumeBitmap(PDEVICE_EXTENSION DeviceExt,
         return Status;
     }
 
-    StartingLcn = ((PSTARTING_LCN_INPUT_BUFFER)Stack->Parameters.FileSystemControl.Type3InputBuffer)->StartingLcn.QuadPart;
-    if (StartingLcn > DeviceExt->NtfsInfo.ClusterCount)
-    {
-        DPRINT1("Requested bitmap start beyond partition end: %I64x %I64x\n", DeviceExt->NtfsInfo.ClusterCount, StartingLcn);
-        return STATUS_INVALID_PARAMETER;
-    }
+    Status = NtfsCalculateVolumeBitmapRange(
+        StartingLcn,
+        DeviceExt->NtfsInfo.ClusterCount,
+        Stack->Parameters.FileSystemControl.OutputBufferLength,
+        &AlignedStart,
+        &ByteCount,
+        &BitCount,
+        &Overflow);
+    if (!NT_SUCCESS(Status))
+        return Status;
 
-    /* Round down to a multiple of 8 */
-    StartingLcn = StartingLcn & ~7;
-    TotalClusters = DeviceExt->NtfsInfo.ClusterCount - StartingLcn;
-    ToCopy = TotalClusters / 8;
-    if ((ToCopy + FIELD_OFFSET(VOLUME_BITMAP_BUFFER, Buffer)) > Stack->Parameters.FileSystemControl.OutputBufferLength)
-    {
-        DPRINT1("Buffer too small: %x, needed: %x\n", Stack->Parameters.FileSystemControl.OutputBufferLength, (ToCopy + FIELD_OFFSET(VOLUME_BITMAP_BUFFER, Buffer)));
-        Overflow = TRUE;
-        ToCopy = Stack->Parameters.FileSystemControl.OutputBufferLength - FIELD_OFFSET(VOLUME_BITMAP_BUFFER, Buffer);
-    }
-
-    BitmapBuffer->StartingLcn.QuadPart = StartingLcn;
-    BitmapBuffer->BitmapSize.QuadPart = ToCopy * 8;
+    BitmapBuffer->StartingLcn.QuadPart = (LONGLONG)AlignedStart;
+    BitmapBuffer->BitmapSize.QuadPart = BitCount;
 
     Irp->IoStatus.Information = FIELD_OFFSET(VOLUME_BITMAP_BUFFER, Buffer);
 
@@ -836,9 +942,28 @@ GetVolumeBitmap(PDEVICE_EXTENSION DeviceExt,
     ExAcquireResourceSharedLite(&DeviceExt->BitmapResource, TRUE);
     _SEH2_TRY
     {
-        RtlCopyMemory(BitmapBuffer->Buffer, (PUCHAR)DeviceExt->BitmapBuffer + StartingLcn / 8, (SIZE_T)ToCopy);
-        Irp->IoStatus.Information += (ULONG_PTR)ToCopy;
-        Status = (Overflow ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS);
+        /* The request must fit both the caller's buffer and the actual
+         * cached $Bitmap extent before any byte is copied to user memory. */
+        if (DeviceExt->BitmapBuffer == NULL)
+        {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+        }
+        else
+        {
+            Status = NtfsCalculateBitmapStorageRange(
+                AlignedStart,
+                ByteCount,
+                DeviceExt->BitmapSize,
+                &BitmapByteOffset);
+            if (NT_SUCCESS(Status))
+            {
+                RtlCopyMemory(BitmapBuffer->Buffer,
+                              (PUCHAR)DeviceExt->BitmapBuffer + BitmapByteOffset,
+                              ByteCount);
+                Irp->IoStatus.Information += ByteCount;
+                Status = (Overflow ? STATUS_BUFFER_OVERFLOW : STATUS_SUCCESS);
+            }
+        }
     }
     _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER)
     {
@@ -973,6 +1098,271 @@ NtfsDismountVolume(PDEVICE_EXTENSION DeviceExt,
     return STATUS_SUCCESS;
 }
 
+
+/*
+ * Return the physical cluster runs for a file's unnamed or named $DATA
+ * attribute.  The MCB is built by PrepareAttributeContext from validated
+ * mapping pairs.  A single attribute extent is accepted only when it covers
+ * the complete logical stream; incomplete attribute-list chains are rejected
+ * rather than returning a deceptively valid prefix to the hibernation writer.
+ */
+static
+NTSTATUS
+NtfsCopyFsctlOutput(PIRP Irp, PVOID Destination, const VOID *Source, ULONG Length)
+{
+    if (Irp->RequestorMode == UserMode)
+    {
+        _SEH2_TRY
+        {
+            RtlCopyMemory(Destination, Source, Length);
+        }
+        _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER)
+        {
+            return _SEH2_GetExceptionCode();
+        }
+        _SEH2_END;
+    }
+    else
+    {
+        RtlCopyMemory(Destination, Source, Length);
+    }
+    return STATUS_SUCCESS;
+}
+
+static
+NTSTATUS
+NtfsGetRetrievalPointers(PDEVICE_EXTENSION DeviceExt,
+                         PIRP Irp)
+{
+    PIO_STACK_LOCATION Stack;
+    PFILE_OBJECT FileObject;
+    PNTFS_FCB Fcb;
+    PSTARTING_VCN_INPUT_BUFFER Input;
+    PRETRIEVAL_POINTERS_BUFFER Output;
+    PFILE_RECORD_HEADER FileRecord = NULL;
+    PNTFS_ATTR_CONTEXT DataContext = NULL;
+    ULONGLONG RequestedVcn, TotalClusters, DataSize, ExpectedVcn = 0;
+    LARGE_INTEGER StartingVcn;
+    LONGLONG RunVcn, RunLcn, RunLength;
+    ULONG OutputLength, Capacity, RunIndex;
+    NTSTATUS Status = STATUS_SUCCESS;
+    BOOLEAN FoundRequested = FALSE;
+    RETRIEVAL_POINTERS_BUFFER Header;
+    struct { LARGE_INTEGER NextVcn; LARGE_INTEGER Lcn; } Extent;
+
+    Stack = IoGetCurrentIrpStackLocation(Irp);
+    FileObject = Stack->FileObject;
+    if (FileObject == NULL || FileObject->FsContext == NULL)
+        return STATUS_INVALID_PARAMETER;
+
+    Fcb = (PNTFS_FCB)FileObject->FsContext;
+    Input = (PSTARTING_VCN_INPUT_BUFFER)Stack->Parameters.FileSystemControl.Type3InputBuffer;
+    Output = (PRETRIEVAL_POINTERS_BUFFER)NtfsGetUserBuffer(Irp, FALSE);
+    OutputLength = Stack->Parameters.FileSystemControl.OutputBufferLength;
+
+    if (Stack->Parameters.FileSystemControl.InputBufferLength <
+            sizeof(STARTING_VCN_INPUT_BUFFER) ||
+        Input == NULL || Output == NULL)
+        return STATUS_INVALID_PARAMETER;
+
+    if (OutputLength < FIELD_OFFSET(RETRIEVAL_POINTERS_BUFFER, Extents))
+        return STATUS_BUFFER_TOO_SMALL;
+
+    if (Irp->RequestorMode == UserMode)
+    {
+        _SEH2_TRY
+        {
+            ProbeForRead(Input, sizeof(*Input), sizeof(ULONG));
+            ProbeForWrite(Output, OutputLength, sizeof(ULONG));
+            StartingVcn = Input->StartingVcn;
+        }
+        _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER)
+        {
+            return _SEH2_GetExceptionCode();
+        }
+        _SEH2_END;
+    }
+    else
+    {
+        StartingVcn = Input->StartingVcn;
+    }
+
+    if (StartingVcn.QuadPart < 0)
+        return STATUS_INVALID_PARAMETER;
+    RequestedVcn = (ULONGLONG)StartingVcn.QuadPart;
+
+    FileRecord = ExAllocateFromNPagedLookasideList(&DeviceExt->FileRecLookasideList);
+    if (FileRecord == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    KeEnterCriticalRegion();
+    ExAcquireResourceSharedLite(&Fcb->MainResource, TRUE);
+
+    Status = ReadFileRecord(DeviceExt, Fcb->MFTIndex, FileRecord);
+    if (!NT_SUCCESS(Status))
+        goto Cleanup;
+
+    Status = FindAttribute(DeviceExt, FileRecord, AttributeData,
+                           Fcb->Stream, (ULONG)wcslen(Fcb->Stream),
+                           &DataContext, NULL);
+    if (!NT_SUCCESS(Status))
+        goto Cleanup;
+
+    if (DataContext->pRecord == NULL || !DataContext->pRecord->IsNonResident)
+    {
+        Status = STATUS_INVALID_PARAMETER;
+        goto Cleanup;
+    }
+
+    if (DeviceExt->NtfsInfo.BytesPerCluster == 0)
+    {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto Cleanup;
+    }
+
+    DataSize = DataContext->pRecord->NonResident.DataSize;
+    TotalClusters = DataSize / DeviceExt->NtfsInfo.BytesPerCluster;
+    if ((DataSize % DeviceExt->NtfsInfo.BytesPerCluster) != 0)
+        ++TotalClusters;
+
+    if (RequestedVcn >= TotalClusters)
+    {
+        Status = STATUS_END_OF_FILE;
+        goto Cleanup;
+    }
+
+    /*
+     * Do not expose an incomplete physical map.  Attribute-list extension
+     * records are resolved by FindAttribute for the selected attribute, but
+     * this context currently represents one mapping-pairs extent.  Until all
+     * continuation extents are assembled, fail closed if this extent does
+     * not span the stream's logical VCN range.
+     */
+    if (DataContext->pRecord->NonResident.HighestVCN == (ULONGLONG)-1 ||
+        (ULONGLONG)DataContext->pRecord->NonResident.HighestVCN + 1 < TotalClusters)
+    {
+        Status = STATUS_NOT_SUPPORTED;
+        goto Cleanup;
+    }
+
+    Capacity = (OutputLength -
+                FIELD_OFFSET(RETRIEVAL_POINTERS_BUFFER, Extents)) /
+               sizeof(Output->Extents[0]);
+    if (Capacity == 0)
+    {
+        Status = STATUS_BUFFER_TOO_SMALL;
+        goto Cleanup;
+    }
+    if (TotalClusters > MAXLONGLONG)
+    {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto Cleanup;
+    }
+    RtlZeroMemory(&Header, sizeof(Header));
+    Header.StartingVcn.QuadPart = (LONGLONG)RequestedVcn;
+    Header.ExtentCount = 0;
+    Status = NtfsCopyFsctlOutput(Irp, Output, &Header,
+                                 FIELD_OFFSET(RETRIEVAL_POINTERS_BUFFER, Extents));
+    if (!NT_SUCCESS(Status)) goto Cleanup;
+
+    for (RunIndex = 0;
+         FsRtlGetNextLargeMcbEntry(&DataContext->DataRunsMCB, RunIndex,
+                                   &RunVcn, &RunLcn, &RunLength);
+         ++RunIndex)
+    {
+        ULONGLONG StartVcn, EndVcn, StartLcn;
+        if (RunVcn < 0 || RunLength <= 0 ||
+            (ULONGLONG)RunVcn > (ULONGLONG)MAXLONGLONG -
+                                (ULONGLONG)RunLength)
+        {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            goto Cleanup;
+        }
+
+        StartVcn = (ULONGLONG)RunVcn;
+        EndVcn = StartVcn + (ULONGLONG)RunLength;
+        if (StartVcn != ExpectedVcn)
+        {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            goto Cleanup;
+        }
+        ExpectedVcn = EndVcn;
+        if (StartVcn >= TotalClusters || EndVcn <= RequestedVcn)
+            continue;
+        if (EndVcn > TotalClusters)
+            EndVcn = TotalClusters;
+
+        if (!FoundRequested)
+        {
+            if (StartVcn > RequestedVcn)
+            {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto Cleanup;
+            }
+            FoundRequested = TRUE;
+        }
+
+        if (Header.ExtentCount == Capacity)
+        {
+            Status = (Header.ExtentCount == 0) ? STATUS_BUFFER_TOO_SMALL : STATUS_BUFFER_OVERFLOW;
+            Irp->IoStatus.Information = FIELD_OFFSET(RETRIEVAL_POINTERS_BUFFER, Extents) +
+                                        Header.ExtentCount * sizeof(Extent);
+            goto Cleanup;
+        }
+
+        if (StartVcn < RequestedVcn)
+            StartVcn = RequestedVcn;
+
+        if (RunLcn == -1)
+        {
+            StartLcn = (ULONGLONG)-1;
+        }
+        else
+        {
+            if (RunLcn < 0 ||
+                (ULONGLONG)RunLcn > (ULONGLONG)MAXLONGLONG -
+                                    (StartVcn - (ULONGLONG)RunVcn))
+            {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto Cleanup;
+            }
+            StartLcn = (ULONGLONG)RunLcn +
+                       (StartVcn - (ULONGLONG)RunVcn);
+        }
+
+        Extent.NextVcn.QuadPart = (LONGLONG)EndVcn;
+        Extent.Lcn.QuadPart = (RunLcn == -1) ? -1 : (LONGLONG)StartLcn;
+        Status = NtfsCopyFsctlOutput(Irp,
+            (PUCHAR)Output + FIELD_OFFSET(RETRIEVAL_POINTERS_BUFFER, Extents) +
+                Header.ExtentCount * sizeof(Extent), &Extent, sizeof(Extent));
+        if (!NT_SUCCESS(Status)) goto Cleanup;
+        ++Header.ExtentCount;
+        Status = NtfsCopyFsctlOutput(Irp,
+            (PUCHAR)Output + FIELD_OFFSET(RETRIEVAL_POINTERS_BUFFER, ExtentCount),
+            &Header.ExtentCount, sizeof(Header.ExtentCount));
+        if (!NT_SUCCESS(Status)) goto Cleanup;
+    }
+
+    if (!FoundRequested || Header.ExtentCount == 0 ||
+        ExpectedVcn < TotalClusters)
+    {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto Cleanup;
+    }
+
+    Irp->IoStatus.Information =
+        FIELD_OFFSET(RETRIEVAL_POINTERS_BUFFER, Extents) +
+        Header.ExtentCount * sizeof(Extent);
+
+Cleanup:
+    if (DataContext != NULL)
+        ReleaseAttributeContext(DataContext);
+    ExReleaseResourceLite(&Fcb->MainResource);
+    KeLeaveCriticalRegion();
+    ExFreeToNPagedLookasideList(&DeviceExt->FileRecLookasideList, FileRecord);
+    return Status;
+}
+
 static
 NTSTATUS
 NtfsUserFsRequest(PDEVICE_OBJECT DeviceObject,
@@ -993,7 +1383,6 @@ NtfsUserFsRequest(PDEVICE_OBJECT DeviceObject,
         case FSCTL_ENUM_USN_DATA:
         case FSCTL_EXTEND_VOLUME:
         //case FSCTL_GET_RETRIEVAL_POINTER_BASE:
-        case FSCTL_GET_RETRIEVAL_POINTERS:
         //case FSCTL_LOOKUP_STREAM_FROM_CLUSTER:
         case FSCTL_MARK_HANDLE:
         case FSCTL_MOVE_FILE:
@@ -1029,6 +1418,10 @@ NtfsUserFsRequest(PDEVICE_OBJECT DeviceObject,
 
         case FSCTL_GET_VOLUME_BITMAP:
             Status = GetVolumeBitmap(DeviceExt, Irp);
+            break;
+
+        case FSCTL_GET_RETRIEVAL_POINTERS:
+            Status = NtfsGetRetrievalPointers(DeviceExt, Irp);
             break;
 
         default:

@@ -210,8 +210,16 @@ PopHiberWriteAt(
     LARGE_INTEGER FileOffset;
     NTSTATUS Status;
 
-    if (Offset > 0x7FFFFFFFFFFFFFFFULL)
+    if (Context == NULL || Context->LinkFileHandle == NULL ||
+        (Length != 0 && Buffer == NULL))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    if (Offset > 0x7FFFFFFFFFFFFFFFULL ||
+        (ULONGLONG)Length > 0x7FFFFFFFFFFFFFFFULL - Offset)
+    {
         return STATUS_INTEGER_OVERFLOW;
+    }
 
     /* At DISPATCH_LEVEL with interrupts off: no file system, no I/O manager */
     if (Context->DumpStackActive)
@@ -247,6 +255,9 @@ PopHiberMapPhysicalChunk(
 )
 {
     UNREFERENCED_PARAMETER(Context);
+
+    if (MappedAddress == NULL || Length == 0)
+        return STATUS_INVALID_PARAMETER;
 
     *MappedAddress = MmMapIoSpace(PhysicalAddress, Length, MmCached);
     return *MappedAddress ? STATUS_SUCCESS : STATUS_INSUFFICIENT_RESOURCES;

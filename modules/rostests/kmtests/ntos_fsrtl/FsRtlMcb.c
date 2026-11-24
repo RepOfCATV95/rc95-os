@@ -2474,10 +2474,102 @@ end_test:
     FsRtlUninitializeLargeMcb(&Mcb);
 }
 
+/*
+ * Exercise the sparse mapping shape used when NTFS prepares a shortened
+ * non-resident stream.  The source MCB contains two physical extents with a
+ * sparse gap; the prepared MCB retains the gap and clips the final extent at
+ * the new VCN count, just as FreeClusters does before persisting mapping pairs.
+ */
+static VOID NtfsSparseTailMcbTest(VOID)
+{
+    LARGE_MCB SourceMcb, PreparedMcb, SparseTailMcb;
+    ULONG RunCount, Index;
+    LONGLONG Vbn, Lbn, Count;
+    LONGLONG CopyCount;
+    BOOLEAN Result;
+
+    FsRtlInitializeLargeMcb(&SourceMcb, PagedPool);
+    FsRtlInitializeLargeMcb(&PreparedMcb, PagedPool);
+    FsRtlInitializeLargeMcb(&SparseTailMcb, PagedPool);
+
+    /*
+     * A stream can have a logical sparse tail beyond its final physical MCB
+     * entry. FsRtl keeps that tail implicit; NTFS supplies the authoritative
+     * VCN count separately when encoding mapping pairs.
+     */
+    Result = FsRtlAddLargeMcbEntry(&SparseTailMcb, 0, 300, 2);
+    ok(Result, "Unable to add physical extent before sparse tail\n");
+    Result = FsRtlLookupLargeMcbEntry(&SparseTailMcb, 1, &Lbn, NULL, NULL, NULL, NULL);
+    ok(Result, "Expected final physical VCN before sparse tail\n");
+    if (Result)
+        ok(Lbn == 301, "Expected final physical LCN 301, got %I64d\n", Lbn);
+    Result = FsRtlLookupLargeMcbEntry(&SparseTailMcb, 4, &Lbn, NULL, NULL, NULL, NULL);
+    ok(!Result, "Sparse tail should remain implicit beyond the final MCB entry\n");
+
+    Result = FsRtlAddLargeMcbEntry(&SourceMcb, 0, 100, 2);
+    ok(Result, "Unable to add first NTFS data extent\n");
+    Result = FsRtlAddLargeMcbEntry(&SourceMcb, 5, 200, 3);
+    ok(Result, "Unable to add second NTFS data extent\n");
+
+    RunCount = FsRtlNumberOfRunsInLargeMcb(&SourceMcb);
+    ok(RunCount == 3, "Expected physical/sparse/physical runs, got %lu\n", RunCount);
+
+    Result = FsRtlGetNextLargeMcbEntry(&SourceMcb, 1, &Vbn, &Lbn, &Count);
+    ok(Result, "Unable to enumerate sparse NTFS run\n");
+    if (Result)
+    {
+        ok(Vbn == 2, "Expected sparse VCN 2, got %I64d\n", Vbn);
+        ok(Lbn == -1, "Expected sparse LCN -1, got %I64d\n", Lbn);
+        ok(Count == 3, "Expected sparse run length 3, got %I64d\n", Count);
+    }
+
+    /* Free the final two clusters: the new stream ends after VCN 5. */
+    for (Index = 0; Index < RunCount; ++Index)
+    {
+        Result = FsRtlGetNextLargeMcbEntry(&SourceMcb, Index, &Vbn, &Lbn, &Count);
+        ok(Result, "Unable to enumerate source run %lu\n", Index);
+        if (!Result || Lbn == -1 || Vbn >= 6)
+            continue;
+
+        CopyCount = Count < (6 - Vbn) ? Count : (6 - Vbn);
+        if (CopyCount != 0)
+        {
+            Result = FsRtlAddLargeMcbEntry(&PreparedMcb, Vbn, Lbn, CopyCount);
+            ok(Result, "Unable to copy retained physical run %lu\n", Index);
+        }
+    }
+
+    RunCount = FsRtlNumberOfRunsInLargeMcb(&PreparedMcb);
+    ok(RunCount == 3, "Expected retained physical/sparse/physical runs, got %lu\n", RunCount);
+
+    Result = FsRtlLookupLargeMcbEntry(&PreparedMcb, 3, &Lbn, NULL, NULL, NULL, NULL);
+    ok(Result, "Expected retained sparse VCN 3 to be represented\n");
+    if (Result)
+        ok(Lbn == -1, "Expected retained sparse VCN 3 LCN -1, got %I64d\n", Lbn);
+
+    Result = FsRtlLookupLargeMcbEntry(&PreparedMcb, 5, &Lbn, NULL, NULL, NULL, NULL);
+    ok(Result, "Expected final retained extent at VCN 5\n");
+    if (Result)
+        ok(Lbn == 200, "Expected final retained LCN 200, got %I64d\n", Lbn);
+
+    Result = FsRtlLookupLargeMcbEntry(&PreparedMcb, 6, &Lbn, NULL, NULL, NULL, NULL);
+    ok(!Result, "Prepared MCB unexpectedly retained trimmed VCN 6\n");
+
+    Result = FsRtlLookupLargeMcbEntry(&SourceMcb, 7, &Lbn, NULL, NULL, NULL, NULL);
+    ok(Result, "Source MCB was unexpectedly modified by preparation\n");
+    if (Result)
+        ok(Lbn == 202, "Expected original tail LCN 202, got %I64d\n", Lbn);
+
+    FsRtlUninitializeLargeMcb(&SparseTailMcb);
+    FsRtlUninitializeLargeMcb(&PreparedMcb);
+    FsRtlUninitializeLargeMcb(&SourceMcb);
+}
+
 START_TEST(FsRtlMcb)
 {
     FsRtlMcbTest();
     FsRtlLargeMcbTest();
+    NtfsSparseTailMcbTest();
     FsRtlLargeMcbTestsExt2();
     FsRtlLargeMcbTestsFastFat();
     FsRtlLargeMcbTestsFastFat_2();

@@ -1,5 +1,13 @@
+#if defined(NTFS_LOGFILE_KERNEL_BUILD)
+#include <ntifs.h>
+#else
 #include "ntfslib.h"
+#endif
 #include "logfile.h"
+
+typedef char NTFS_LOGFILE_CLIENT_ENTRY_SIZE_CHECK[
+    (sizeof(NTFS_LOGFILE_CLIENT_ENTRY_VIEW) ==
+        NTFS_LOGFILE_CLIENT_ENTRY_SIZE) ? 1 : -1];
 
 #define LOG_U16(p) ((USHORT)((p)[0] | ((USHORT)(p)[1] << 8)))
 #define LOG_U32(p) ((ULONG)((p)[0] | ((ULONG)(p)[1] << 8) | ((ULONG)(p)[2] << 16) | ((ULONG)(p)[3] << 24)))
@@ -27,6 +35,27 @@ LogBuffersOverlap(const VOID *First, const VOID *Second, ULONG Length)
         return TRUE;
 
     return A < B + Length && B < A + Length;
+}
+
+/* Validate independently sized caller buffers without overflowing addresses. */
+static BOOLEAN
+LogBufferRangesOverlap(
+    const VOID *First,
+    ULONG FirstLength,
+    const VOID *Second,
+    ULONG SecondLength)
+{
+    ULONG_PTR A = (ULONG_PTR)First;
+    ULONG_PTR B = (ULONG_PTR)Second;
+
+    if (FirstLength == 0 || SecondLength == 0)
+        return FALSE;
+    if (!First || !Second ||
+        A > ~(ULONG_PTR)0 - FirstLength ||
+        B > ~(ULONG_PTR)0 - SecondLength)
+        return TRUE;
+
+    return A < B + SecondLength && B < A + FirstLength;
 }
 
 NTSTATUS
@@ -58,13 +87,17 @@ NtfsLogfileOpenRestartPage(
     UsaOffset = LOG_U16(Source + 4);
     UsaCount = LOG_U16(Source + 6);
     SectorCount = PageLength / BytesPerSector;
+    RestartOffset = LOG_U16(Source + 0x18);
     if (UsaCount != SectorCount + 1 || (UsaOffset & 1) ||
-        UsaOffset < 8 || UsaCount > MAXULONG / sizeof(USHORT))
+        UsaOffset < NTFS_LOGFILE_RESTART_HEADER_MIN ||
+        UsaCount > MAXULONG / sizeof(USHORT))
         return STATUS_DATA_ERROR;
 
     UsaBytes = UsaCount * sizeof(USHORT);
     if (!LogRange(UsaOffset, UsaBytes, PageLength) ||
-        UsaOffset + UsaBytes > BytesPerSector - sizeof(USHORT))
+        UsaOffset + UsaBytes > BytesPerSector - sizeof(USHORT) ||
+        RestartOffset < NTFS_LOGFILE_RESTART_HEADER_MIN ||
+        UsaOffset + UsaBytes > RestartOffset)
         return STATUS_DATA_ERROR;
 
     UpdateSequence = LOG_U16(Source + UsaOffset);
@@ -130,7 +163,8 @@ NtfsLogfileOpenRestartArea(
     const UCHAR *Bytes;
     ULONG Offset, Available, AreaLength, ClientOffset;
     ULONG Clients, Flags;
-    USHORT FreeList, InUseList, SequenceBits;
+    USHORT FreeList, InUseList;
+    ULONG SequenceBits;
     USHORT AreaLength16, ClientOffset16, HeaderLength, PageDataOffset;
 
     if (!Restart || !Area || !Restart->Page ||
@@ -138,6 +172,9 @@ NtfsLogfileOpenRestartArea(
         return STATUS_INVALID_PARAMETER;
 
     RtlZeroMemory(Area, sizeof(*Area));
+    if (!LogPowerOfTwo(Restart->LogPageSize))
+        return STATUS_DATA_ERROR;
+
     Offset = Restart->RestartOffset;
     Available = Restart->PageLength - Offset;
     if (Available < NTFS_LOGFILE_RESTART_AREA_MIN)
@@ -146,28 +183,27 @@ NtfsLogfileOpenRestartArea(
     Bytes = Restart->Page + Offset;
     /* Restart-area fields are read by fixed offsets, never native structure casts. */
     /*
-     * RESTART_AREA layout: the client-list heads and the sequence/length/
-     * offset fields are 16-bit values. Reading them as ULONGs shifts every
-     * following field and can turn malformed metadata into bogus bounds.
+     * RESTART_AREA uses 16-bit client counts/list heads and 32-bit sequence
+     * width; the fixed offsets below are part of the on-disk format.
      */
-    Clients = LOG_U32(Bytes + 0x08);
-    FreeList = LOG_U16(Bytes + 0x0C);
-    InUseList = LOG_U16(Bytes + 0x0E);
-    Flags = LOG_U32(Bytes + 0x10);
-    SequenceBits = LOG_U16(Bytes + 0x14);
-    AreaLength16 = LOG_U16(Bytes + 0x16);
-    ClientOffset16 = LOG_U16(Bytes + 0x18);
+    Clients = LOG_U16(Bytes + 0x08);
+    FreeList = LOG_U16(Bytes + 0x0A);
+    InUseList = LOG_U16(Bytes + 0x0C);
+    Flags = LOG_U16(Bytes + 0x0E);
+    SequenceBits = LOG_U32(Bytes + 0x10);
+    AreaLength16 = LOG_U16(Bytes + 0x14);
+    ClientOffset16 = LOG_U16(Bytes + 0x16);
     AreaLength = AreaLength16;
     ClientOffset = ClientOffset16;
-    HeaderLength = LOG_U16(Bytes + 0x2C);
-    PageDataOffset = LOG_U16(Bytes + 0x2E);
+    HeaderLength = LOG_U16(Bytes + 0x24);
+    PageDataOffset = LOG_U16(Bytes + 0x26);
 
     if (AreaLength < NTFS_LOGFILE_RESTART_AREA_MIN ||
         AreaLength > Available ||
         ClientOffset < NTFS_LOGFILE_RESTART_AREA_MIN ||
         ClientOffset > AreaLength ||
         (ClientOffset & 7) ||
-        (Clients > (AreaLength - ClientOffset) / 0x20) ||
+        (Clients > (AreaLength - ClientOffset) / NTFS_LOGFILE_CLIENT_ENTRY_SIZE) ||
         SequenceBits == 0 || SequenceBits > 63 ||
         HeaderLength < 0x20 || HeaderLength > Restart->LogPageSize ||
         PageDataOffset < HeaderLength || PageDataOffset >= Restart->LogPageSize ||
@@ -181,22 +217,486 @@ NtfsLogfileOpenRestartArea(
     Area->LogClients = Clients;
     Area->FreeList = (FreeList == 0xFFFF) ? 0xFFFFFFFF : FreeList;
     Area->InUseList = (InUseList == 0xFFFF) ? 0xFFFFFFFF : InUseList;
-    Area->Flags = Flags;
+    Area->Flags = (USHORT)Flags;
     Area->SequenceNumberBits = SequenceBits;
     Area->RestartAreaLength = AreaLength;
     Area->ClientArrayOffset = ClientOffset;
-    Area->FileSize = LOG_U64(Bytes + 0x20);
-    Area->LastLsnDataLength = LOG_U32(Bytes + 0x28);
+    Area->FileSize = LOG_U64(Bytes + 0x18);
+    Area->LastLsnDataLength = LOG_U32(Bytes + 0x20);
     Area->RecordHeaderLength = HeaderLength;
     Area->LogPageDataOffset = PageDataOffset;
+    Area->RestartLogOpenCount = LOG_U32(Bytes + 0x28);
+    Area->Reserved = LOG_U32(Bytes + 0x2C);
 
     if (Area->FileSize == 0 ||
+        (Area->FileSize & 0x8000000000000000ULL) != 0 ||
+        (Area->FileSize % Restart->LogPageSize) != 0 ||
         Area->LastLsnDataLength > Area->FileSize)
+    {
+        RtlZeroMemory(Area, sizeof(*Area));
         return STATUS_DATA_ERROR;
+    }
 
     return STATUS_SUCCESS;
 }
 
+
+/*
+ * Compare two independently validated restart areas. A sequence-width
+ * mismatch cannot be ordered safely, and the modular half-range case is
+ * deliberately rejected by NtfsLogfileCompareLsn().
+ */
+NTSTATUS
+NTAPI
+NtfsLogfileSelectRestartArea(
+    const NTFS_LOGFILE_RESTART_AREA_VIEW *First,
+    const NTFS_LOGFILE_RESTART_AREA_VIEW *Second,
+    PULONG SelectedIndex)
+{
+    LONG Comparison;
+    NTSTATUS Status;
+
+    if (!First || !Second || !SelectedIndex ||
+        First->SequenceNumberBits == 0 ||
+        First->SequenceNumberBits > 63 ||
+        First->SequenceNumberBits != Second->SequenceNumberBits)
+        return STATUS_INVALID_PARAMETER;
+
+    Status = NtfsLogfileCompareLsn(
+        First->CurrentLsn, Second->CurrentLsn,
+        First->SequenceNumberBits, &Comparison);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    *SelectedIndex = (Comparison < 0) ? 1 : 0;
+    return STATUS_SUCCESS;
+}
+
+
+/*
+ * Decode native 0xA0-byte client records. The client name is inline UTF-16.
+ */
+NTSTATUS
+NTAPI
+NtfsLogfileReadClientTable(
+    const NTFS_LOGFILE_RESTART_AREA_VIEW *Area,
+    NTFS_LOGFILE_CLIENT_ENTRY_VIEW *Entries,
+    ULONG EntryCapacity,
+    PULONG EntriesRead)
+{
+    ULONG i, TableBytes;
+
+    if (!Area || !Area->Buffer || !EntriesRead ||
+        (!Entries && EntryCapacity != 0))
+        return STATUS_INVALID_PARAMETER;
+
+    *EntriesRead = 0;
+    if (Area->LogClients > 0xFFFF)
+        return STATUS_DATA_ERROR;
+    if (Area->LogClients > EntryCapacity)
+        return STATUS_BUFFER_TOO_SMALL;
+    if (Area->Length < NTFS_LOGFILE_RESTART_AREA_MIN ||
+        Area->ClientArrayOffset < NTFS_LOGFILE_RESTART_AREA_MIN ||
+        Area->ClientArrayOffset > Area->Length ||
+        (Area->ClientArrayOffset & 7) ||
+        Area->LogClients > MAXULONG / NTFS_LOGFILE_CLIENT_ENTRY_SIZE)
+        return STATUS_DATA_ERROR;
+
+    TableBytes = Area->LogClients * NTFS_LOGFILE_CLIENT_ENTRY_SIZE;
+    if (!LogRange(Area->ClientArrayOffset, TableBytes, Area->Length))
+        return STATUS_DATA_ERROR;
+    for (i = 0; i < Area->LogClients; ++i)
+    {
+        const UCHAR *Raw = Area->Buffer + Area->ClientArrayOffset +
+            i * NTFS_LOGFILE_CLIENT_ENTRY_SIZE;
+        USHORT PreviousClient = LOG_U16(Raw + 0x10);
+        USHORT NextClient = LOG_U16(Raw + 0x12);
+        ULONG NameLength = LOG_U32(Raw + 0x1C);
+
+        if ((PreviousClient != 0xFFFF &&
+             PreviousClient >= Area->LogClients) ||
+            (NextClient != 0xFFFF && NextClient >= Area->LogClients) ||
+            NameLength > NTFS_LOGFILE_CLIENT_NAME_BYTES ||
+            (NameLength & 1))
+            return STATUS_DATA_ERROR;
+    }
+
+    for (i = 0; i < Area->LogClients; ++i)
+    {
+        const UCHAR *Raw = Area->Buffer + Area->ClientArrayOffset +
+            i * NTFS_LOGFILE_CLIENT_ENTRY_SIZE;
+
+        RtlZeroMemory(&Entries[i], sizeof(Entries[i]));
+        Entries[i].OldestLsn = LOG_U64(Raw);
+        Entries[i].ClientRestartLsn = LOG_U64(Raw + 0x08);
+        Entries[i].PreviousClient = LOG_U16(Raw + 0x10);
+        Entries[i].NextClient = LOG_U16(Raw + 0x12);
+        Entries[i].SequenceNumber = LOG_U16(Raw + 0x14);
+        RtlCopyMemory(Entries[i].Reserved, Raw + 0x16,
+            sizeof(Entries[i].Reserved));
+        Entries[i].ClientNameLength = LOG_U32(Raw + 0x1C);
+        RtlCopyMemory(Entries[i].ClientName, Raw + 0x20,
+            NTFS_LOGFILE_CLIENT_NAME_BYTES);
+    }
+
+    *EntriesRead = Area->LogClients;
+    return STATUS_SUCCESS;
+}
+
+
+/*
+ * Check the reciprocal links in the restart client's doubly-linked lists.
+ * 0xFFFF is the on-disk null link; circular singleton links are permitted.
+ */
+NTSTATUS
+NTAPI
+NtfsLogfileValidateClientLinks(
+    const NTFS_LOGFILE_CLIENT_ENTRY_VIEW *Entries,
+    ULONG ClientCount)
+{
+    ULONG i;
+
+    /* 0xFFFF is reserved as the null-link sentinel, not a valid index. */
+    if (!Entries || ClientCount == 0 || ClientCount > 0xFFFF)
+        return STATUS_INVALID_PARAMETER;
+
+    for (i = 0; i < ClientCount; ++i)
+    {
+        USHORT Previous = Entries[i].PreviousClient;
+        USHORT Next = Entries[i].NextClient;
+
+        if ((Previous != 0xFFFF && Previous >= ClientCount) ||
+            (Next != 0xFFFF && Next >= ClientCount))
+            return STATUS_DATA_ERROR;
+
+        if (Previous != 0xFFFF &&
+            Entries[Previous].NextClient != i)
+            return STATUS_DATA_ERROR;
+
+        if (Next != 0xFFFF &&
+            Entries[Next].PreviousClient != i)
+            return STATUS_DATA_ERROR;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+LogValidateRestartClientList(
+    const NTFS_LOGFILE_CLIENT_ENTRY_VIEW *Entries,
+    ULONG ClientCount,
+    ULONG Head,
+    PULONG ListCount)
+{
+    ULONG Current = (Head == NTFS_LOGFILE_NO_CLIENT) ? 0xFFFF : Head;
+    ULONG Previous = 0xFFFF;
+    ULONG Steps = 0;
+
+    *ListCount = 0;
+    while (Current != 0xFFFF)
+    {
+        if (Current >= ClientCount || Steps >= ClientCount ||
+            Entries[Current].PreviousClient != Previous)
+            return STATUS_DATA_ERROR;
+
+        Previous = Current;
+        Current = Entries[Current].NextClient;
+        ++Steps;
+    }
+
+    *ListCount = Steps;
+    return STATUS_SUCCESS;
+}
+
+static BOOLEAN
+LogRestartClientListContains(
+    const NTFS_LOGFILE_CLIENT_ENTRY_VIEW *Entries,
+    ULONG ClientCount,
+    ULONG Head,
+    ULONG ClientIndex)
+{
+    ULONG Current = (Head == NTFS_LOGFILE_NO_CLIENT) ? 0xFFFF : Head;
+    ULONG Steps = 0;
+
+    while (Current != 0xFFFF && Steps < ClientCount)
+    {
+        if (Current == ClientIndex)
+            return TRUE;
+        if (Current >= ClientCount)
+            return FALSE;
+        Current = Entries[Current].NextClient;
+        ++Steps;
+    }
+
+    return FALSE;
+}
+
+NTSTATUS
+NTAPI
+NtfsLogfileValidateClientLists(
+    const NTFS_LOGFILE_RESTART_AREA_VIEW *Area,
+    const NTFS_LOGFILE_CLIENT_ENTRY_VIEW *Entries,
+    ULONG ClientCount)
+{
+    ULONG FreeCount, InUseCount, i;
+    NTSTATUS Status;
+
+    if (!Area || ClientCount > 0xFFFF ||
+        ClientCount != Area->LogClients ||
+        (ClientCount != 0 && !Entries))
+        return STATUS_INVALID_PARAMETER;
+
+    if ((Area->FreeList != NTFS_LOGFILE_NO_CLIENT &&
+         Area->FreeList >= ClientCount) ||
+        (Area->InUseList != NTFS_LOGFILE_NO_CLIENT &&
+         Area->InUseList >= ClientCount))
+        return STATUS_DATA_ERROR;
+
+    if (ClientCount == 0)
+        return (Area->FreeList == 0xFFFFFFFF &&
+                Area->InUseList == 0xFFFFFFFF) ?
+            STATUS_SUCCESS : STATUS_DATA_ERROR;
+
+    Status = LogValidateRestartClientList(
+        Entries, ClientCount, Area->FreeList, &FreeCount);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    Status = LogValidateRestartClientList(
+        Entries, ClientCount, Area->InUseList, &InUseCount);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    if (FreeCount + InUseCount != ClientCount)
+        return STATUS_DATA_ERROR;
+
+    for (i = 0; i < ClientCount; ++i)
+    {
+        BOOLEAN InFree = LogRestartClientListContains(
+            Entries, ClientCount, Area->FreeList, i);
+        BOOLEAN InUse = LogRestartClientListContains(
+            Entries, ClientCount, Area->InUseList, i);
+
+        if (InFree == InUse)
+            return STATUS_DATA_ERROR;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+NTAPI
+NtfsLogfileDecodeNtfsOperation(
+    const NTFS_LOGFILE_ASSEMBLED_RECORD *Record,
+    NTFS_LOGFILE_NTFS_OPERATION_VIEW *Operation)
+{
+    const UCHAR *Data;
+    ULONG Available;
+    ULONG LcnBytes, PayloadOffset;
+    NTFS_LOGFILE_NTFS_OPERATION_VIEW Decoded;
+
+    if (!Operation)
+        return STATUS_INVALID_PARAMETER;
+    RtlZeroMemory(Operation, sizeof(*Operation));
+
+    if (!Record || !Record->Buffer ||
+        Record->HeaderLength < NTFS_LFS_RECORD_HEADER_SIZE ||
+        Record->HeaderLength > Record->Length)
+        return STATUS_INVALID_PARAMETER;
+
+    RtlZeroMemory(&Decoded, sizeof(Decoded));
+    Available = Record->Length - Record->HeaderLength;
+    if (Record->Header.ClientDataLength > Available ||
+        Record->Header.ClientDataLength <
+            NTFS_LOGFILE_NTFS_OPERATION_HEADER_SIZE)
+        return STATUS_DATA_ERROR;
+
+    Data = Record->Buffer + Record->HeaderLength;
+    Decoded.RedoOperation = LOG_U16(Data + 0x00);
+    Decoded.UndoOperation = LOG_U16(Data + 0x02);
+    Decoded.RedoOffset = LOG_U16(Data + 0x04);
+    Decoded.RedoLength = LOG_U16(Data + 0x06);
+    Decoded.UndoOffset = LOG_U16(Data + 0x08);
+    Decoded.UndoLength = LOG_U16(Data + 0x0A);
+    Decoded.TargetAttribute = LOG_U16(Data + 0x0C);
+    Decoded.LcnsToFollow = LOG_U16(Data + 0x0E);
+    Decoded.RecordOffset = LOG_U16(Data + 0x10);
+    Decoded.AttributeOffset = LOG_U16(Data + 0x12);
+    Decoded.TargetVcn = LOG_U64(Data + 0x18);
+    Decoded.ClientDataLength = Record->Header.ClientDataLength;
+
+    if (Decoded.LcnsToFollow > MAXULONG / sizeof(ULONGLONG))
+        return STATUS_DATA_ERROR;
+    LcnBytes = Decoded.LcnsToFollow * sizeof(ULONGLONG);
+    if (!LogRange(NTFS_LOGFILE_NTFS_OPERATION_HEADER_SIZE,
+            LcnBytes, Decoded.ClientDataLength))
+        return STATUS_DATA_ERROR;
+    PayloadOffset = NTFS_LOGFILE_NTFS_OPERATION_HEADER_SIZE + LcnBytes;
+
+    if ((Decoded.RedoLength != 0 &&
+         (Decoded.RedoOffset < PayloadOffset ||
+          !LogRange(Decoded.RedoOffset, Decoded.RedoLength,
+              Decoded.ClientDataLength))) ||
+        (Decoded.UndoLength != 0 &&
+         (Decoded.UndoOffset < PayloadOffset ||
+          !LogRange(Decoded.UndoOffset, Decoded.UndoLength,
+              Decoded.ClientDataLength))))
+        return STATUS_DATA_ERROR;
+
+    Decoded.LcnList = Data + NTFS_LOGFILE_NTFS_OPERATION_HEADER_SIZE;
+    Decoded.RedoData = (Decoded.RedoLength != 0) ?
+        Data + Decoded.RedoOffset : NULL;
+    Decoded.UndoData = (Decoded.UndoLength != 0) ?
+        Data + Decoded.UndoOffset : NULL;
+    *Operation = Decoded;
+    return STATUS_SUCCESS;
+}
+
+
+NTSTATUS
+NTAPI
+NtfsLogfileReadOperationLcn(
+    const NTFS_LOGFILE_NTFS_OPERATION_VIEW *Operation,
+    ULONG Index,
+    PULONGLONG Lcn)
+{
+    if (!Operation || !Lcn || !Operation->LcnList ||
+        Index >= Operation->LcnsToFollow)
+        return STATUS_INVALID_PARAMETER;
+
+    *Lcn = LOG_U64(Operation->LcnList + Index * sizeof(ULONGLONG));
+    return STATUS_SUCCESS;
+}
+
+
+
+/*
+ * Analyze already-classified transaction records. This deliberately does
+ * not infer on-disk operation types: the native client-record decoder must
+ * supply Begin/Update/Commit/Abort classifications before this state machine
+ * can be used for recovery decisions.
+ */
+NTSTATUS
+NTAPI
+NtfsLogfileAnalyzeTransactionEvents(
+    const NTFS_LOGFILE_TRANSACTION_EVENT *Events,
+    ULONG EventCount,
+    ULONG ClientCount,
+    NTFS_LOGFILE_TRANSACTION_STATE_VIEW *States,
+    ULONG StateCapacity,
+    PULONG StatesWritten)
+{
+    ULONG i, j, Count = 0;
+    ULONG EventBytes, StateBytes;
+    NTSTATUS Status = STATUS_SUCCESS;
+
+    if ((!Events && EventCount != 0) || !StatesWritten ||
+        (!States && StateCapacity != 0) || ClientCount == 0 ||
+        EventCount > MAXULONG / sizeof(*Events) ||
+        StateCapacity > MAXULONG / sizeof(*States))
+        return STATUS_INVALID_PARAMETER;
+
+    EventBytes = EventCount * (ULONG)sizeof(*Events);
+    StateBytes = StateCapacity * (ULONG)sizeof(*States);
+    if (LogBufferRangesOverlap(
+            Events, EventBytes, States, StateBytes) ||
+        LogBufferRangesOverlap(
+            Events, EventBytes, StatesWritten, (ULONG)sizeof(*StatesWritten)) ||
+        LogBufferRangesOverlap(
+            States, StateBytes, StatesWritten, (ULONG)sizeof(*StatesWritten)))
+        return STATUS_INVALID_PARAMETER;
+
+    *StatesWritten = 0;
+
+    for (i = 0; i < EventCount; ++i)
+    {
+        const NTFS_LOGFILE_TRANSACTION_EVENT *Event = &Events[i];
+        NTFS_LOGFILE_TRANSACTION_STATE_VIEW *State = NULL;
+
+        if (Event->Lsn == 0 || Event->TransactionId == 0 ||
+            !NT_SUCCESS(NtfsLogfileValidateClientReference(
+                Event->ClientIndex, ClientCount)) ||
+            Event->Action < NtfsLogfileTransactionBegin ||
+            Event->Action > NtfsLogfileTransactionAbort)
+        {
+            Status = STATUS_DATA_ERROR;
+            goto Failure;
+        }
+
+        /*
+         * An LFS record has one globally unique LSN, regardless of which
+         * client or transaction owns it. Reject duplicate event identities
+         * before mutating the transaction state table; otherwise a caller
+         * could accidentally account one physical log record twice.
+         */
+        for (j = 0; j < i; ++j)
+        {
+            if (Events[j].Lsn == Event->Lsn)
+            {
+                Status = STATUS_DATA_ERROR;
+                goto Failure;
+            }
+        }
+
+        for (j = 0; j < Count; ++j)
+        {
+            if (States[j].TransactionId == Event->TransactionId &&
+                States[j].ClientIndex == Event->ClientIndex)
+            {
+                State = &States[j];
+                break;
+            }
+        }
+
+        if (Event->Action == NtfsLogfileTransactionBegin)
+        {
+            if (State != NULL)
+            {
+                Status = STATUS_DATA_ERROR;
+                goto Failure;
+            }
+            if (Count == StateCapacity)
+            {
+                Status = STATUS_BUFFER_TOO_SMALL;
+                goto Failure;
+            }
+
+            State = &States[Count++];
+            RtlZeroMemory(State, sizeof(*State));
+            State->TransactionId = Event->TransactionId;
+            State->ClientIndex = Event->ClientIndex;
+            State->State = NtfsLogfileTransactionActive;
+            State->FirstLsn = Event->Lsn;
+        }
+        else if (State == NULL ||
+                 State->State != NtfsLogfileTransactionActive)
+        {
+            Status = STATUS_DATA_ERROR;
+            goto Failure;
+        }
+
+        State->LastLsn = Event->Lsn;
+        if (State->RecordCount == MAXULONG)
+        {
+            Status = STATUS_INTEGER_OVERFLOW;
+            goto Failure;
+        }
+        ++State->RecordCount;
+
+        if (Event->Action == NtfsLogfileTransactionCommit)
+            State->State = NtfsLogfileTransactionCommitted;
+        else if (Event->Action == NtfsLogfileTransactionAbort)
+            State->State = NtfsLogfileTransactionAborted;
+    }
+
+    *StatesWritten = Count;
+    return STATUS_SUCCESS;
+
+Failure:
+    if (States && Count != 0)
+        RtlZeroMemory(States, Count * sizeof(*States));
+    return Status;
+}
 
 
 /* Find one LSN in a caller-provided, bounded transaction-link array. */
@@ -293,7 +793,7 @@ NTAPI
 NtfsLogfileCompareLsn(
     ULONGLONG FirstLsn,
     ULONGLONG SecondLsn,
-    USHORT SequenceNumberBits,
+    ULONG SequenceNumberBits,
     PLONG Comparison)
 {
     ULONG OffsetBits;
@@ -550,8 +1050,28 @@ NtfsLogfileNextRecord(
     if (!Iterator || !Record || !Iterator->Page || !Iterator->Page->Page)
         return STATUS_INVALID_PARAMETER;
 
-    RtlZeroMemory(Record, sizeof(*Record));
+    /*
+     * The iterator is caller-owned and may have been modified after
+     * initialization. Revalidate every arithmetic operand before using it;
+     * otherwise a zero/non-power-of-two alignment or a forged cursor can
+     * bypass the initializer's bounds checks.
+     */
     Page = Iterator->Page;
+    if (Iterator->RecordHeaderLength == 0 ||
+        Iterator->LengthFieldOffset > Iterator->RecordHeaderLength ||
+        sizeof(ULONG) > Iterator->RecordHeaderLength - Iterator->LengthFieldOffset ||
+        !LogPowerOfTwo(Iterator->Alignment) ||
+        Iterator->Alignment < sizeof(ULONG) ||
+        (Iterator->HasClientIndex &&
+         (Iterator->ClientIndexFieldOffset > Iterator->RecordHeaderLength ||
+          sizeof(USHORT) > Iterator->RecordHeaderLength - Iterator->ClientIndexFieldOffset)) ||
+        Page->DataOffset > Page->NextRecordOffset ||
+        Page->NextRecordOffset > Page->PageLength ||
+        Iterator->Cursor < Page->DataOffset ||
+        Iterator->Cursor > Page->NextRecordOffset)
+        return STATUS_DATA_ERROR;
+
+    RtlZeroMemory(Record, sizeof(*Record));
 
     if (Iterator->Cursor == Page->NextRecordOffset)
         return STATUS_NO_MORE_ENTRIES;
@@ -690,7 +1210,9 @@ NtfsLogfileAssembleRecord(
 
     RtlZeroMemory(Record, sizeof(*Record));
     FirstPage = &Pages[FirstPageIndex];
-    if (!FirstPage->Page || FirstPageOffset < FirstPage->DataOffset ||
+    if (!FirstPage->Page || FirstPage->PageCount != PageCount ||
+        FirstPage->PagePosition >= FirstPage->PageCount ||
+        FirstPageOffset < FirstPage->DataOffset ||
         FirstPageOffset > FirstPage->NextRecordOffset ||
         FirstPage->NextRecordOffset > FirstPage->PageLength ||
         FirstPage->NextRecordOffset - FirstPageOffset < NTFS_LFS_RECORD_HEADER_SIZE)

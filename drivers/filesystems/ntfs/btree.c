@@ -131,6 +131,9 @@ AllocateIndexNode(PDEVICE_EXTENSION DeviceExt,
     RTL_BITMAP Bitmap;
     ULONG BytesWritten;
     ULONG BytesNeeded;
+    ULONG BitmapBufferSize;
+    ULONG BytesToWrite;
+    ULONG BitmapBits;
     LARGE_INTEGER DataSize;
 
     DPRINT("AllocateIndexNode(%p, %p, %lu, %p, %lu, %p) called.\n", DeviceExt,
@@ -140,8 +143,20 @@ AllocateIndexNode(PDEVICE_EXTENSION DeviceExt,
             IndexAllocationOffset,
             NewVCN);
 
+    if (DeviceExt == NULL || FileRecord == NULL ||
+        IndexAllocationCtx == NULL || IndexAllocationCtx->pRecord == NULL ||
+        NewVCN == NULL || IndexBufferSize == 0 ||
+        DeviceExt->NtfsInfo.BytesPerIndexRecord == 0 ||
+        DeviceExt->NtfsInfo.BytesPerSector == 0 ||
+        DeviceExt->NtfsInfo.BytesPerCluster == 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     // Get the length of the attribute allocation
     IndexAllocationLength = AttributeDataLength(IndexAllocationCtx->pRecord);
+    if (IndexAllocationLength % DeviceExt->NtfsInfo.BytesPerIndexRecord != 0)
+        return STATUS_FILE_CORRUPT_ERROR;
 
     // Find the bitmap attribute for the index
     Status = FindAttribute(DeviceExt,
@@ -161,21 +176,41 @@ AllocateIndexNode(PDEVICE_EXTENSION DeviceExt,
     BitmapLength = AttributeDataLength(BitmapCtx->pRecord);
 
     NextNodeNumber = IndexAllocationLength / DeviceExt->NtfsInfo.BytesPerIndexRecord;
+    if (NextNodeNumber >= MAXULONG ||
+        BitmapLength > MAXULONG ||
+        BitmapLength > MAXULONG / 8)
+    {
+        ReleaseAttributeContext(BitmapCtx);
+        return STATUS_NOT_SUPPORTED;
+    }
 
-    // TODO: Find unused allocation in bitmap and use that space first
-
-    // Add another bit to bitmap
-
-    // See how many bytes we need to store the amount of bits we'll have
-    BytesNeeded = NextNodeNumber / 8;
-    BytesNeeded++;
-
-    // Windows seems to allocate the bitmap in 8-byte chunks to keep any bytes from being wasted on padding
+    // Include the bit for the node being allocated and round to NTFS padding.
+    BytesNeeded = (ULONG)(NextNodeNumber / 8) + 1;
+    if (BytesNeeded > MAXULONG - (ATTR_RECORD_ALIGNMENT - 1))
+    {
+        ReleaseAttributeContext(BitmapCtx);
+        return STATUS_INTEGER_OVERFLOW;
+    }
     BytesNeeded = ALIGN_UP(BytesNeeded, ATTR_RECORD_ALIGNMENT);
 
-    // Allocate memory for the bitmap, including some padding; RtlInitializeBitmap() wants a pointer
-    // that's ULONG-aligned, and it wants the size of the memory allocated for it to be a ULONG-multiple.
-    BitmapMem = ExAllocatePoolWithTag(NonPagedPool, BytesNeeded + sizeof(ULONG), TAG_NTFS);
+    /*
+     * Existing $I30 bitmaps may be larger than the minimum size required by
+     * the next node.  Preserve their full contents and avoid reading past a
+     * minimum-sized temporary buffer.
+     */
+    BitmapBufferSize = max(BytesNeeded, (ULONG)BitmapLength);
+    if (BitmapBufferSize > MAXULONG / 8 ||
+        BitmapBufferSize > MAXULONG - sizeof(ULONG))
+    {
+        ReleaseAttributeContext(BitmapCtx);
+        return STATUS_INTEGER_OVERFLOW;
+    }
+    BytesToWrite = BitmapBufferSize;
+    BitmapBits = BitmapBufferSize * 8;
+
+    BitmapMem = ExAllocatePoolWithTag(NonPagedPool,
+                                      BitmapBufferSize + sizeof(ULONG),
+                                      TAG_NTFS);
     if (!BitmapMem)
     {
         DPRINT1("Error: failed to allocate bitmap!");
@@ -185,14 +220,22 @@ AllocateIndexNode(PDEVICE_EXTENSION DeviceExt,
     // RtlInitializeBitmap() wants a pointer that's ULONG-aligned.
     BitmapPtr = (PULONG)ALIGN_UP_BY((ULONG_PTR)BitmapMem, sizeof(ULONG));
 
-    RtlZeroMemory(BitmapPtr, BytesNeeded);
+    RtlZeroMemory(BitmapPtr, BitmapBufferSize);
 
-    // Read the existing bitmap data
-    Status = ReadAttribute(DeviceExt, BitmapCtx, 0, (PCHAR)BitmapPtr, BitmapLength);
+    // Read the complete existing bitmap and reject a short read.
+    if (BitmapLength != 0 &&
+        ReadAttribute(DeviceExt, BitmapCtx, 0, (PCHAR)BitmapPtr,
+                      (ULONG)BitmapLength) != (ULONG)BitmapLength)
+    {
+        DPRINT1("Unable to read complete $I30 bitmap attribute\n");
+        ExFreePoolWithTag(BitmapMem, TAG_NTFS);
+        ReleaseAttributeContext(BitmapCtx);
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
 
-    // Initialize bitmap. It has to describe the node we are about to add, so
-    // it needs NextNodeNumber + 1 bits, not NextNodeNumber.
-    RtlInitializeBitMap(&Bitmap, BitmapPtr, NextNodeNumber + 1);
+    // Include existing padding bits as well as the new node bit.
+    RtlInitializeBitMap(&Bitmap, BitmapPtr,
+                        max(BitmapBits, (ULONG)NextNodeNumber + 1));
 
     // Do we need to enlarge the bitmap?
     if (BytesNeeded > BitmapLength)
@@ -255,12 +298,14 @@ AllocateIndexNode(PDEVICE_EXTENSION DeviceExt,
                             BitmapCtx,
                             0,
                             (const PUCHAR)BitmapPtr,
-                            BytesNeeded,
+                            BytesToWrite,
                             &BytesWritten,
                             FileRecord);
-    if (!NT_SUCCESS(Status))
+    if (!NT_SUCCESS(Status) || BytesWritten != BytesToWrite)
     {
-        DPRINT1("ERROR: Unable to write to $I30 bitmap attribute!\n");
+        DPRINT1("ERROR: Unable to write complete $I30 bitmap attribute!\\n");
+        if (NT_SUCCESS(Status))
+            Status = STATUS_DEVICE_DATA_ERROR;
     }
 
     // Calculate VCN of new node number. An index record smaller than a cluster is addressed

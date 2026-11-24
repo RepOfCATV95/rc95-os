@@ -4,10 +4,11 @@
 #include <ntifs.h>
 #include <pseh/pseh2.h>
 #include <section_attribs.h>
+#include <logfile.h>
 
 #define CACHEPAGESIZE(pDeviceExt) \
-	((pDeviceExt)->NtfsInfo.UCHARsPerCluster > PAGE_SIZE ? \
-	 (pDeviceExt)->NtfsInfo.UCHARsPerCluster : PAGE_SIZE)
+	((pDeviceExt)->NtfsInfo.BytesPerCluster > PAGE_SIZE ? \
+	 (pDeviceExt)->NtfsInfo.BytesPerCluster : PAGE_SIZE)
 
 #define TAG_NTFS '0ftN'
 #define TAG_CCB 'CftN'
@@ -146,6 +147,9 @@ typedef struct
 #define VCB_VOLUME_LOCKED       0x0001
 /* Volume dismounted: everything but raw volume access is refused */
 #define VCB_VOLUME_DISMOUNTED   0x0002
+/* $Bitmap I/O failed or completed short; allocation/freeing stays disabled
+ * until the volume is remounted and its on-disk bitmap is reloaded. */
+#define VCB_BITMAP_WRITE_FAILED 0x0004
 
 typedef struct
 {
@@ -179,7 +183,6 @@ typedef struct
     NPAGED_LOOKASIDE_LIST IrpContextLookasideList;
     NPAGED_LOOKASIDE_LIST FcbLookasideList;
     NPAGED_LOOKASIDE_LIST AttrCtxtLookasideList;
-    BOOLEAN EnableWriteSupport;
 } NTFS_GLOBAL_DATA, *PNTFS_GLOBAL_DATA;
 
 
@@ -510,7 +513,7 @@ typedef struct {
 #define NTFS_SPARSE_LBO ((LONGLONG)-1)
 
 /* How many runs a request may span before the run list spills into pool. */
-#define NTFS_MAX_IO_RUNS_ON_STACK 8
+#define NTFS_MAX_IO_RUNS_ON_STACK 16
 
 /* One physically contiguous piece of a transfer. Runs tile the caller's buffer:
  * Runs[i].BufferOffset + Runs[i].ByteCount == Runs[i + 1].BufferOffset. */
@@ -538,7 +541,8 @@ typedef struct _NTFS_IO_CONTEXT
 {
     volatile LONG IrpCount;         /* Runs still in flight */
     volatile LONG Status;           /* First error seen, else STATUS_SUCCESS */
-    volatile LONG BytesTransferred;
+    /* 64-bit accumulator: a legal ULONG-sized transfer can exceed LONG_MAX. */
+    DECLSPEC_ALIGN(8) volatile LONG64 BytesTransferred;
 
     /* Covers the whole transfer; every run cuts a partial MDL from it. Either
      * borrowed from the caller's IRP or built here; we only lock and release
@@ -636,7 +640,9 @@ typedef struct _FIND_ATTR_CONTXT
     PNTFS_ATTRIBUTE_LIST_ITEM NonResidentStart;
     PNTFS_ATTRIBUTE_LIST_ITEM NonResidentEnd;
     PNTFS_ATTRIBUTE_LIST_ITEM NonResidentCur;
+    PNTFS_ATTRIBUTE_LIST_ITEM NonResidentPrevious;
     ULONG Offset;
+    BOOLEAN NonResidentCorrupt;
 } FIND_ATTR_CONTXT, *PFIND_ATTR_CONTXT;
 
 typedef struct
@@ -684,6 +690,23 @@ AddRun(PNTFS_VCB Vcb,
        ULONG RunLength);
 
 NTSTATUS
+NtfsAddSparseRun(PNTFS_VCB Vcb,
+                 PNTFS_ATTR_CONTEXT AttrContext,
+                 ULONG AttrOffset,
+                 PFILE_RECORD_HEADER FileRecord,
+                 ULONGLONG Vcn,
+                 ULONGLONG FirstLcn,
+                 ULONG RunLength);
+
+NTSTATUS
+NtfsAllocateSparseWriteRange(PDEVICE_EXTENSION Vcb,
+                             PNTFS_ATTR_CONTEXT Context,
+                             ULONGLONG Offset,
+                             ULONG Length,
+                             PFILE_RECORD_HEADER FileRecord,
+                             BOOLEAN AllowAllocation);
+
+NTSTATUS
 AddIndexAllocation(PNTFS_VCB Vcb,
                    PFILE_RECORD_HEADER FileRecord,
                    PNTFS_ATTR_RECORD AttributeAddress,
@@ -713,8 +736,17 @@ AddStandardInformation(PFILE_RECORD_HEADER FileRecord,
 
 NTSTATUS
 ConvertDataRunsToLargeMCB(PUCHAR DataRun,
+                          ULONG DataRunLengthBytes,
+                          ULONGLONG InitialLCN,
                           PLARGE_MCB DataRunsMCB,
                           PULONGLONG pNextVBN);
+
+PUCHAR
+DecodeRunBounded(PUCHAR DataRun,
+                 ULONG BytesAvailable,
+                 PLONGLONG DataRunOffset,
+                 PULONGLONG DataRunLength,
+                 PBOOLEAN IsSparse);
 
 NTSTATUS
 ConvertLargeMCBToDataRuns(PLARGE_MCB DataRunsMCB,
@@ -1517,6 +1549,23 @@ NtfsAllocateClusters(PDEVICE_EXTENSION DeviceExt,
 
 ULONGLONG
 NtfsGetFreeClusters(PDEVICE_EXTENSION DeviceExt);
+
+NTSTATUS
+NtfsCalculateBitmapStorageRange(
+    _In_ ULONGLONG StartingLcn,
+    _In_ ULONG ByteCount,
+    _In_ ULONG BitmapSize,
+    _Out_ PULONG ByteOffset);
+
+NTSTATUS
+NtfsCalculateVolumeBitmapRange(
+    _In_ LONGLONG RequestedStart,
+    _In_ ULONGLONG ClusterCount,
+    _In_ ULONG OutputLength,
+    _Out_ PULONGLONG AlignedStart,
+    _Out_ PULONG ByteCount,
+    _Out_ PULONGLONG BitCount,
+    _Out_ PBOOLEAN Overflow);
 
 NTSTATUS
 NtfsLoadVolumeBitmap(

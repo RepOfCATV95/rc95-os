@@ -11,6 +11,13 @@
 #include <debug.h>
 
 #define HIBER_MEMORY_CHUNK_SIZE  (64 * 1024)
+#define HIBER_CHUNK_COMPRESSED 0x80000000UL
+#define HIBER_CHUNK_LENGTH_MASK 0x7FFFFFFFUL
+#define HIBER_LZ_MIN_MATCH 3
+#define HIBER_LZ_MAX_MATCH 18
+#define HIBER_LZ_OFFSET_MASK 0x0FFF
+#define HIBER_LZ_INPUT_CAPACITY (HIBER_MEMORY_CHUNK_SIZE + (HIBER_MEMORY_CHUNK_SIZE / 8) + sizeof(ULONG) + 16)
+
 #if defined(_M_IX86)
 #define HIBER_RESTORE_WINDOW     0xFFC10000
 #define HIBER_RESTORE_PTE_INDEX  ((HIBER_RESTORE_WINDOW - 0xFFC00000) >> MM_PAGE_SHIFT)
@@ -71,6 +78,7 @@ extern VOID NTAPI WinLdrResumeProcessorState(
 static struct _PO_HIBER_IMAGE_HEADER WinLdrHiberHeader;
 static DECLSPEC_ALIGN(16) WINLDR_RESUME_STATE WinLdrResumeState;
 static UCHAR WinLdrHiberBuffer[HIBER_MEMORY_CHUNK_SIZE];
+static UCHAR WinLdrHiberEncodedBuffer[HIBER_LZ_INPUT_CAPACITY];
 
 #define HIBER_TRAMPOLINE_HAS_FPU 0x01
 #define HIBER_TRAMPOLINE_HAS_FX  0x02
@@ -103,6 +111,115 @@ WinLdrHiberReadExact(
     ULONG BytesRead = 0;
     return (ArcRead(FileId, Buffer, Length, &BytesRead) == ESUCCESS) &&
            (BytesRead == Length);
+}
+
+static
+BOOLEAN
+WinLdrHiberDecodeLz(
+    _In_reads_bytes_(InputLength) const UCHAR *Input,
+    _In_ ULONG InputLength,
+    _Out_writes_bytes_(OutputCapacity) UCHAR *Output,
+    _In_ ULONG OutputCapacity,
+    _Out_ PULONG OutputLength
+)
+{
+    ULONG InPos = 0, OutPos = 0;
+
+    if (Input == NULL || Output == NULL || OutputLength == NULL)
+        return FALSE;
+
+    while (InPos < InputLength)
+    {
+        UCHAR Control = Input[InPos++];
+        ULONG Token;
+
+        for (Token = 0; Token < 8 && InPos < InputLength; ++Token)
+        {
+            if (Control & (1u << Token))
+            {
+                USHORT Encoded;
+                ULONG Offset, MatchLength, CopyIndex;
+
+                if (InputLength - InPos < sizeof(Encoded))
+                    return FALSE;
+
+                Encoded = (USHORT)(Input[InPos] |
+                                   ((USHORT)Input[InPos + 1] << 8));
+                InPos += sizeof(Encoded);
+                Offset = (Encoded & HIBER_LZ_OFFSET_MASK) + 1;
+                MatchLength = (Encoded >> 12) + HIBER_LZ_MIN_MATCH;
+
+                if (Offset > OutPos ||
+                    MatchLength > OutputCapacity - OutPos)
+                {
+                    return FALSE;
+                }
+
+                for (CopyIndex = 0; CopyIndex < MatchLength; ++CopyIndex)
+                    Output[OutPos + CopyIndex] =
+                        Output[OutPos + CopyIndex - Offset];
+                OutPos += MatchLength;
+            }
+            else
+            {
+                if (OutPos >= OutputCapacity)
+                    return FALSE;
+                Output[OutPos++] = Input[InPos++];
+            }
+        }
+    }
+
+    *OutputLength = OutPos;
+    return TRUE;
+}
+
+/*
+ * Read and expand one chunk. The high bit of Length selects the LZ extension;
+ * its first ULONG is the original byte count and the remaining bytes are the
+ * bounded LZ token stream. The checksum is always over the expanded bytes.
+ */
+static
+BOOLEAN
+WinLdrHiberDecodeChunk(
+    _In_ const PO_HIBER_MEMORY_CHUNK *Chunk,
+    _In_ ULONG StoredLength,
+    _In_reads_bytes_(StoredLength) const UCHAR *StoredData,
+    _Out_ PULONG OriginalLength
+)
+{
+    ULONG Length;
+
+    if (Chunk->Length & HIBER_CHUNK_COMPRESSED)
+    {
+        if (StoredLength < sizeof(ULONG))
+            return FALSE;
+
+        RtlCopyMemory(&Length, StoredData, sizeof(Length));
+        if (Length == 0 || Length > HIBER_MEMORY_CHUNK_SIZE ||
+            (Length & (MM_PAGE_SIZE - 1)) != 0 ||
+            !WinLdrHiberDecodeLz(StoredData + sizeof(ULONG),
+                                 StoredLength - sizeof(ULONG),
+                                 WinLdrHiberBuffer,
+                                 HIBER_MEMORY_CHUNK_SIZE,
+                                 OriginalLength) ||
+            *OriginalLength != Length)
+        {
+            return FALSE;
+        }
+    }
+    else
+    {
+        if (StoredLength == 0 || StoredLength > HIBER_MEMORY_CHUNK_SIZE ||
+            (StoredLength & (MM_PAGE_SIZE - 1)) != 0)
+        {
+            return FALSE;
+        }
+
+        RtlCopyMemory(WinLdrHiberBuffer, StoredData, StoredLength);
+        *OriginalLength = StoredLength;
+    }
+
+    return TRUE;
 }
 
 static
@@ -328,6 +445,7 @@ WinLdrHiberValidateImage(
         ULONGLONG ChunkEnd;
         ULONGLONG ChunkSize;
         ULONGLONG ExpectedCheckSum;
+        ULONG ChunkOriginalLength;
 
         if (PayloadSize - BytesConsumed < sizeof(Chunk) ||
             !WinLdrHiberReadExact(FileId, &Chunk, sizeof(Chunk)))
@@ -336,10 +454,9 @@ WinLdrHiberValidateImage(
         }
 
         BytesConsumed += sizeof(Chunk);
-        ChunkSize = Chunk.Length;
+        ChunkSize = Chunk.Length & HIBER_CHUNK_LENGTH_MASK;
         if (ChunkSize == 0 ||
-            ChunkSize > HIBER_MEMORY_CHUNK_SIZE ||
-            (ChunkSize & (MM_PAGE_SIZE - 1)) != 0 ||
+            ChunkSize > HIBER_LZ_INPUT_CAPACITY ||
             ChunkSize > PayloadSize - BytesConsumed ||
             Chunk.PhysicalAddress < PreviousEnd ||
 #if defined(_M_IX86)
@@ -351,28 +468,42 @@ WinLdrHiberValidateImage(
             return FALSE;
         }
 
-        ChunkEnd = Chunk.PhysicalAddress + ChunkSize;
-        if (!WinLdrHiberPhysicalRangeValid(MemoryMap,
-                                           MemoryMapEntries,
-                                           Chunk.PhysicalAddress,
-                                           Chunk.Length))
+        if (!WinLdrHiberReadExact(FileId,
+                                  (Chunk.Length & HIBER_CHUNK_COMPRESSED) ?
+                                      WinLdrHiberEncodedBuffer : WinLdrHiberBuffer,
+                                  (ULONG)ChunkSize))
         {
             return FALSE;
         }
 
-        if (!WinLdrHiberReadExact(FileId, WinLdrHiberBuffer, Chunk.Length))
+        if (!WinLdrHiberDecodeChunk(&Chunk,
+                                    (ULONG)ChunkSize,
+                                    (Chunk.Length & HIBER_CHUNK_COMPRESSED) ?
+                                        WinLdrHiberEncodedBuffer : WinLdrHiberBuffer,
+                                    &ChunkOriginalLength))
+        {
             return FALSE;
+        }
+
+        ChunkEnd = Chunk.PhysicalAddress + ChunkOriginalLength;
+        if (!WinLdrHiberPhysicalRangeValid(MemoryMap,
+                                           MemoryMapEntries,
+                                           Chunk.PhysicalAddress,
+                                           ChunkOriginalLength))
+        {
+            return FALSE;
+        }
 
         ExpectedCheckSum =
             (ULONG)Chunk.PhysicalAddress ^
             (ULONG)(Chunk.PhysicalAddress >> 32) ^
-            Chunk.Length ^
-            WinLdrHiberCalculateChecksum(WinLdrHiberBuffer, Chunk.Length);
+            ChunkOriginalLength ^
+            WinLdrHiberCalculateChecksum(WinLdrHiberBuffer, ChunkOriginalLength);
         if ((ULONG)ExpectedCheckSum != Chunk.CheckSum)
             return FALSE;
 
         BytesConsumed += ChunkSize;
-        PagesConsumed += ChunkSize >> MM_PAGE_SHIFT;
+        PagesConsumed += ChunkOriginalLength >> MM_PAGE_SHIFT;
         PreviousEnd = ChunkEnd;
     }
 
@@ -441,34 +572,47 @@ WinLdrHiberRestoreImage(
         }
 
         BytesConsumed += sizeof(Chunk);
-        if (Chunk.Length == 0 ||
-            Chunk.Length > HIBER_MEMORY_CHUNK_SIZE ||
-            (Chunk.Length & (MM_PAGE_SIZE - 1)) != 0 ||
-            Chunk.Length > PayloadSize - BytesConsumed ||
-            (Chunk.PhysicalAddress & (MM_PAGE_SIZE - 1)) != 0 ||
+        {
+            ULONG StoredLength = Chunk.Length & HIBER_CHUNK_LENGTH_MASK;
+            ULONG OriginalLength;
+
+            if (StoredLength == 0 ||
+                StoredLength > HIBER_LZ_INPUT_CAPACITY ||
+                StoredLength > PayloadSize - BytesConsumed ||
+                (Chunk.PhysicalAddress & (MM_PAGE_SIZE - 1)) != 0 ||
 #if defined(_M_IX86)
-            Chunk.PhysicalAddress > 0xFFFFFFFFULL ||
-            Chunk.Length > 0x100000000ULL - Chunk.PhysicalAddress ||
+                Chunk.PhysicalAddress > 0xFFFFFFFFULL ||
 #elif defined(_M_AMD64)
-            Chunk.PhysicalAddress >= HIBER_AMD64_PHYSICAL_LIMIT ||
-            Chunk.Length > HIBER_AMD64_PHYSICAL_LIMIT - Chunk.PhysicalAddress ||
+                Chunk.PhysicalAddress >= HIBER_AMD64_PHYSICAL_LIMIT ||
 #endif
-            !WinLdrHiberReadExact(FileId, WinLdrHiberBuffer, Chunk.Length))
-        {
-            goto Fatal;
-        }
+                !WinLdrHiberReadExact(
+                    FileId,
+                    (Chunk.Length & HIBER_CHUNK_COMPRESSED) ?
+                        WinLdrHiberEncodedBuffer : WinLdrHiberBuffer,
+                    StoredLength) ||
+                !WinLdrHiberDecodeChunk(
+                    &Chunk,
+                    StoredLength,
+                    (Chunk.Length & HIBER_CHUNK_COMPRESSED) ?
+                        WinLdrHiberEncodedBuffer : WinLdrHiberBuffer,
+                    &OriginalLength) ||
+#if defined(_M_IX86)
+                OriginalLength > 0x100000000ULL - Chunk.PhysicalAddress ||
+#elif defined(_M_AMD64)
+                OriginalLength > HIBER_AMD64_PHYSICAL_LIMIT - Chunk.PhysicalAddress ||
+#endif
+                (((ULONG)Chunk.PhysicalAddress ^
+                  (ULONG)(Chunk.PhysicalAddress >> 32) ^
+                  OriginalLength ^
+                  WinLdrHiberCalculateChecksum(WinLdrHiberBuffer,
+                                               OriginalLength)) != Chunk.CheckSum))
+            {
+                goto Fatal;
+            }
 
-        if (((ULONG)Chunk.PhysicalAddress ^
-             (ULONG)(Chunk.PhysicalAddress >> 32) ^
-             Chunk.Length ^
-             WinLdrHiberCalculateChecksum(WinLdrHiberBuffer,
-                                          Chunk.Length)) != Chunk.CheckSum)
-        {
-            goto Fatal;
+            WinLdrHiberMapChunk(Chunk.PhysicalAddress, OriginalLength);
+            BytesConsumed += StoredLength;
         }
-
-        WinLdrHiberMapChunk(Chunk.PhysicalAddress, Chunk.Length);
-        BytesConsumed += Chunk.Length;
     }
 
     if (BytesConsumed != PayloadSize)

@@ -54,6 +54,19 @@ NtfsLoadVolumeBitmap(
     ULONG BufferSize;
     NTSTATUS Status;
 
+    if (DeviceExt == NULL)
+        return STATUS_INVALID_PARAMETER;
+
+    /*
+     * A reload may follow a failed bitmap write or a previous partial load.
+     * Discard every old cached object first so FindAttribute() cannot replace
+     * a live BitmapContext and leak it, and so no stale bitmap descriptor is
+     * observable if the new read fails. NtfsFreeVolumeBitmap() deliberately
+     * preserves VCB_BITMAP_WRITE_FAILED; only the complete load below clears
+     * that latch.
+     */
+    NtfsFreeVolumeBitmap(DeviceExt);
+
     BitmapRecord = ExAllocateFromNPagedLookasideList(&DeviceExt->FileRecLookasideList);
     if (BitmapRecord == NULL)
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -70,12 +83,27 @@ NtfsLoadVolumeBitmap(
     if (!NT_SUCCESS(Status))
     {
         DPRINT1("Unable to find $Bitmap (Status %lx)\n", Status);
-        DeviceExt->BitmapContext = NULL;
+        /*
+         * Keep the failure path self-contained: FindAttribute() currently
+         * clears its output on failure, but teardown must also release any
+         * partially published context if a future lookup path fails after
+         * preparing one.
+         */
+        NtfsFreeVolumeBitmap(DeviceExt);
         return Status;
     }
 
+    if (DeviceExt->BitmapContext == NULL ||
+        DeviceExt->BitmapContext->pRecord == NULL)
+    {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto Fail;
+    }
+
     BitmapSize = AttributeDataLength(DeviceExt->BitmapContext->pRecord);
-    if (BitmapSize > MAXULONG ||
+    if (BitmapSize == 0 ||
+        DeviceExt->NtfsInfo.ClusterCount == 0 ||
+        BitmapSize > MAXULONG ||
         BitmapSize * 8 < DeviceExt->NtfsInfo.ClusterCount ||
         DeviceExt->NtfsInfo.ClusterCount > MAXULONG)
     {
@@ -85,8 +113,23 @@ NtfsLoadVolumeBitmap(
         goto Fail;
     }
 
+    /*
+     * Bitmap I/O is sector aligned.  Validate the geometry and rounding
+     * before allocating the padded buffer; ROUND_UP uses ULONG arithmetic.
+     */
+    if (DeviceExt->NtfsInfo.BytesPerSector == 0 ||
+        (DeviceExt->NtfsInfo.BytesPerSector &
+         (DeviceExt->NtfsInfo.BytesPerSector - 1)) != 0 ||
+        BitmapSize > MAXULONG -
+                     (DeviceExt->NtfsInfo.BytesPerSector - 1))
+    {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto Fail;
+    }
+
     /* Whole sectors, so write back never reads first */
-    BufferSize = ROUND_UP((ULONG)BitmapSize, DeviceExt->NtfsInfo.BytesPerSector);
+    BufferSize = ROUND_UP((ULONG)BitmapSize,
+                          DeviceExt->NtfsInfo.BytesPerSector);
     DeviceExt->BitmapBuffer = ExAllocatePoolWithTag(PagedPool, BufferSize, TAG_NTFS);
     if (DeviceExt->BitmapBuffer == NULL)
     {
@@ -110,6 +153,13 @@ NtfsLoadVolumeBitmap(
     RtlInitializeBitMap(&DeviceExt->ClusterBitmap, DeviceExt->BitmapBuffer, (ULONG)DeviceExt->NtfsInfo.ClusterCount);
     DeviceExt->FreeClusterCount = RtlNumberOfClearBits(&DeviceExt->ClusterBitmap);
 
+    /*
+     * A complete read of the on-disk bitmap re-establishes the authoritative
+     * allocation state.  Clear a prior sticky write-failure state only after
+     * the buffer and bitmap have both been initialized successfully.
+     */
+    DeviceExt->Flags &= ~VCB_BITMAP_WRITE_FAILED;
+
     DPRINT("Volume bitmap loaded: %I64u of %I64u clusters free\n",
            DeviceExt->FreeClusterCount, DeviceExt->NtfsInfo.ClusterCount);
 
@@ -132,6 +182,9 @@ VOID
 NtfsFreeVolumeBitmap(
     _In_ PDEVICE_EXTENSION DeviceExt)
 {
+    if (DeviceExt == NULL)
+        return;
+
     if (DeviceExt->BitmapBuffer != NULL)
     {
         ExFreePoolWithTag(DeviceExt->BitmapBuffer, TAG_NTFS);
@@ -143,6 +196,15 @@ NtfsFreeVolumeBitmap(
         ReleaseAttributeContext(DeviceExt->BitmapContext);
         DeviceExt->BitmapContext = NULL;
     }
+
+    /*
+     * Do not leave a stale RTL bitmap descriptor or size behind after
+     * releasing its backing storage.  The sticky write-failure flag is
+     * intentionally preserved; only a complete subsequent reload clears it.
+     */
+    RtlZeroMemory(&DeviceExt->ClusterBitmap, sizeof(DeviceExt->ClusterBitmap));
+    DeviceExt->BitmapSize = 0;
+    DeviceExt->FreeClusterCount = 0;
 }
 
 /**
@@ -169,24 +231,88 @@ NtfsWriteVolumeBitmap(
     _In_ ULONG FirstCluster,
     _In_ ULONG ClusterCount)
 {
-    ULONG SectorSize = DeviceExt->NtfsInfo.BytesPerSector;
+    ULONG SectorSize;
     ULONG Start;
     ULONG End;
-    ULONG LengthWritten;
+    ULONG BitmapSizeRounded;
+    ULONG LengthWritten = 0;
+    NTSTATUS Status;
 
-    ASSERT(ClusterCount != 0);
+    /*
+     * Validate the cluster range before doing ULONG arithmetic.  The caller
+     * holds BitmapResource, so SizeOfBitMap and the backing buffer remain
+     * stable for the duration of this write.
+     */
+    /* Every caller holds BitmapResource exclusively.  Once a bitmap
+     * write fails or completes short, the on-disk copy may be partially
+     * changed; do not issue further allocation metadata writes until remount.
+     */
+    if (DeviceExt == NULL)
+        return STATUS_INVALID_PARAMETER;
 
+    SectorSize = DeviceExt->NtfsInfo.BytesPerSector;
+
+    if (DeviceExt->Flags & VCB_BITMAP_WRITE_FAILED)
+        return STATUS_DEVICE_DATA_ERROR;
+
+    if (ClusterCount == 0 ||
+        SectorSize == 0 ||
+        (SectorSize & (SectorSize - 1)) != 0 ||
+        DeviceExt->BitmapBuffer == NULL ||
+        DeviceExt->BitmapSize == 0 ||
+        DeviceExt->ClusterBitmap.Buffer != DeviceExt->BitmapBuffer ||
+        DeviceExt->ClusterBitmap.SizeOfBitMap == 0 ||
+        (ULONGLONG)DeviceExt->ClusterBitmap.SizeOfBitMap >
+            (ULONGLONG)DeviceExt->BitmapSize * 8 ||
+        FirstCluster >= DeviceExt->ClusterBitmap.SizeOfBitMap ||
+        ClusterCount > DeviceExt->ClusterBitmap.SizeOfBitMap - FirstCluster ||
+        DeviceExt->BitmapSize > MAXULONG - (SectorSize - 1))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    /*
+     * Compute the padded extent once. Besides avoiding repeated rounding,
+     * retaining it in a local makes the bounds check and end clamp use the
+     * exact same overflow-validated value.
+     */
+    BitmapSizeRounded = ROUND_UP(DeviceExt->BitmapSize, SectorSize);
     Start = ROUND_DOWN(FirstCluster / 8, SectorSize);
     End = ROUND_UP((FirstCluster + ClusterCount - 1) / 8 + 1, SectorSize);
-    End = min(End, ROUND_UP(DeviceExt->BitmapSize, SectorSize));
+    End = min(End, BitmapSizeRounded);
 
-    return WriteAttribute(DeviceExt,
-                          DeviceExt->BitmapContext,
-                          Start,
-                          (PUCHAR)DeviceExt->BitmapBuffer + Start,
-                          End - Start,
-                          &LengthWritten,
-                          NULL);
+    if (Start >= End || End > BitmapSizeRounded ||
+        DeviceExt->BitmapContext == NULL ||
+        DeviceExt->BitmapContext->pRecord == NULL)
+    {
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
+
+    Status = WriteAttribute(DeviceExt,
+                            DeviceExt->BitmapContext,
+                            Start,
+                            (PUCHAR)DeviceExt->BitmapBuffer + Start,
+                            End - Start,
+                            &LengthWritten,
+                            NULL);
+    if (!NT_SUCCESS(Status))
+    {
+        /* The device may have accepted a prefix before reporting failure. */
+        DeviceExt->Flags |= VCB_BITMAP_WRITE_FAILED;
+        return Status;
+    }
+
+    /*
+     * A successful status with a short transfer is not a committed bitmap
+     * update.  The written prefix may have reached disk, so fail closed.
+     */
+    if (LengthWritten != End - Start)
+    {
+        DeviceExt->Flags |= VCB_BITMAP_WRITE_FAILED;
+        return STATUS_DEVICE_DATA_ERROR;
+    }
+
+    return STATUS_SUCCESS;
 }
 
 ULONGLONG
@@ -196,9 +322,26 @@ NtfsGetFreeClusters(PDEVICE_EXTENSION DeviceExt)
 
     DPRINT("NtfsGetFreeClusters(%p)\n", DeviceExt);
 
+    if (DeviceExt == NULL)
+        return 0;
+
     KeEnterCriticalRegion();
     ExAcquireResourceSharedLite(&DeviceExt->BitmapResource, TRUE);
-    FreeClusters = DeviceExt->FreeClusterCount;
+    /*
+     * After an uncertain $Bitmap write, the cached free count no longer
+     * describes a trustworthy on-disk allocation state.  Report no free
+     * space rather than advertising clusters that may already be allocated.
+     */
+    FreeClusters =
+        ((DeviceExt->Flags & VCB_BITMAP_WRITE_FAILED) ||
+         DeviceExt->BitmapBuffer == NULL ||
+         DeviceExt->BitmapSize == 0 ||
+         DeviceExt->ClusterBitmap.Buffer != DeviceExt->BitmapBuffer ||
+         DeviceExt->ClusterBitmap.SizeOfBitMap == 0 ||
+         (ULONGLONG)DeviceExt->ClusterBitmap.SizeOfBitMap >
+             (ULONGLONG)DeviceExt->BitmapSize * 8 ||
+         DeviceExt->FreeClusterCount > DeviceExt->ClusterBitmap.SizeOfBitMap) ?
+        0 : DeviceExt->FreeClusterCount;
     ExReleaseResourceLite(&DeviceExt->BitmapResource);
     KeLeaveCriticalRegion();
 
@@ -217,16 +360,59 @@ NtfsAllocateClusters(PDEVICE_EXTENSION DeviceExt,
                      PULONG AssignedClusters)
 {
     NTSTATUS Status;
-    PRTL_BITMAP Bitmap = &DeviceExt->ClusterBitmap;
+    PRTL_BITMAP Bitmap;
     ULONG AssignedRun;
 
     DPRINT("NtfsAllocateClusters(%p, %lu, %lu, %p, %p)\n", DeviceExt, FirstDesiredCluster, DesiredClusters, FirstAssignedCluster, AssignedClusters);
 
+    if (AssignedClusters == NULL)
+        return STATUS_INVALID_PARAMETER;
+
     *AssignedClusters = 0;
+
+    if (FirstAssignedCluster != NULL)
+        *FirstAssignedCluster = 0;
+
+    if (DeviceExt == NULL ||
+        FirstAssignedCluster == NULL ||
+        DesiredClusters == 0)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    Bitmap = &DeviceExt->ClusterBitmap;
 
     /* Files growing in parallel must not both claim the same free run */
     KeEnterCriticalRegion();
     ExAcquireResourceExclusiveLite(&DeviceExt->BitmapResource, TRUE);
+
+    if (DeviceExt->Flags & VCB_BITMAP_WRITE_FAILED)
+    {
+        Status = STATUS_DEVICE_DATA_ERROR;
+        goto Quit;
+    }
+
+    if (Bitmap->Buffer == NULL ||
+        Bitmap->Buffer != DeviceExt->BitmapBuffer ||
+        DeviceExt->BitmapSize == 0 ||
+        Bitmap->SizeOfBitMap == 0 ||
+        (ULONGLONG)Bitmap->SizeOfBitMap > (ULONGLONG)DeviceExt->BitmapSize * 8 ||
+        DeviceExt->FreeClusterCount > Bitmap->SizeOfBitMap)
+    {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto Quit;
+    }
+
+    /*
+     * Reject impossible requests before calling RTL bitmap helpers.  The
+     * free-cluster counter is advisory state; the bitmap's declared range is
+     * the authoritative bound for every search and set operation.
+     */
+    if (DesiredClusters > Bitmap->SizeOfBitMap)
+    {
+        Status = STATUS_DISK_FULL;
+        goto Quit;
+    }
 
     if (DeviceExt->FreeClusterCount < DesiredClusters)
     {

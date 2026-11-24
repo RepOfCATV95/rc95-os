@@ -14,6 +14,9 @@ extern "C" {
 #define NTFS_LOGFILE_RECORD_PAGE_HEADER_MIN 0x20
 #define NTFS_LOGFILE_RESTART_HEADER_MIN 0x20
 #define NTFS_LOGFILE_RESTART_AREA_MIN   0x30
+#define NTFS_LOGFILE_CLIENT_ENTRY_SIZE  0xA0
+#define NTFS_LOGFILE_CLIENT_NAME_BYTES  128
+#define NTFS_LOGFILE_NTFS_OPERATION_HEADER_SIZE 0x20
 #define NTFS_LOGFILE_NO_CLIENT          0xFFFFFFFFUL
 typedef enum _NTFS_LFS_FORMAT { NtfsLfsUnknown=0, NtfsLfsVersion1=1, NtfsLfsVersion2=2 } NTFS_LFS_FORMAT;
 typedef struct _NTFS_LOGFILE_RESTART_VIEW {
@@ -22,10 +25,79 @@ typedef struct _NTFS_LOGFILE_RESTART_VIEW {
 } NTFS_LOGFILE_RESTART_VIEW, *PNTFS_LOGFILE_RESTART_VIEW;
 typedef struct _NTFS_LOGFILE_RESTART_AREA_VIEW {
  const UCHAR *Buffer; ULONG Length; ULONGLONG CurrentLsn; ULONG LogClients; ULONG FreeList;
- ULONG InUseList; ULONG Flags; USHORT SequenceNumberBits; ULONG RestartAreaLength;
+ ULONG InUseList; USHORT Flags; ULONG SequenceNumberBits; ULONG RestartAreaLength;
  ULONG ClientArrayOffset; ULONGLONG FileSize; ULONG LastLsnDataLength;
  USHORT RecordHeaderLength; USHORT LogPageDataOffset;
+ ULONG RestartLogOpenCount; ULONG Reserved;
 } NTFS_LOGFILE_RESTART_AREA_VIEW, *PNTFS_LOGFILE_RESTART_AREA_VIEW;
+
+/* Decoded view of one native 0xA0-byte restart client record. */
+typedef struct _NTFS_LOGFILE_CLIENT_ENTRY_VIEW
+{
+    ULONGLONG OldestLsn;
+    ULONGLONG ClientRestartLsn;
+    USHORT PreviousClient;
+    USHORT NextClient;
+    USHORT SequenceNumber;
+    UCHAR Reserved[6];
+    ULONG ClientNameLength;
+    UCHAR ClientName[NTFS_LOGFILE_CLIENT_NAME_BYTES];
+} NTFS_LOGFILE_CLIENT_ENTRY_VIEW, *PNTFS_LOGFILE_CLIENT_ENTRY_VIEW;
+
+/* Raw NTFS client-operation envelope; offsets address client-data bytes.
+ * This view does not assign redo/undo semantics to operation numbers. */
+typedef struct _NTFS_LOGFILE_NTFS_OPERATION_VIEW
+{
+    USHORT RedoOperation;
+    USHORT UndoOperation;
+    USHORT RedoOffset;
+    USHORT RedoLength;
+    USHORT UndoOffset;
+    USHORT UndoLength;
+    USHORT TargetAttribute;
+    USHORT LcnsToFollow;
+    USHORT RecordOffset;
+    USHORT AttributeOffset;
+    ULONGLONG TargetVcn;
+    const UCHAR *RedoData;
+    const UCHAR *UndoData;
+    /* LCN entries are little-endian 64-bit values in on-disk order. */
+    const UCHAR *LcnList;
+    ULONG ClientDataLength;
+} NTFS_LOGFILE_NTFS_OPERATION_VIEW, *PNTFS_LOGFILE_NTFS_OPERATION_VIEW;
+
+typedef enum _NTFS_LOGFILE_TRANSACTION_ACTION
+{
+    NtfsLogfileTransactionBegin = 1,
+    NtfsLogfileTransactionUpdate = 2,
+    NtfsLogfileTransactionCommit = 3,
+    NtfsLogfileTransactionAbort = 4
+} NTFS_LOGFILE_TRANSACTION_ACTION;
+
+typedef enum _NTFS_LOGFILE_TRANSACTION_STATE
+{
+    NtfsLogfileTransactionActive = 1,
+    NtfsLogfileTransactionCommitted = 2,
+    NtfsLogfileTransactionAborted = 3
+} NTFS_LOGFILE_TRANSACTION_STATE;
+
+typedef struct _NTFS_LOGFILE_TRANSACTION_EVENT
+{
+    ULONGLONG Lsn;
+    ULONG TransactionId;
+    ULONG ClientIndex;
+    NTFS_LOGFILE_TRANSACTION_ACTION Action;
+} NTFS_LOGFILE_TRANSACTION_EVENT, *PNTFS_LOGFILE_TRANSACTION_EVENT;
+
+typedef struct _NTFS_LOGFILE_TRANSACTION_STATE_VIEW
+{
+    ULONG TransactionId;
+    ULONG ClientIndex;
+    NTFS_LOGFILE_TRANSACTION_STATE State;
+    ULONGLONG FirstLsn;
+    ULONGLONG LastLsn;
+    ULONG RecordCount;
+} NTFS_LOGFILE_TRANSACTION_STATE_VIEW, *PNTFS_LOGFILE_TRANSACTION_STATE_VIEW;
 
 typedef struct _NTFS_LOGFILE_RECORD_PAGE_VIEW
 {
@@ -82,7 +154,37 @@ NTSTATUS NTAPI NtfsLogfileOpenRestartPage(_In_reads_bytes_(PageLength) const VOI
  _Out_ PNTFS_LOGFILE_RESTART_VIEW View);
 NTSTATUS NTAPI NtfsLogfileOpenRestartArea(_In_ const NTFS_LOGFILE_RESTART_VIEW *Restart,
  _Out_ PNTFS_LOGFILE_RESTART_AREA_VIEW Area);
+/* Select the newer of two already-validated restart areas (0 wins exact ties). */
+NTSTATUS NTAPI NtfsLogfileSelectRestartArea(
+ _In_ const NTFS_LOGFILE_RESTART_AREA_VIEW *First,
+ _In_ const NTFS_LOGFILE_RESTART_AREA_VIEW *Second,
+ _Out_ PULONG SelectedIndex);
 
+NTSTATUS NTAPI NtfsLogfileReadClientTable(
+ _In_ const NTFS_LOGFILE_RESTART_AREA_VIEW *Area,
+ _Out_writes_(EntryCapacity) NTFS_LOGFILE_CLIENT_ENTRY_VIEW *Entries,
+ _In_ ULONG EntryCapacity, _Out_ PULONG EntriesRead);
+NTSTATUS NTAPI NtfsLogfileValidateClientLinks(
+ _In_reads_(ClientCount) const NTFS_LOGFILE_CLIENT_ENTRY_VIEW *Entries,
+ _In_ ULONG ClientCount);
+/* Validate free/in-use list topology and require each client exactly once. */
+NTSTATUS NTAPI NtfsLogfileValidateClientLists(
+ _In_ const NTFS_LOGFILE_RESTART_AREA_VIEW *Area,
+ _In_reads_(ClientCount) const NTFS_LOGFILE_CLIENT_ENTRY_VIEW *Entries,
+ _In_ ULONG ClientCount);
+/* Decode the NTFS-specific client-data envelope; no metadata replay occurs. */
+NTSTATUS NTAPI NtfsLogfileDecodeNtfsOperation(
+ _In_ const NTFS_LOGFILE_ASSEMBLED_RECORD *Record,
+ _Out_ PNTFS_LOGFILE_NTFS_OPERATION_VIEW Operation);
+NTSTATUS NTAPI NtfsLogfileReadOperationLcn(
+ _In_ const NTFS_LOGFILE_NTFS_OPERATION_VIEW *Operation,
+ _In_ ULONG Index, _Out_ PULONGLONG Lcn);
+/* Events, States, and StatesWritten must refer to disjoint memory ranges. */
+NTSTATUS NTAPI NtfsLogfileAnalyzeTransactionEvents(
+ _In_reads_(EventCount) const NTFS_LOGFILE_TRANSACTION_EVENT *Events,
+ _In_ ULONG EventCount, _In_ ULONG ClientCount,
+ _Out_writes_(StateCapacity) NTFS_LOGFILE_TRANSACTION_STATE_VIEW *States,
+ _In_ ULONG StateCapacity, _Out_ PULONG StatesWritten);
 NTSTATUS NTAPI NtfsLogfileOpenRecordPage(
  _In_reads_bytes_(PageLength) const VOID *Page, _In_ ULONG PageLength,
  _In_ ULONG BytesPerSector, _In_ ULONG DataOffset,
@@ -124,7 +226,7 @@ NTSTATUS NTAPI NtfsLogfileAdvanceCircularOffset(_In_ ULONGLONG Offset, _In_ ULON
  _In_ ULONGLONG RegionStart, _In_ ULONGLONG RegionLength, _In_ ULONGLONG FileSize,
  _Out_ PULONGLONG Result);
 NTSTATUS NTAPI NtfsLogfileCompareLsn(_In_ ULONGLONG FirstLsn, _In_ ULONGLONG SecondLsn,
- _In_ USHORT SequenceNumberBits, _Out_ PLONG Comparison);
+ _In_ ULONG SequenceNumberBits, _Out_ PLONG Comparison);
 NTSTATUS NTAPI NtfsLogfileValidateClientReference(_In_ ULONG ClientIndex, _In_ ULONG ClientCount);
 NTSTATUS NTAPI NtfsLogfileValidateTransactionChains(
  _In_reads_(LinkCount) const NTFS_LOGFILE_TRANSACTION_LINK *Links,
