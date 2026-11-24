@@ -1,5 +1,5 @@
 /*
- * PROJECT:     ReactOS Kernel
+ * PROJECT:     RC95-OS Kernel
  * LICENSE:     GPL-2.0-or-later (https://spdx.org/licenses/GPL-2.0-or-later)
  * PURPOSE:     Boot Theme & Animation
  * COPYRIGHT:   Copyright 2007 Alex Ionescu (alex.ionescu@reactos.org)
@@ -7,7 +7,7 @@
  *              Copyright 2012-2022 Hermès Bélusca-Maïto
  *              Copyright 2017-2018 Stanislav Motylkov
  *              Copyright 2019-2020 Yaroslav Kibysh
- *              Copyright 1997-2027 Republic of CATV 95 (catv95@gmail.com)
+ *              Copyright 1997-2028 Republic of CATV 95 (catv95@gmail.com)
  */
 
 /* INCLUDES ******************************************************************/
