@@ -724,6 +724,8 @@ HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList","Public",0x00020
 ; Font substitutes
 HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts",,0x00000012
 HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontSubstitutes",,0x00000012
+HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontSubstitutes","Lelawadee",0x00000000,"Noto Sans"
+HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontSubstitutes","Lelawadee Bold",0x00000000,"Noto Sans Bold"
 HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontSubstitutes","Segoe UI",0x00000000,"Selawik"
 HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontSubstitutes","Segoe UI Light",0x00000000,"Selawik Light"
 HKLM,"SOFTWARE\Microsoft\Windows NT\CurrentVersion\FontSubstitutes","Segoe UI Semilight",0x00000000,"Selawik Semilight"
