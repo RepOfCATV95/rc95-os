@@ -779,6 +779,14 @@ PopHiberSystemHandler(
      * the image is written through the file system at PASSIVE_LEVEL, as
      * before. This has to be done now, it needs PASSIVE_LEVEL.
      */
+    /*
+     * PopDumpStackInitialize deliberately rejects Btrfs volumes with more
+     * than one member.  The filesystem's GET_HIBER_MAPPING ABI describes
+     * chunk stripes, but the legacy polled ATA writer below still has a
+     * single-disk target and cannot safely emit RAID0/10 or parity writes.
+     * On rejection, keep the ordinary filesystem-mediated write path; never
+     * reinterpret a member-local LCN as a volume-wide physical address.
+     */
     UseDumpStack = NT_SUCCESS(PopDumpStackInitialize(Context));
 
     /*

@@ -36,6 +36,13 @@ InbvAcquireDisplayOwnership(
     VOID
 );
 
+/* Relinquish boot-video ownership without replacing the video-port reset callback. */
+VOID
+NTAPI
+InbvSetDisplayOwnership(
+    _In_ BOOLEAN DisplayOwned
+);
+
 BOOLEAN
 NTAPI
 InbvCheckDisplayOwnership(

@@ -5005,6 +5005,325 @@ static NTSTATUS fsctl_oplock(device_extension* Vcb, PIRP* Pirp) {
     return Status;
 }
 
+/*
+ * FSCTL_GET_RETRIEVAL_POINTERS returns LCNs in allocation-unit (BTRFS
+ * sector-size) units.  The hibernation dump writer converts those LCNs to
+ * 512-byte sectors using FILE_FS_SIZE_INFORMATION.SectorsPerAllocationUnit
+ * and adds the partition start.  Therefore this routine must return a
+ * partition-relative BTRFS allocation-unit number, never an absolute disk
+ * sector or a 512-byte sector number.
+ */
+/*
+ * Resolve a BTRFS logical extent to an allocation-unit LCN that the
+ * single-device hibernation dump writer can address.  SINGLE chunks and
+ * mirrored chunks are supported when one of their stripes resides on the
+ * mounted volume's real device.  Striping/parity profiles are deliberately
+ * rejected because their logical-to-physical mapping cannot be represented
+ * by one linear LCN run.
+ */
+static bool get_hiberfile_disk_cluster(device_extension* Vcb, uint64_t address, uint64_t length, uint64_t* lcn) {
+    LIST_ENTRY* le;
+    bool found = false;
+    const uint64_t profile_mask = BLOCK_FLAG_RAID0 | BLOCK_FLAG_RAID1 | BLOCK_FLAG_DUPLICATE |
+                                  BLOCK_FLAG_RAID10 | BLOCK_FLAG_RAID5 | BLOCK_FLAG_RAID6 |
+                                  BLOCK_FLAG_RAID1C3 | BLOCK_FLAG_RAID1C4;
+    uint64_t sector_size;
+
+    if (!lcn || length == 0 || !Vcb->superblock.sector_size || Vcb->readonly ||
+        !Vcb->Vpb || !Vcb->Vpb->RealDevice)
+        return false;
+
+    sector_size = Vcb->superblock.sector_size;
+
+    ExAcquireResourceSharedLite(&Vcb->chunk_lock, true);
+
+    le = Vcb->chunks.Flink;
+    while (le != &Vcb->chunks) {
+        chunk* c = CONTAINING_RECORD(le, chunk, list_entry);
+        uint64_t chunk_end;
+        uint64_t profile;
+        uint16_t stripe_count, stripe_index;
+
+        if (!c->chunk_item || c->size < sizeof(CHUNK_ITEM) ||
+            c->chunk_item->size > UINT64_MAX - c->offset)
+            break;
+
+        chunk_end = c->offset + c->chunk_item->size;
+        if (address >= c->offset && address < chunk_end) {
+            if (c->chunk_item->sector_size != sector_size ||
+                length > chunk_end - address)
+                break;
+
+            stripe_count = c->chunk_item->num_stripes;
+            if (stripe_count == 0 ||
+                stripe_count > (c->size - sizeof(CHUNK_ITEM)) / sizeof(CHUNK_ITEM_STRIPE) ||
+                !c->devices)
+                break;
+
+            profile = c->chunk_item->type & profile_mask;
+
+            /* Only profiles whose each mirror contains the complete logical range. */
+            if (profile == 0) {
+                if (stripe_count != 1)
+                    break;
+            } else if (profile == BLOCK_FLAG_DUPLICATE || profile == BLOCK_FLAG_RAID1) {
+                if (stripe_count < 2)
+                    break;
+            } else if (profile == BLOCK_FLAG_RAID1C3) {
+                if (stripe_count < 3)
+                    break;
+            } else if (profile == BLOCK_FLAG_RAID1C4) {
+                if (stripe_count < 4)
+                    break;
+            } else {
+                /* RAID0/10/5/6 and combined/unknown profiles are not linear. */
+                break;
+            }
+
+            for (stripe_index = 0; stripe_index < stripe_count; stripe_index++) {
+                CHUNK_ITEM_STRIPE* stripe = (CHUNK_ITEM_STRIPE*)&c->chunk_item[1] + stripe_index;
+                device* dev = c->devices[stripe_index];
+                uint64_t physical;
+
+                if (!dev || !dev->devobj || dev->devobj != Vcb->Vpb->RealDevice ||
+                    dev->readonly || dev->seeding ||
+                    dev->devitem.dev_id != stripe->dev_id ||
+                    RtlCompareMemory(&dev->devitem.device_uuid, &stripe->dev_uuid, sizeof(BTRFS_UUID)) != sizeof(BTRFS_UUID) ||
+                    dev->devitem.sector_size != sector_size ||
+                    address - c->offset > UINT64_MAX - stripe->offset)
+                    continue;
+
+                physical = stripe->offset + (address - c->offset);
+
+                if ((physical % sector_size) != 0 || (length % sector_size) != 0 ||
+                    physical > dev->size || length > dev->size - physical ||
+                    (physical >> Vcb->sector_shift) > MAXLONGLONG)
+                    continue;
+
+                *lcn = physical >> Vcb->sector_shift;
+                found = true;
+                break;
+            }
+
+            break;
+        }
+
+        le = le->Flink;
+    }
+
+    ExReleaseResourceLite(&Vcb->chunk_lock);
+    return found;
+}
+
+/*
+ * Describe one Btrfs logical segment using its complete chunk geometry and
+ * stable member identities. A caller repeats the query at each chunk/stripe
+ * boundary. The interface can represent RAID0/10 and parity layouts without
+ * lying about a single contiguous LCN; the dump writer remains responsible
+ * for profile-specific placement, mirroring, and parity generation.
+ */
+static NTSTATUS get_hiber_mapping(device_extension* Vcb, btrfs_hiber_mapping_request* in,
+                                  ULONG inlen, btrfs_hiber_mapping* out, ULONG outlen,
+                                  ULONG_PTR* retlen) {
+    LIST_ENTRY* le;
+    NTSTATUS Status = STATUS_NOT_FOUND;
+
+    if (!in || !out || !retlen || inlen < sizeof(*in))
+        return STATUS_INVALID_PARAMETER;
+
+    *retlen = 0;
+
+    if (in->size != sizeof(*in) || in->version != BTRFS_HIBER_MAPPING_VERSION ||
+        in->flags != 0 || in->reserved != 0 || in->length == 0 ||
+        in->logical_address > UINT64_MAX - in->length ||
+        !Vcb->superblock.sector_size ||
+        (in->logical_address % Vcb->superblock.sector_size) != 0 ||
+        (in->length % Vcb->superblock.sector_size) != 0)
+        return STATUS_INVALID_PARAMETER;
+
+    ExAcquireResourceSharedLite(&Vcb->tree_lock, true);
+    ExAcquireResourceSharedLite(&Vcb->chunk_lock, true);
+
+    for (le = Vcb->chunks.Flink; le != &Vcb->chunks; le = le->Flink) {
+        chunk* c = CONTAINING_RECORD(le, chunk, list_entry);
+        uint64_t chunk_end, segment_length, profile;
+        uint16_t count, i;
+        ULONG required;
+        bool valid_profile;
+
+        if (!c->chunk_item || c->size < sizeof(CHUNK_ITEM) ||
+            c->chunk_item->size == 0 ||
+            c->chunk_item->size > UINT64_MAX - c->offset)
+            continue;
+
+        chunk_end = c->offset + c->chunk_item->size;
+        if (in->logical_address < c->offset || in->logical_address >= chunk_end)
+            continue;
+
+        count = c->chunk_item->num_stripes;
+        if (!count ||
+            count > (c->size - sizeof(CHUNK_ITEM)) / sizeof(CHUNK_ITEM_STRIPE) ||
+            !c->devices) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            break;
+        }
+
+        {
+            const uint64_t profile_mask = BLOCK_FLAG_RAID0 | BLOCK_FLAG_RAID1 | BLOCK_FLAG_DUPLICATE |
+                                          BLOCK_FLAG_RAID10 | BLOCK_FLAG_RAID5 | BLOCK_FLAG_RAID6 |
+                                          BLOCK_FLAG_RAID1C3 | BLOCK_FLAG_RAID1C4;
+            profile = c->chunk_item->type & profile_mask;
+        }
+
+        /*
+         * sub_stripes is meaningful for RAID10. Other profiles do not use
+         * it for placement, and on-disk producers may store a nonzero default.
+         */
+        valid_profile =
+            (profile == 0 && count == 1) ||
+            ((profile == BLOCK_FLAG_DUPLICATE || profile == BLOCK_FLAG_RAID1) && count >= 2) ||
+            (profile == BLOCK_FLAG_RAID0 && count >= 2) ||
+            (profile == BLOCK_FLAG_RAID10 && count >= 4 && c->chunk_item->sub_stripes >= 2 &&
+             (count % c->chunk_item->sub_stripes) == 0) ||
+            (profile == BLOCK_FLAG_RAID5 && count >= 2) ||
+            (profile == BLOCK_FLAG_RAID6 && count >= 3) ||
+            (profile == BLOCK_FLAG_RAID1C3 && count >= 3) ||
+            (profile == BLOCK_FLAG_RAID1C4 && count >= 4);
+
+        if (!valid_profile || !c->chunk_item->sector_size ||
+            c->chunk_item->sector_size != Vcb->superblock.sector_size ||
+            !c->chunk_item->stripe_length ||
+            (c->chunk_item->stripe_length % c->chunk_item->sector_size) != 0 ||
+            (c->offset % c->chunk_item->sector_size) != 0) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            break;
+        }
+
+        if ((ULONG)count > (MAXULONG - (ULONG)offsetof(btrfs_hiber_mapping, stripes)) /
+                           (ULONG)sizeof(btrfs_hiber_mapping_stripe)) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            break;
+        }
+
+        required = (ULONG)offsetof(btrfs_hiber_mapping, stripes) +
+                   (ULONG)count * sizeof(btrfs_hiber_mapping_stripe);
+        if (outlen < required) {
+            *retlen = required;
+            Status = STATUS_BUFFER_TOO_SMALL;
+            break;
+        }
+
+        {
+            uint64_t delta = in->logical_address - c->offset;
+            uint64_t stripe_remaining = c->chunk_item->stripe_length -
+                                        (delta % c->chunk_item->stripe_length);
+            uint64_t chunk_remaining = chunk_end - in->logical_address;
+
+            segment_length = min(in->length, min(chunk_remaining, stripe_remaining));
+            if (segment_length == 0 ||
+                (segment_length % c->chunk_item->sector_size) != 0) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                break;
+            }
+        }
+
+        RtlZeroMemory(out, required);
+        out->size = required;
+        out->stripe_count = count;
+        out->logical_address = in->logical_address;
+        out->segment_length = segment_length;
+        out->chunk_logical = c->offset;
+        out->chunk_length = c->chunk_item->size;
+        out->stripe_length = c->chunk_item->stripe_length;
+        out->chunk_type = c->chunk_item->type;
+        out->sector_size = c->chunk_item->sector_size;
+        out->sub_stripes = c->chunk_item->sub_stripes;
+        out->version = BTRFS_HIBER_MAPPING_VERSION;
+        out->header_size = (ULONG)offsetof(btrfs_hiber_mapping, stripes);
+
+        {
+            uint64_t data_stripes, stripe_set_bytes, stripe_sets, member_span;
+
+            if (profile == BLOCK_FLAG_RAID0)
+                data_stripes = count;
+            else if (profile == BLOCK_FLAG_RAID10)
+                data_stripes = count / c->chunk_item->sub_stripes;
+            else if (profile == BLOCK_FLAG_RAID5)
+                data_stripes = count - 1;
+            else if (profile == BLOCK_FLAG_RAID6)
+                data_stripes = count - 2;
+            else
+                data_stripes = 1;
+
+            if (data_stripes == 0 ||
+                data_stripes > UINT64_MAX / c->chunk_item->stripe_length) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                break;
+            }
+
+            stripe_set_bytes = data_stripes * c->chunk_item->stripe_length;
+            stripe_sets = c->chunk_item->size / stripe_set_bytes;
+            if ((c->chunk_item->size % stripe_set_bytes) != 0)
+                stripe_sets++;
+            if (stripe_sets > UINT64_MAX / c->chunk_item->stripe_length) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                break;
+            }
+            member_span = stripe_sets * c->chunk_item->stripe_length;
+
+            for (i = 0; i < count; i++) {
+                CHUNK_ITEM_STRIPE* stripe = (CHUNK_ITEM_STRIPE*)&c->chunk_item[1] + i;
+                device* dev = c->devices[i];
+                btrfs_hiber_mapping_stripe* dst = &out->stripes[i];
+
+                if (stripe->dev_id == 0 || stripe->offset == UINT64_MAX ||
+                    (stripe->offset % c->chunk_item->sector_size) != 0) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    break;
+                }
+
+                dst->devid = stripe->dev_id;
+                dst->device_uuid = stripe->dev_uuid;
+                dst->physical_offset = stripe->offset;
+
+                if (!dev || !dev->devobj) {
+                    dst->flags |= BTRFS_HIBER_STRIPE_MISSING;
+                    out->flags |= BTRFS_HIBER_MAPPING_FLAG_MISSING |
+                                  BTRFS_HIBER_MAPPING_FLAG_DEGRADED;
+                    continue;
+                }
+
+                if (dev->devitem.dev_id != stripe->dev_id ||
+                    RtlCompareMemory(&dev->devitem.device_uuid, &stripe->dev_uuid,
+                                     sizeof(BTRFS_UUID)) != sizeof(BTRFS_UUID) ||
+                    stripe->offset > dev->size ||
+                    member_span > dev->size - stripe->offset) {
+                    Status = STATUS_FILE_CORRUPT_ERROR;
+                    break;
+                }
+
+                dst->device_size = dev->size;
+                if (dev->readonly) {
+                    dst->flags |= BTRFS_HIBER_STRIPE_READONLY;
+                    out->flags |= BTRFS_HIBER_MAPPING_FLAG_READONLY;
+                }
+                if (dev->seeding)
+                    dst->flags |= BTRFS_HIBER_STRIPE_SEEDING;
+            }
+        }
+
+        if (i == count) {
+            *retlen = required;
+            Status = STATUS_SUCCESS;
+        }
+        break;
+    }
+
+    ExReleaseResourceLite(&Vcb->chunk_lock);
+    ExReleaseResourceLite(&Vcb->tree_lock);
+    return Status;
+}
+
 static NTSTATUS get_retrieval_pointers(device_extension* Vcb, PFILE_OBJECT FileObject, STARTING_VCN_INPUT_BUFFER* in,
                                        ULONG inlen, RETRIEVAL_POINTERS_BUFFER* out, ULONG outlen, ULONG_PTR* retlen) {
     NTSTATUS Status;
@@ -5013,78 +5332,113 @@ static NTSTATUS get_retrieval_pointers(device_extension* Vcb, PFILE_OBJECT FileO
     TRACE("get_retrieval_pointers(%p, %p, %p, %lx, %p, %lx, %p)\n", Vcb, FileObject, in, inlen,
                                                                     out, outlen, retlen);
 
-    if (!FileObject)
+    if (!FileObject || !in || !out || !retlen)
         return STATUS_INVALID_PARAMETER;
+
+    *retlen = 0;
+    out->ExtentCount = 0;
 
     fcb = FileObject->FsContext;
 
-    if (!fcb)
+    if (!fcb || fcb->ads || fcb->type != BTRFS_TYPE_FILE)
         return STATUS_INVALID_PARAMETER;
 
     if (inlen < sizeof(STARTING_VCN_INPUT_BUFFER) || in->StartingVcn.QuadPart < 0)
         return STATUS_INVALID_PARAMETER;
 
-    if (!out)
-        return STATUS_INVALID_PARAMETER;
-
     if (outlen < offsetof(RETRIEVAL_POINTERS_BUFFER, Extents[0]))
         return STATUS_BUFFER_TOO_SMALL;
+
+    if (!Vcb->superblock.sector_size || Vcb->sector_shift >= 64 ||
+        (1ULL << Vcb->sector_shift) != Vcb->superblock.sector_size)
+        return STATUS_FILE_CORRUPT_ERROR;
 
     ExAcquireResourceSharedLite(fcb->Header.Resource, true);
 
     _SEH2_TRY {
         LIST_ENTRY* le = fcb->extents.Flink;
         extent* first_ext = NULL;
-        unsigned int num_extents = 0, first_extent_num = 0, i;
+        unsigned int i;
         uint64_t num_sectors, last_off = 0;
+
+        if (fcb->inode_item.st_size > UINT64_MAX - (Vcb->superblock.sector_size - 1)) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE;
+        }
 
         num_sectors = (fcb->inode_item.st_size + Vcb->superblock.sector_size - 1) >> Vcb->sector_shift;
 
+        if (num_sectors > MAXLONGLONG) {
+            Status = STATUS_FILE_CORRUPT_ERROR;
+            _SEH2_LEAVE;
+        }
+
+        if ((uint64_t)in->StartingVcn.QuadPart >= num_sectors) {
+            Status = STATUS_END_OF_FILE;
+            _SEH2_LEAVE;
+        }
+
+        /* Find the allocated extent containing StartingVcn and validate order. */
         while (le != &fcb->extents) {
             extent* ext = CONTAINING_RECORD(le, extent, list_entry);
+            uint64_t extent_end;
 
             if (ext->ignore || ext->extent_data.type == EXTENT_TYPE_INLINE) {
                 le = le->Flink;
                 continue;
             }
 
-            if (ext->offset > last_off)
-                num_extents++;
-
-            if ((ext->offset >> Vcb->sector_shift) <= (uint64_t)in->StartingVcn.QuadPart &&
-                (ext->offset + ext->extent_data.decoded_size) >> Vcb->sector_shift > (uint64_t)in->StartingVcn.QuadPart) {
-                first_ext = ext;
-                first_extent_num = num_extents;
+            if (ext->extent_data.decoded_size > UINT64_MAX - ext->offset || ext->offset < last_off ||
+                (ext->offset % Vcb->superblock.sector_size) != 0 ||
+                (ext->extent_data.decoded_size % Vcb->superblock.sector_size) != 0) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
             }
 
-            num_extents++;
+            extent_end = ext->offset + ext->extent_data.decoded_size;
 
-            last_off = ext->offset + ext->extent_data.decoded_size;
+            /*
+             * Start at the extent containing StartingVcn, or at the first
+             * later extent when the requested VCN lies in a sparse hole.
+             * The latter case must emit the leading sparse run, not EOF.
+             */
+            if (!first_ext &&
+                (extent_end >> Vcb->sector_shift) > (uint64_t)in->StartingVcn.QuadPart)
+                first_ext = ext;
 
+            last_off = extent_end;
             le = le->Flink;
         }
 
-        if (num_sectors > last_off >> Vcb->sector_shift)
-            num_extents++;
-
-        if (!first_ext) {
-            Status = STATUS_END_OF_FILE;
-            _SEH2_LEAVE;
-        }
-
-        out->ExtentCount = num_extents - first_extent_num;
-        out->StartingVcn.QuadPart = first_ext->offset >> Vcb->sector_shift;
+        out->ExtentCount = 0;
+        out->StartingVcn.QuadPart = in->StartingVcn.QuadPart;
         outlen -= offsetof(RETRIEVAL_POINTERS_BUFFER, Extents[0]);
         *retlen = offsetof(RETRIEVAL_POINTERS_BUFFER, Extents[0]);
 
-        le = &first_ext->list_entry;
+        le = first_ext ? &first_ext->list_entry : &fcb->extents;
         i = 0;
-        last_off = 0;
+        last_off = (uint64_t)in->StartingVcn.QuadPart << Vcb->sector_shift;
 
         while (le != &fcb->extents) {
             extent* ext = CONTAINING_RECORD(le, extent, list_entry);
+            uint64_t extent_end;
 
             if (ext->ignore || ext->extent_data.type == EXTENT_TYPE_INLINE) {
+                le = le->Flink;
+                continue;
+            }
+
+            if (ext->extent_data.decoded_size > UINT64_MAX - ext->offset ||
+                (ext->offset % Vcb->superblock.sector_size) != 0 ||
+                (ext->extent_data.decoded_size % Vcb->superblock.sector_size) != 0) {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                _SEH2_LEAVE;
+            }
+
+            extent_end = ext->offset + ext->extent_data.decoded_size;
+
+            if (extent_end <= last_off)
+            {
                 le = le->Flink;
                 continue;
             }
@@ -5101,6 +5455,7 @@ static NTSTATUS get_retrieval_pointers(device_extension* Vcb, PFILE_OBJECT FileO
                 outlen -= sizeof(LARGE_INTEGER) + sizeof(LARGE_INTEGER);
                 *retlen += sizeof(LARGE_INTEGER) + sizeof(LARGE_INTEGER);
                 i++;
+                out->ExtentCount = i;
             }
 
             if (outlen < sizeof(LARGE_INTEGER) + sizeof(LARGE_INTEGER)) {
@@ -5108,23 +5463,47 @@ static NTSTATUS get_retrieval_pointers(device_extension* Vcb, PFILE_OBJECT FileO
                 _SEH2_LEAVE;
             }
 
-            out->Extents[i].NextVcn.QuadPart = (ext->offset + ext->extent_data.decoded_size) >> Vcb->sector_shift;
+            out->Extents[i].NextVcn.QuadPart = extent_end >> Vcb->sector_shift;
 
-            if (ext->extent_data.compression == BTRFS_COMPRESSION_NONE) {
+            if ((ext->extent_data.type == EXTENT_TYPE_REGULAR || ext->extent_data.type == EXTENT_TYPE_PREALLOC) &&
+                ext->extent_data.compression == BTRFS_COMPRESSION_NONE &&
+                ext->extent_data.encryption == BTRFS_ENCRYPTION_NONE &&
+                ext->extent_data.encoding == BTRFS_ENCODING_NONE &&
+                ext->datalen >= offsetof(EXTENT_DATA, data) + sizeof(EXTENT_DATA2)) {
                 EXTENT_DATA2* ed2 = (EXTENT_DATA2*)ext->extent_data.data;
+                uint64_t logical, disk_cluster;
+                uint64_t extent_start = max(ext->offset, last_off);
+                uint64_t extent_skip = extent_start - ext->offset;
+                uint64_t mapped_length = extent_end - extent_start;
 
-                out->Extents[i].Lcn.QuadPart = (ed2->address + ed2->offset) >> Vcb->sector_shift;
+                if (ed2->address <= UINT64_MAX - ed2->offset &&
+                    ed2->offset <= ed2->size &&
+                    extent_skip <= ed2->num_bytes &&
+                    mapped_length <= ed2->num_bytes - extent_skip &&
+                    extent_skip <= ed2->size - ed2->offset &&
+                    mapped_length <= ed2->size - ed2->offset - extent_skip &&
+                    ed2->address + ed2->offset <= UINT64_MAX - extent_skip) {
+                    logical = ed2->address + ed2->offset + extent_skip;
+
+                    if (get_hiberfile_disk_cluster(Vcb, logical, mapped_length, &disk_cluster))
+                        out->Extents[i].Lcn.QuadPart = (LONGLONG)disk_cluster;
+                    else
+                        out->Extents[i].Lcn.QuadPart = -1;
+                } else
+                    out->Extents[i].Lcn.QuadPart = -1;
             } else
                 out->Extents[i].Lcn.QuadPart = -1;
 
             outlen -= sizeof(LARGE_INTEGER) + sizeof(LARGE_INTEGER);
             *retlen += sizeof(LARGE_INTEGER) + sizeof(LARGE_INTEGER);
             i++;
+            out->ExtentCount = i;
 
+            last_off = extent_end;
             le = le->Flink;
         }
 
-        if (num_sectors << Vcb->sector_shift > last_off) {
+        if (num_sectors > (last_off >> Vcb->sector_shift)) {
             if (outlen < sizeof(LARGE_INTEGER) + sizeof(LARGE_INTEGER)) {
                 Status = STATUS_BUFFER_OVERFLOW;
                 _SEH2_LEAVE;
@@ -5135,6 +5514,7 @@ static NTSTATUS get_retrieval_pointers(device_extension* Vcb, PFILE_OBJECT FileO
 
             outlen -= sizeof(LARGE_INTEGER) + sizeof(LARGE_INTEGER);
             *retlen += sizeof(LARGE_INTEGER) + sizeof(LARGE_INTEGER);
+            out->ExtentCount = i + 1;
         }
 
         Status = STATUS_SUCCESS;
@@ -5936,6 +6316,23 @@ NTSTATUS fsctl_request(PDEVICE_OBJECT DeviceObject, PIRP* Pirp, uint32_t type) {
         case FSCTL_BTRFS_RESIZE:
             Status = resize_device(DeviceObject->DeviceExtension, Irp->AssociatedIrp.SystemBuffer,
                                    IrpSp->Parameters.FileSystemControl.InputBufferLength, Irp);
+            break;
+
+        case FSCTL_BTRFS_GET_HIBER_MAPPING:
+            /*
+             * This interface exposes physical member placement for the
+             * kernel dump/hibernation path. Do not let an ordinary user-mode
+             * handle enumerate raw member offsets.
+             */
+            if (Irp->RequestorMode != KernelMode) {
+                Status = STATUS_ACCESS_DENIED;
+                break;
+            }
+            Status = get_hiber_mapping(DeviceObject->DeviceExtension, Irp->AssociatedIrp.SystemBuffer,
+                                       IrpSp->Parameters.FileSystemControl.InputBufferLength,
+                                       map_user_buffer(Irp, NormalPagePriority),
+                                       IrpSp->Parameters.FileSystemControl.OutputBufferLength,
+                                       &Irp->IoStatus.Information);
             break;
 
         case FSCTL_BTRFS_GET_CSUM_INFO:

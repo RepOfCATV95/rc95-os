@@ -546,8 +546,12 @@ BtrfsSuperblockProblem(const superblock *Sb, ULONGLONG Offset)
         return "has a misaligned tree root address";
     if (Sb->n == 0 || Sb->n > SYS_CHUNK_ARRAY_SIZE)
         return "has an invalid sys_chunk_array size";
-    if (Sb->dev_item.num_bytes == 0)
-        return "has an invalid device size";
+    if (Sb->dev_item.dev_id == 0)
+        return "records an invalid device ID";
+    if (Sb->dev_item.num_bytes == 0 || Sb->dev_item.bytes_used > Sb->dev_item.num_bytes)
+        return "has inconsistent device size accounting";
+    if (RtlCompareMemory(&Sb->dev_item.fs_uuid, &Sb->uuid, sizeof(BTRFS_UUID)) != sizeof(BTRFS_UUID))
+        return "device item belongs to a different filesystem";
 
     return NULL;
 }
@@ -1152,6 +1156,21 @@ BtrfsChkdsk(
                  (ULONGLONG)Best->Sb.dev_item.num_bytes, DevLen);
         ++Errors;
     }
+
+    /*
+     * BtrfsChkdsk is invoked against one physical member.  A multi-device
+     * filesystem therefore requires one pass per member for full coverage.
+     * Balance serialization and physical paging-file preallocation are
+     * runtime driver policies; they do not change on-disk metadata, and this
+     * raw-device checker must not reinterpret a striped/parity chunk as one
+     * contiguous member extent.
+     */
+    if (Best->Sb.num_devices > 1)
+        BtrfsOut(Callback, "Checking member %u of a %u-device Btrfs filesystem. "
+                 "This pass covers this member only; run the check on every member for complete coverage.",
+                 (ULONGLONG)Best->Sb.dev_item.dev_id, (ULONGLONG)Best->Sb.num_devices);
+    else
+        BtrfsOut(Callback, "Checking the sole Btrfs device.");
 
     /* ---- phase 4: chunk tree root ---- */
     BtrfsCheckChunkRoot(VolumeHandle, &Best->Sb, DevLen, CanRepair, Callback, Verbose, &Errors, &Fixed);

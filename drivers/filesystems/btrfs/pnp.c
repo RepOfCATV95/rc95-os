@@ -369,6 +369,12 @@ static NTSTATUS pdo_device_usage_notification(pdo_device_extension* pdode, PIRP 
             if (context.Status == STATUS_PENDING)
                 KeWaitForSingleObject(&context.Event, Executive, KernelMode, false, NULL);
 
+            /*
+             * The completion routine returns STATUS_MORE_PROCESSING_REQUIRED,
+             * so ownership of this allocated IRP remains with us.
+             */
+            IoFreeIrp(Irp2);
+
             if (!NT_SUCCESS(context.Status)) {
                 ERR("IoCallDriver returned %08lx\n", context.Status);
                 ExReleaseResourceLite(&pdode->child_lock);
@@ -434,25 +440,97 @@ static NTSTATUS pdo_pnp(PDEVICE_OBJECT pdo, PIRP Irp) {
     return Irp->IoStatus.Status;
 }
 
+typedef struct {
+    device_extension* Vcb;
+    BOOLEAN InPath;
+} btrfs_usage_notification_context;
+
+static NTSTATUS NTAPI pnp_usage_notification_completion(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context) {
+    btrfs_usage_notification_context* ctx = Context;
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    /*
+     * The lower storage stack is authoritative.  Roll back our optimistic
+     * path count if it rejects the notification, otherwise failed requests
+     * can permanently block dismount and balance operations.
+     */
+    if (ctx->InPath) {
+        /* Reserve the path before forwarding; undo only if rejected. */
+        if (!NT_SUCCESS(Irp->IoStatus.Status))
+            IoAdjustPagingPathCount(&ctx->Vcb->page_file_count, FALSE);
+    } else if (NT_SUCCESS(Irp->IoStatus.Status)) {
+        /*
+         * Keep the existing pin until the lower stack confirms removal.
+         * Decrementing before forwarding would let balance race a rejected
+         * removal notification and relocate still-pinned extents.
+         */
+        IoAdjustPagingPathCount(&ctx->Vcb->page_file_count, FALSE);
+    }
+
+    ExFreePoolWithTag(ctx, ALLOC_TAG);
+    return STATUS_CONTINUE_COMPLETION;
+}
+
 static NTSTATUS pnp_device_usage_notification(PDEVICE_OBJECT DeviceObject, PIRP Irp) {
     PIO_STACK_LOCATION IrpSp = IoGetCurrentIrpStackLocation(Irp);
     device_extension* Vcb = DeviceObject->DeviceExtension;
+    btrfs_usage_notification_context* ctx;
+    BOOLEAN tracked = FALSE;
+    NTSTATUS Status;
 
-    if (IrpSp->Parameters.UsageNotification.InPath) {
-        switch (IrpSp->Parameters.UsageNotification.Type) {
-            case DeviceUsageTypePaging:
-            case DeviceUsageTypeHibernation:
-            case DeviceUsageTypeDumpFile:
-                IoAdjustPagingPathCount(&Vcb->page_file_count, IrpSp->Parameters.UsageNotification.InPath);
-                break;
-
-            default:
-                break;
-        }
+    if (!Vcb->Vpb || !Vcb->Vpb->RealDevice) {
+        Irp->IoStatus.Status = STATUS_DEVICE_NOT_READY;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_DEVICE_NOT_READY;
     }
 
-    IoSkipCurrentIrpStackLocation(Irp);
-    return IoCallDriver(Vcb->Vpb->RealDevice, Irp);
+    switch (IrpSp->Parameters.UsageNotification.Type) {
+        case DeviceUsageTypePaging:
+        case DeviceUsageTypeHibernation:
+        case DeviceUsageTypeDumpFile:
+            tracked = TRUE;
+            break;
+        default:
+            break;
+    }
+
+    if (!tracked) {
+        IoSkipCurrentIrpStackLocation(Irp);
+        return IoCallDriver(Vcb->Vpb->RealDevice, Irp);
+    }
+
+    ctx = ExAllocatePoolWithTag(NonPagedPool, sizeof(*ctx), ALLOC_TAG);
+    if (!ctx) {
+        Irp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    ctx->Vcb = Vcb;
+    ctx->InPath = IrpSp->Parameters.UsageNotification.InPath;
+
+    /*
+     * Serialize the transition with balance startup.  Balance holds the same
+     * resource from its final page_file_count check through thread creation.
+     */
+    ExAcquireResourceExclusiveLite(&Vcb->chunk_lock, true);
+
+    if (ctx->InPath && Vcb->balance.thread) {
+        ExReleaseResourceLite(&Vcb->chunk_lock);
+        ExFreePoolWithTag(ctx, ALLOC_TAG);
+        Irp->IoStatus.Status = STATUS_DEVICE_BUSY;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_DEVICE_BUSY;
+    }
+
+    if (ctx->InPath)
+        IoAdjustPagingPathCount(&Vcb->page_file_count, TRUE);
+    ExReleaseResourceLite(&Vcb->chunk_lock);
+
+    IoCopyCurrentIrpStackLocationToNext(Irp);
+    IoSetCompletionRoutine(Irp, pnp_usage_notification_completion, ctx, TRUE, TRUE, TRUE);
+    Status = IoCallDriver(Vcb->Vpb->RealDevice, Irp);
+    return Status;
 }
 
 _Dispatch_type_(IRP_MJ_PNP)

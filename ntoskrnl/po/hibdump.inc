@@ -42,6 +42,8 @@
 
 #include <ntdddisk.h>
 #include "hibdump_ata.h"
+#include "hibdump_btrfs.h"
+#include "hibdump_btrfs_map.h"
 
 #define PO_DUMP_SIGNATURE       'pmDP'
 #define PO_DUMP_TAG             'pDoP'
@@ -88,6 +90,10 @@ typedef struct _PO_DUMP_STACK
     BOOLEAN FlushCache;
     BOOLEAN FlushCacheExt;
     ULONGLONG TotalSectors;
+
+    /* The containing partition, in absolute disk sectors */
+    ULONGLONG PartitionStartSector;
+    ULONGLONG PartitionSectorCount;
 
     /* The hibernation file */
     ULONG ExtentCount;
@@ -732,6 +738,136 @@ PopDumpStackFlush(
     return PopAtaFlushCache(Stack);
 }
 
+/*
+ * Btrfs retrieval pointers can expose a usable physical LCN for some chunk
+ * layouts, but they do not prove that every hibernation-file extent belongs
+ * to the same physical member. The versioned HIBER_MAPPING ABI additionally
+ * requires a file-VCN-to-Btrfs-logical-extent query, member-object resolution
+ * and multiple polled targets; those pieces are not yet implemented here.
+ *
+ * Until then, this legacy writer accepts only a single-member Btrfs volume.
+ * Any malformed, truncated, missing, read-only or multi-member device list
+ * fails closed. Non-Btrfs filesystems reject this private FSCTL with
+ * STATUS_INVALID_DEVICE_REQUEST on a volume already identified as Btrfs is
+ * treated as an unsupported/old Btrfs driver, never as a non-Btrfs volume.
+ */
+#define PO_FSCTL_BTRFS_GET_DEVICES \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x82e, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+
+static
+NTSTATUS
+PopDumpCheckBtrfsMemberCount(
+    _In_ HANDLE FileHandle)
+{
+    const ULONG BufferSize = 64 * 1024;
+    PUCHAR Buffer;
+    ULONG MemberCount, ValidLength;
+    union
+    {
+        ULONGLONG Alignment;
+        UCHAR Buffer[sizeof(FILE_FS_ATTRIBUTE_INFORMATION) + 16 * sizeof(WCHAR)];
+    } AttributeStorage;
+    PFILE_FS_ATTRIBUTE_INFORMATION AttributeInfo;
+    IO_STATUS_BLOCK IoStatusBlock;
+    KEVENT Event;
+    NTSTATUS Status;
+
+    /*
+     * Identify the filesystem first. This keeps ordinary NTFS/FAT volumes
+     * eligible for the legacy path while ensuring an older Btrfs driver that
+     * lacks GET_DEVICES is not mistaken for a non-Btrfs filesystem.
+     */
+    AttributeInfo = (PFILE_FS_ATTRIBUTE_INFORMATION)AttributeStorage.Buffer;
+    RtlZeroMemory(&AttributeStorage, sizeof(AttributeStorage));
+    Status = ZwQueryVolumeInformationFile(FileHandle,
+                                          &IoStatusBlock,
+                                          AttributeInfo,
+                                          sizeof(AttributeStorage.Buffer),
+                                          FileFsAttributeInformation);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    if (AttributeInfo->FileSystemNameLength == 0 ||
+        IoStatusBlock.Information <
+            FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) +
+                AttributeInfo->FileSystemNameLength ||
+        AttributeInfo->FileSystemNameLength >
+            sizeof(AttributeStorage.Buffer) -
+                FIELD_OFFSET(FILE_FS_ATTRIBUTE_INFORMATION, FileSystemName) ||
+        (AttributeInfo->FileSystemNameLength % sizeof(WCHAR)) != 0)
+    {
+        return STATUS_FILE_CORRUPT_ERROR;
+    }
+
+    if (AttributeInfo->FileSystemNameLength !=
+            sizeof(L"Btrfs") - sizeof(WCHAR) ||
+        RtlCompareMemory(AttributeInfo->FileSystemName,
+                         L"Btrfs",
+                         sizeof(L"Btrfs") - sizeof(WCHAR)) !=
+            sizeof(L"Btrfs") - sizeof(WCHAR))
+    {
+        return STATUS_SUCCESS; /* Not Btrfs. */
+    }
+
+    Buffer = ExAllocatePoolWithTag(NonPagedPool, BufferSize, PO_DUMP_TAG);
+    if (Buffer == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    RtlZeroMemory(Buffer, BufferSize);
+    IoStatusBlock.Status = STATUS_UNSUCCESSFUL;
+    IoStatusBlock.Information = 0;
+    KeInitializeEvent(&Event, NotificationEvent, FALSE);
+
+    Status = ZwFsControlFile(FileHandle,
+                             &Event,
+                             NULL,
+                             NULL,
+                             &IoStatusBlock,
+                             PO_FSCTL_BTRFS_GET_DEVICES,
+                             NULL,
+                             0,
+                             Buffer,
+                             BufferSize);
+    if (Status == STATUS_PENDING)
+    {
+        KeWaitForSingleObject(&Event, Executive, KernelMode, FALSE, NULL);
+        Status = IoStatusBlock.Status;
+    }
+    else if (NT_SUCCESS(Status))
+    {
+        Status = IoStatusBlock.Status;
+    }
+
+    if (Status == STATUS_INVALID_DEVICE_REQUEST)
+    {
+        Status = STATUS_NOT_SUPPORTED; /* Btrfs driver is too old for safe preflight. */
+        goto Done;
+    }
+
+    if (!NT_SUCCESS(Status))
+        goto Done;
+
+    /*
+     * get_devices() currently leaves Information unset. When it is supplied,
+     * use it as the parser bound; otherwise use the zeroed output capacity.
+     */
+    if (IoStatusBlock.Information > BufferSize)
+    {
+        Status = STATUS_FILE_CORRUPT_ERROR;
+        goto Done;
+    }
+
+    ValidLength = IoStatusBlock.Information != 0 ?
+                  (ULONG)IoStatusBlock.Information : BufferSize;
+    Status = PopDumpBtrfsValidateDeviceList(Buffer, ValidLength, &MemberCount);
+    if (NT_SUCCESS(Status) && MemberCount != 1)
+        Status = STATUS_FILE_CORRUPT_ERROR;
+
+Done:
+    ExFreePoolWithTag(Buffer, PO_DUMP_TAG);
+    return Status;
+}
+
 /* Preparation (PASSIVE_LEVEL) ************************************************/
 
 static
@@ -747,6 +883,10 @@ PopDumpIoctl(
     PIRP Irp;
     NTSTATUS Status;
 
+    if (Output == NULL || OutputLength == 0)
+        return STATUS_INVALID_PARAMETER;
+
+    RtlZeroMemory(Output, OutputLength);
     KeInitializeEvent(&Event, NotificationEvent, FALSE);
     IoStatusBlock.Status = STATUS_UNSUCCESSFUL;
     IoStatusBlock.Information = 0;
@@ -772,6 +912,11 @@ PopDumpIoctl(
     {
         Status = IoStatusBlock.Status;
     }
+
+    if (NT_SUCCESS(Status) && IoStatusBlock.Information < OutputLength)
+        Status = STATUS_DEVICE_DATA_ERROR;
+    else if (IoStatusBlock.Information > OutputLength)
+        Status = STATUS_FILE_CORRUPT_ERROR;
 
     return Status;
 }
@@ -818,8 +963,7 @@ PopDumpAddExtent(
 
     /*
      * Retrieval-pointer extents describe one contiguous file stream even
-     * when their disk clusters are fragmented. Reject gaps, overlaps and
-     * wrapped ranges before the dump stack can translate an image offset.
+     * when their disk clusters are fragmented. Reject gaps and overlaps.
      */
     if (Stack->ExtentCount != 0)
     {
@@ -827,8 +971,15 @@ PopDumpAddExtent(
 
         if (Previous->FileSector > (~0ULL - Previous->Count) ||
             FileSector != Previous->FileSector + Previous->Count)
-        {
             return STATUS_FILE_CORRUPT_ERROR;
+
+        /* Coalesce physically adjacent runs to keep the nonpaged map small. */
+        if (Previous->DiskSector <= (~0ULL - Previous->Count) &&
+            Previous->DiskSector + Previous->Count == DiskSector &&
+            Previous->Count <= (~0ULL - Count))
+        {
+            Previous->Count += Count;
+            return STATUS_SUCCESS;
         }
     }
 
@@ -871,6 +1022,7 @@ PopDumpQueryExtents(
     _Inout_ PPO_DUMP_STACK Stack,
     _In_ HANDLE FileHandle,
     _In_ ULONGLONG PartitionStartSector,
+    _In_ ULONGLONG PartitionSectorCount,
     _In_ ULONG SectorsPerCluster,
     _In_ ULONGLONG EndOfFile)
 {
@@ -879,7 +1031,7 @@ PopDumpQueryExtents(
     IO_STATUS_BLOCK IoStatusBlock;
     ULONG BufferSize, i;
     ULONGLONG Vcn = 0, Next, Lcn, Length;
-    ULONGLONG Sectors = 0, RequiredSectors;
+    ULONGLONG RelativeSector, Sectors = 0, RequiredSectors;
     NTSTATUS Status, QueryStatus;
 
     if (SectorsPerCluster == 0)
@@ -955,7 +1107,17 @@ PopDumpQueryExtents(
 
             Length = (Next - Vcn) * SectorsPerCluster;
             if (Vcn > (~0ULL / SectorsPerCluster) ||
+                Lcn > (~0ULL / SectorsPerCluster) ||
                 Sectors > (~0ULL - Length))
+            {
+                Status = STATUS_FILE_CORRUPT_ERROR;
+                goto Done;
+            }
+
+            RelativeSector = Lcn * SectorsPerCluster;
+            if (RelativeSector > PartitionSectorCount ||
+                Length > PartitionSectorCount - RelativeSector ||
+                PartitionStartSector > (~0ULL - RelativeSector))
             {
                 Status = STATUS_FILE_CORRUPT_ERROR;
                 goto Done;
@@ -963,7 +1125,7 @@ PopDumpQueryExtents(
 
             Status = PopDumpAddExtent(Stack,
                                       Vcn * SectorsPerCluster,
-                                      PartitionStartSector + Lcn * SectorsPerCluster,
+                                      PartitionStartSector + RelativeSector,
                                       Length);
             if (!NT_SUCCESS(Status))
                 goto Done;
@@ -1143,6 +1305,20 @@ PopDumpStackInitialize(
         return STATUS_NOT_SUPPORTED;
 
     /*
+     * The polled ATA writer supports one physical disk only.  In particular,
+     * do not infer single-disk placement from retrieval pointers on Btrfs:
+     * multi-device filesystems can contain a mixture of single and striped
+     * chunks.  Their full chunk mapping is not yet wired into this writer.
+     */
+    Status = PopDumpCheckBtrfsMemberCount(Context->LinkFileHandle);
+    if (!NT_SUCCESS(Status))
+    {
+        DPRINT1("Hibernation dump stack not used: Btrfs layout is not safe for single-disk writes (0x%08lx)\n",
+                Status);
+        return Status;
+    }
+
+    /*
      * Legacy IDE only. Without a channel on the legacy ports the dump stack
      * can't be used, so leave the disk alone and keep the normal path.
      */
@@ -1204,11 +1380,13 @@ PopDumpStackInitialize(
     /* All clusters must exist on disk, the file system may allocate lazily */
     AllocationInfo.AllocationSize.QuadPart =
         (LONGLONG)(((EndOfFile + ClusterBytes - 1) / ClusterBytes) * ClusterBytes);
-    (VOID)ZwSetInformationFile(Context->LinkFileHandle,
-                               &IoStatusBlock,
-                               &AllocationInfo,
-                               sizeof(AllocationInfo),
-                               FileAllocationInformation);
+    Status = ZwSetInformationFile(Context->LinkFileHandle,
+                                  &IoStatusBlock,
+                                  &AllocationInfo,
+                                  sizeof(AllocationInfo),
+                                  FileAllocationInformation);
+    if (!NT_SUCCESS(Status))
+        goto Quit;
 
     Status = PopDumpIoctl(PartitionDevice,
                           IOCTL_DISK_GET_PARTITION_INFO_EX,
@@ -1217,7 +1395,11 @@ PopDumpStackInitialize(
     if (!NT_SUCCESS(Status))
         goto Quit;
     if (PartitionInfo.StartingOffset.QuadPart < 0 ||
-        (PartitionInfo.StartingOffset.QuadPart % PO_DUMP_SECTOR_SIZE) != 0)
+        PartitionInfo.PartitionLength.QuadPart <= 0 ||
+        PartitionInfo.StartingOffset.QuadPart >
+            0x7FFFFFFFFFFFFFFFLL - PartitionInfo.PartitionLength.QuadPart ||
+        (PartitionInfo.StartingOffset.QuadPart % PO_DUMP_SECTOR_SIZE) != 0 ||
+        (PartitionInfo.PartitionLength.QuadPart % PO_DUMP_SECTOR_SIZE) != 0)
     {
         Status = STATUS_NOT_SUPPORTED;
         goto Quit;
@@ -1231,6 +1413,10 @@ PopDumpStackInitialize(
     }
     RtlZeroMemory(Stack, sizeof(*Stack));
     Stack->Signature = PO_DUMP_SIGNATURE;
+    Stack->PartitionStartSector =
+        (ULONGLONG)PartitionInfo.StartingOffset.QuadPart / PO_DUMP_SECTOR_SIZE;
+    Stack->PartitionSectorCount =
+        (ULONGLONG)PartitionInfo.PartitionLength.QuadPart / PO_DUMP_SECTOR_SIZE;
     Stack->ExtentCapacity = 16;
     Stack->Extents = ExAllocatePoolWithTag(NonPagedPool,
                                            Stack->ExtentCapacity *
@@ -1249,8 +1435,8 @@ PopDumpStackInitialize(
 
     Status = PopDumpQueryExtents(Stack,
                                  Context->LinkFileHandle,
-                                 (ULONGLONG)PartitionInfo.StartingOffset.QuadPart /
-                                     PO_DUMP_SECTOR_SIZE,
+                                 Stack->PartitionStartSector,
+                                 Stack->PartitionSectorCount,
                                  SizeInfo.SectorsPerAllocationUnit,
                                  EndOfFile);
     if (!NT_SUCCESS(Status))
@@ -1308,6 +1494,11 @@ PopDumpStackInitialize(
                              NULL);
         if (!NT_SUCCESS(Status))
             goto Quit;
+        if (IoStatusBlock.Information != PO_DUMP_SECTOR_SIZE)
+        {
+            Status = STATUS_DEVICE_DATA_ERROR;
+            goto Quit;
+        }
     }
 
     Status = ZwFlushBuffersFile(Context->LinkFileHandle, &IoStatusBlock);

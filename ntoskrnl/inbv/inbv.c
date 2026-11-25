@@ -310,9 +310,18 @@ NTAPI
 InbvSetDisplayOwnership(
     _In_ BOOLEAN DisplayOwned)
 {
-    /* Set the new display state */
+    /*
+     * Serialize the transition with the boot-video driver's other state
+     * changes. Keep the registered VIDEOPRT reset callback intact.
+     */
+    if (InbvBootDriverInstalled)
+        InbvAcquireLock();
+
     InbvDisplayState = DisplayOwned ? INBV_DISPLAY_STATE_OWNED :
                                       INBV_DISPLAY_STATE_LOST;
+
+    if (InbvBootDriverInstalled)
+        InbvReleaseLock();
 }
 
 BOOLEAN

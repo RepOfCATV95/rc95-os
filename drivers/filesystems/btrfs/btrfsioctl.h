@@ -38,6 +38,58 @@
 #define FSCTL_BTRFS_RESIZE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x848, METHOD_IN_DIRECT, FILE_ANY_ACCESS)
 #define IOCTL_BTRFS_UNLOAD CTL_CODE(FILE_DEVICE_UNKNOWN, 0x849, METHOD_NEITHER, FILE_ANY_ACCESS)
 #define FSCTL_BTRFS_GET_CSUM_INFO CTL_CODE(FILE_DEVICE_UNKNOWN, 0x84a, METHOD_BUFFERED, FILE_READ_ACCESS)
+/* Multi-device hibernation/dump layout query. Device identities are devid+UUID,
+ * not kernel pointers; callers must resolve and retain the actual member devices. */
+#define FSCTL_BTRFS_GET_HIBER_MAPPING CTL_CODE(FILE_DEVICE_UNKNOWN, 0x84b, METHOD_OUT_DIRECT, FILE_READ_ACCESS)
+/*
+ * Versioned, kernel-only mapping ABI. The original logical range fields stay
+ * first in the request so callers can validate/copy the fixed prefix.
+ */
+#define BTRFS_HIBER_MAPPING_VERSION 1
+#define BTRFS_HIBER_MAPPING_FLAG_READONLY 0x00000001
+#define BTRFS_HIBER_MAPPING_FLAG_DEGRADED 0x00000002
+#define BTRFS_HIBER_MAPPING_FLAG_MISSING  0x00000004
+
+#define BTRFS_HIBER_STRIPE_READONLY 0x00000001
+#define BTRFS_HIBER_STRIPE_SEEDING  0x00000002
+#define BTRFS_HIBER_STRIPE_MISSING  0x00000004
+
+typedef struct {
+    uint64_t logical_address;
+    uint64_t length;
+    uint32_t size;
+    uint32_t version;
+    uint32_t flags;
+    uint32_t reserved;
+} btrfs_hiber_mapping_request;
+
+typedef struct {
+    uint64_t devid;
+    BTRFS_UUID device_uuid;
+    uint64_t physical_offset;
+    uint64_t device_size;
+    uint32_t flags;
+    uint32_t reserved;
+} btrfs_hiber_mapping_stripe;
+
+typedef struct {
+    uint32_t size;
+    uint32_t stripe_count;
+    uint64_t logical_address;
+    uint64_t segment_length;
+    uint64_t chunk_logical;
+    uint64_t chunk_length;
+    uint64_t stripe_length;
+    uint64_t chunk_type;
+    uint32_t sector_size;
+    uint16_t sub_stripes;
+    uint16_t reserved;
+    uint32_t version;
+    uint32_t header_size;
+    uint32_t flags;
+    uint32_t reserved2;
+    btrfs_hiber_mapping_stripe stripes[1];
+} btrfs_hiber_mapping;
 
 typedef struct {
     uint64_t subvol;

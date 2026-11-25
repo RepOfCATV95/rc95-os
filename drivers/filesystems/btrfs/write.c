@@ -3370,7 +3370,7 @@ NTSTATUS extend_file(fcb* fcb, file_ref* fileref, uint64_t end, bool prealloc, P
             oldalloc = ext->offset + (ed->type == EXTENT_TYPE_INLINE ? ed->decoded_size : ed2->num_bytes);
             cur_inline = ed->type == EXTENT_TYPE_INLINE;
 
-            if (cur_inline && end > fcb->Vcb->options.max_inline) {
+            if (cur_inline && (end > fcb->Vcb->options.max_inline || prealloc)) {
                 uint64_t origlength, length;
                 uint8_t* data;
 
@@ -3476,7 +3476,7 @@ NTSTATUS extend_file(fcb* fcb, file_ref* fileref, uint64_t end, bool prealloc, P
 
                         Status = insert_prealloc_extent(fcb, oldalloc, newalloc - oldalloc, rollback);
 
-                        if (!NT_SUCCESS(Status) && Status != STATUS_DISK_FULL) {
+                        if (!NT_SUCCESS(Status)) {
                             ERR("insert_prealloc_extent returned %08lx\n", Status);
                             return Status;
                         }
@@ -3497,13 +3497,13 @@ NTSTATUS extend_file(fcb* fcb, file_ref* fileref, uint64_t end, bool prealloc, P
                 fcb->Header.FileSize.QuadPart = fcb->Header.ValidDataLength.QuadPart = end;
             }
         } else {
-            if (end > fcb->Vcb->options.max_inline) {
+            if (end > fcb->Vcb->options.max_inline || prealloc) {
                 newalloc = sector_align(end, fcb->Vcb->superblock.sector_size);
 
                 if (prealloc) {
                     Status = insert_prealloc_extent(fcb, 0, newalloc, rollback);
 
-                    if (!NT_SUCCESS(Status) && Status != STATUS_DISK_FULL) {
+                    if (!NT_SUCCESS(Status)) {
                         ERR("insert_prealloc_extent returned %08lx\n", Status);
                         return Status;
                     }

@@ -2371,11 +2371,13 @@ NtSetSystemPowerState(_In_ POWER_ACTION SystemAction,
             if (PopHiberContext->ResumeFlag)
             {
                 NTSTATUS InvalidateStatus;
+                BOOLEAN DeviceRestoreSucceeded;
 
                 PopHiberContext->ResumeFlag = 0;
                 PopResyncSystemTimeAfterResume();
                 Status = PopSetSystemPowerState(PowerSystemWorking,
                                                 PowerActionHibernate);
+                DeviceRestoreSucceeded = NT_SUCCESS(Status);
 
                 PopHiberContext->ImageHeader.Flags &=
                     ~HIBERFILE_FLAG_IMAGE_COMPLETE;
@@ -2390,6 +2392,16 @@ NtSetSystemPowerState(_In_ POWER_ACTION SystemAction,
                 }
 
                 PopHiberCloseFile();
+
+                /*
+                 * Relinquish boot-video ownership only after device power
+                 * restoration and hibernation-file cleanup have completed.
+                 * Keep VIDEOPRT's registered reset callback intact so the
+                 * resumed WIN32K display stack can reclaim the adapter.
+                 */
+                if (DeviceRestoreSucceeded)
+                    InbvSetDisplayOwnership(FALSE);
+
                 break;
             }
 

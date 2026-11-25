@@ -3503,7 +3503,15 @@ end:
     }
 
     ZwClose(Vcb->balance.thread);
+
+    /*
+     * Publish completion under the same lock used by balance startup and
+     * device removal. Otherwise those paths can observe a stale thread
+     * handle while the worker is tearing it down.
+     */
+    ExAcquireResourceExclusiveLite(&Vcb->chunk_lock, true);
     Vcb->balance.thread = NULL;
+    ExReleaseResourceLite(&Vcb->chunk_lock);
 
     KeSetEvent(&Vcb->balance.finished, 0, false);
 }
@@ -3523,6 +3531,16 @@ NTSTATUS start_balance(device_extension* Vcb, void* data, ULONG length, KPROCESS
     if (Vcb->locked) {
         WARN("cannot start balance while locked\n");
         return STATUS_DEVICE_NOT_READY;
+    }
+
+    /*
+     * A paging, hibernation, or crash-dump file must keep the same physical
+     * extents for the lifetime of the special-file path.  Balance relocates
+     * chunks, so do not start it while the volume is pinned by the I/O stack.
+     */
+    if (Vcb->page_file_count != 0) {
+        WARN("cannot start balance while paging, hibernation, or dump files are active\n");
+        return STATUS_DEVICE_BUSY;
     }
 
     if (Vcb->scrub.thread) {
@@ -3586,10 +3604,10 @@ NTSTATUS start_balance(device_extension* Vcb, void* data, ULONG length, KPROCESS
             }
 
             if (bsb->opts[i].flags & BTRFS_BALANCE_OPTS_USAGE) {
-                bsb->opts[i].usage_start = min(100, bsb->opts[i].stripes_start);
-                bsb->opts[i].usage_end = min(100, bsb->opts[i].stripes_end);
+                bsb->opts[i].usage_start = min(100, bsb->opts[i].usage_start);
+                bsb->opts[i].usage_end = min(100, bsb->opts[i].usage_end);
 
-                if (bsb->opts[i].stripes_start > bsb->opts[i].stripes_end)
+                if (bsb->opts[i].usage_start > bsb->opts[i].usage_end)
                     return STATUS_INVALID_PARAMETER;
             }
 
@@ -3602,6 +3620,37 @@ NTSTATUS start_balance(device_extension* Vcb, void* data, ULONG length, KPROCESS
                     return STATUS_INVALID_PARAMETER;
             }
         }
+    }
+
+    /*
+     * Pair this lock with pnp_device_usage_notification(): the special-file
+     * path count must not change between this final check and publishing the
+     * balance thread, or the two operations can race and relocate hiberfile
+     * extents after the dump writer has captured them.
+     */
+    ExAcquireResourceExclusiveLite(&Vcb->chunk_lock, true);
+
+    if (Vcb->page_file_count != 0) {
+        ExReleaseResourceLite(&Vcb->chunk_lock);
+        WARN("cannot start balance while paging, hibernation, or dump files are active\n");
+        return STATUS_DEVICE_BUSY;
+    }
+
+    if (Vcb->balance.thread) {
+        ExReleaseResourceLite(&Vcb->chunk_lock);
+        WARN("balance already running\n");
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (Vcb->scrub.thread) {
+        ExReleaseResourceLite(&Vcb->chunk_lock);
+        WARN("cannot start balance while scrub running\n");
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    if (Vcb->readonly) {
+        ExReleaseResourceLite(&Vcb->chunk_lock);
+        return STATUS_MEDIA_WRITE_PROTECTED;
     }
 
     RtlCopyMemory(&Vcb->balance.opts[BALANCE_OPTS_DATA], &bsb->opts[BALANCE_OPTS_DATA], sizeof(btrfs_balance_opts));
@@ -3618,10 +3667,13 @@ NTSTATUS start_balance(device_extension* Vcb, void* data, ULONG length, KPROCESS
 
     Status = PsCreateSystemThread(&Vcb->balance.thread, 0, &oa, NULL, NULL, balance_thread, Vcb);
     if (!NT_SUCCESS(Status)) {
+        Vcb->balance.thread = NULL;
+        ExReleaseResourceLite(&Vcb->chunk_lock);
         ERR("PsCreateSystemThread returned %08lx\n", Status);
         return Status;
     }
 
+    ExReleaseResourceLite(&Vcb->chunk_lock);
     return STATUS_SUCCESS;
 }
 
@@ -3815,7 +3867,8 @@ NTSTATUS remove_device(device_extension* Vcb, void* data, ULONG length, KPROCESS
 
     devid = *(uint64_t*)data;
 
-    ExAcquireResourceSharedLite(&Vcb->tree_lock, true);
+    /* Device list and relocation state are modified below. */
+    ExAcquireResourceExclusiveLite(&Vcb->tree_lock, true);
 
     if (Vcb->readonly) {
         ExReleaseResourceLite(&Vcb->tree_lock);
@@ -3880,10 +3933,29 @@ NTSTATUS remove_device(device_extension* Vcb, void* data, ULONG length, KPROCESS
         }
     }
 
-    ExReleaseResourceLite(&Vcb->tree_lock);
+    /*
+     * Keep the device list protected until the relocation worker is
+     * published. Lock order is tree_lock -> chunk_lock (also used by the
+     * balance worker); dropping tree_lock here would leave 'dev' vulnerable
+     * to concurrent device-list teardown before dev->reloc is set.
+     *
+     * Device removal relocates extents just like balance. Serialize its
+     * startup with special-file notifications and reject it while a paging,
+     * hibernation, or crash-dump path pins the current physical mappings.
+     */
+    ExAcquireResourceExclusiveLite(&Vcb->chunk_lock, true);
 
-    if (Vcb->balance.thread) {
-        WARN("balance already running\n");
+    if (Vcb->page_file_count != 0) {
+        ExReleaseResourceLite(&Vcb->chunk_lock);
+        ExReleaseResourceLite(&Vcb->tree_lock);
+        WARN("cannot remove device while paging, hibernation, or dump files are active\n");
+        return STATUS_DEVICE_BUSY;
+    }
+
+    if (Vcb->balance.thread || Vcb->scrub.thread) {
+        ExReleaseResourceLite(&Vcb->chunk_lock);
+        ExReleaseResourceLite(&Vcb->tree_lock);
+        WARN("cannot remove device while balance or scrub is running\n");
         return STATUS_DEVICE_NOT_READY;
     }
 
@@ -3908,8 +3980,13 @@ NTSTATUS remove_device(device_extension* Vcb, void* data, ULONG length, KPROCESS
     if (!NT_SUCCESS(Status)) {
         ERR("PsCreateSystemThread returned %08lx\n", Status);
         dev->reloc = false;
+        Vcb->balance.thread = NULL;
+        ExReleaseResourceLite(&Vcb->chunk_lock);
+        ExReleaseResourceLite(&Vcb->tree_lock);
         return Status;
     }
 
+    ExReleaseResourceLite(&Vcb->chunk_lock);
+    ExReleaseResourceLite(&Vcb->tree_lock);
     return STATUS_SUCCESS;
 }

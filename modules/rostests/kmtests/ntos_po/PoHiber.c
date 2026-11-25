@@ -6,6 +6,8 @@
 
 #include <kmt_test.h>
 #include "../../../../ntoskrnl/po/hibdump_ata.h"
+#include "../../../../ntoskrnl/po/hibdump_btrfs.h"
+#include "../../../../ntoskrnl/po/hibdump_btrfs_map.h"
 
 static
 VOID
@@ -138,8 +140,356 @@ TestAtaAddress(VOID)
        "Invalid ATA device number accepted\n");
 }
 
+static
+VOID
+TestBtrfsDeviceList(VOID)
+{
+    union
+    {
+        ULONGLONG Alignment;
+        UCHAR Buffer[512];
+    } Storage;
+    PO_BTRFS_DEVICE_ENTRY Entry;
+    ULONG MemberCount;
+    ULONG FixedEntrySize =
+        (ULONG)(sizeof(PO_BTRFS_DEVICE_ENTRY) - sizeof(WCHAR));
+    NTSTATUS Status;
+
+    RtlZeroMemory(&Storage, sizeof(Storage));
+    RtlZeroMemory(&Entry, sizeof(Entry));
+    Entry.DeviceId = 1;
+    Entry.Size = 1024 * 1024;
+    Entry.MaxSize = 2 * 1024 * 1024;
+    RtlCopyMemory(Storage.Buffer,
+                  &Entry,
+                  FIELD_OFFSET(PO_BTRFS_DEVICE_ENTRY, Name));
+
+    MemberCount = 99;
+    Status = PopDumpBtrfsValidateDeviceList(Storage.Buffer,
+                                            sizeof(Storage.Buffer),
+                                            &MemberCount);
+    ok(Status == STATUS_SUCCESS, "Single Btrfs member rejected: 0x%08lx\n", Status);
+    ok(MemberCount == 1, "Expected one member, got %lu\n", MemberCount);
+
+    /* A valid next_entry means a second member and must disable the ATA path. */
+    Entry.NextEntry = FixedEntrySize;
+    RtlCopyMemory(Storage.Buffer,
+                  &Entry,
+                  FIELD_OFFSET(PO_BTRFS_DEVICE_ENTRY, Name));
+    MemberCount = 0;
+    Status = PopDumpBtrfsValidateDeviceList(Storage.Buffer,
+                                            sizeof(Storage.Buffer),
+                                            &MemberCount);
+    ok(Status == STATUS_NOT_SUPPORTED,
+       "Multi-member Btrfs list was not rejected: 0x%08lx\n", Status);
+    ok(MemberCount == 2, "Expected at least two members, got %lu\n", MemberCount);
+
+    Entry.NextEntry = FixedEntrySize - 1;
+    RtlCopyMemory(Storage.Buffer,
+                  &Entry,
+                  FIELD_OFFSET(PO_BTRFS_DEVICE_ENTRY, Name));
+    Status = PopDumpBtrfsValidateDeviceList(Storage.Buffer,
+                                            sizeof(Storage.Buffer),
+                                            &MemberCount);
+    ok(Status == STATUS_FILE_CORRUPT_ERROR,
+       "Short next_entry accepted: 0x%08lx\n", Status);
+
+    Entry.NextEntry = sizeof(Storage.Buffer) + 1;
+    RtlCopyMemory(Storage.Buffer,
+                  &Entry,
+                  FIELD_OFFSET(PO_BTRFS_DEVICE_ENTRY, Name));
+    Status = PopDumpBtrfsValidateDeviceList(Storage.Buffer,
+                                            sizeof(Storage.Buffer),
+                                            &MemberCount);
+    ok(Status == STATUS_FILE_CORRUPT_ERROR,
+       "Out-of-buffer next_entry accepted: 0x%08lx\n", Status);
+
+    Entry.NextEntry = 0;
+    Entry.ReadOnly = TRUE;
+    RtlCopyMemory(Storage.Buffer,
+                  &Entry,
+                  FIELD_OFFSET(PO_BTRFS_DEVICE_ENTRY, Name));
+    Status = PopDumpBtrfsValidateDeviceList(Storage.Buffer,
+                                            sizeof(Storage.Buffer),
+                                            &MemberCount);
+    ok(Status == STATUS_NOT_SUPPORTED,
+       "Read-only member accepted for dump writes: 0x%08lx\n", Status);
+
+    Entry.ReadOnly = FALSE;
+    Entry.Missing = TRUE;
+    RtlCopyMemory(Storage.Buffer,
+                  &Entry,
+                  FIELD_OFFSET(PO_BTRFS_DEVICE_ENTRY, Name));
+    Status = PopDumpBtrfsValidateDeviceList(Storage.Buffer,
+                                            sizeof(Storage.Buffer),
+                                            &MemberCount);
+    ok(Status == STATUS_NOT_SUPPORTED,
+       "Missing member accepted for dump writes: 0x%08lx\n", Status);
+
+    Entry.Missing = FALSE;
+    Entry.NameLength = 1;
+    RtlCopyMemory(Storage.Buffer,
+                  &Entry,
+                  FIELD_OFFSET(PO_BTRFS_DEVICE_ENTRY, Name));
+    Status = PopDumpBtrfsValidateDeviceList(Storage.Buffer,
+                                            sizeof(Storage.Buffer),
+                                            &MemberCount);
+    ok(Status == STATUS_FILE_CORRUPT_ERROR,
+       "Odd UTF-16 device-name length accepted: 0x%08lx\n", Status);
+
+    Entry.NameLength = 0;
+    Entry.DeviceId = 0;
+    RtlCopyMemory(Storage.Buffer,
+                  &Entry,
+                  FIELD_OFFSET(PO_BTRFS_DEVICE_ENTRY, Name));
+    Status = PopDumpBtrfsValidateDeviceList(Storage.Buffer,
+                                            sizeof(Storage.Buffer),
+                                            &MemberCount);
+    ok(Status == STATUS_FILE_CORRUPT_ERROR,
+       "Zero device ID accepted: 0x%08lx\n", Status);
+
+    Entry.DeviceId = 1;
+    Entry.MaxSize = Entry.Size - 1;
+    RtlCopyMemory(Storage.Buffer,
+                  &Entry,
+                  FIELD_OFFSET(PO_BTRFS_DEVICE_ENTRY, Name));
+    Status = PopDumpBtrfsValidateDeviceList(Storage.Buffer,
+                                            sizeof(Storage.Buffer),
+                                            &MemberCount);
+    ok(Status == STATUS_FILE_CORRUPT_ERROR,
+       "Device size larger than physical capacity accepted: 0x%08lx\n", Status);
+
+    Status = PopDumpBtrfsValidateDeviceList(Storage.Buffer,
+                                            FixedEntrySize - 1,
+                                            &MemberCount);
+    ok(Status == STATUS_FILE_CORRUPT_ERROR,
+       "Truncated device header accepted: 0x%08lx\n", Status);
+    ok(MemberCount == 0, "Truncated header left a nonzero member count\n");
+}
+
+
+static
+VOID
+TestBtrfsChunkMapping(VOID)
+{
+    union
+    {
+        ULONGLONG Alignment;
+        UCHAR Buffer[512];
+    } Storage;
+    PPO_BTRFS_HIBER_MAPPING Mapping;
+    PO_BTRFS_HIBER_TARGET Targets[PO_BTRFS_HIBER_MAX_TARGETS];
+    ULONG TargetCount, i;
+    ULONGLONG MappedLength;
+    NTSTATUS Status;
+
+    RtlZeroMemory(&Storage, sizeof(Storage));
+    Mapping = (PPO_BTRFS_HIBER_MAPPING)Storage.Buffer;
+    Mapping->Version = PO_BTRFS_HIBER_MAPPING_VERSION;
+    Mapping->HeaderSize = FIELD_OFFSET(PO_BTRFS_HIBER_MAPPING, Stripes);
+    Mapping->StripeCount = 4;
+    Mapping->Size = Mapping->HeaderSize +
+                    Mapping->StripeCount * sizeof(PO_BTRFS_HIBER_STRIPE);
+    Mapping->LogicalAddress = 0x100000;
+    Mapping->ChunkLogical = 0x100000;
+    Mapping->ChunkLength = 0x100000;
+    Mapping->SegmentLength = 0x100000;
+    Mapping->StripeLength = 0x10000;
+    Mapping->SectorSize = 512;
+
+    for (i = 0; i < Mapping->StripeCount; ++i)
+    {
+        Mapping->Stripes[i].DeviceId = i + 1;
+        Mapping->Stripes[i].DeviceUuid[0] = (UCHAR)(i + 1);
+        Mapping->Stripes[i].DeviceSize = 0x1000000;
+        Mapping->Stripes[i].PhysicalOffset = 0x200000 + i * 0x100000;
+    }
+
+    Status = PopDumpBtrfsValidateMapping(Storage.Buffer,
+                                         sizeof(Storage.Buffer), &Mapping);
+    ok(Status == STATUS_SUCCESS, "Valid mapping header rejected: 0x%08lx\n", Status);
+
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID0;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x110200, 4096,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_SUCCESS, "RAID0 mapping failed: 0x%08lx\n", Status);
+    ok(TargetCount == 1 && Targets[0].StripeIndex == 1,
+       "RAID0 selected wrong member/stripe\n");
+    ok(Targets[0].PhysicalOffset == 0x300200,
+       "RAID0 physical offset incorrect: %I64u\n", Targets[0].PhysicalOffset);
+    ok(MappedLength == 4096, "RAID0 mapped length incorrect\n");
+
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID1;
+    Mapping->StripeCount = 2;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 4096,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_SUCCESS, "RAID1 mapping failed: 0x%08lx\n", Status);
+    ok(TargetCount == 2, "RAID1 did not return both mirrors\n");
+    ok(Targets[0].PhysicalOffset == 0x201000 &&
+       Targets[1].PhysicalOffset == 0x301000,
+       "RAID1 mirror offsets incorrect\n");
+
+    Mapping->StripeCount = 4;
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID10;
+    Mapping->SubStripes = 2;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x110200, 4096,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_SUCCESS, "RAID10 mapping failed: 0x%08lx\n", Status);
+    ok(TargetCount == 2 && Targets[0].StripeIndex == 2 &&
+       Targets[1].StripeIndex == 3, "RAID10 selected wrong mirror group\n");
+    ok(Targets[0].PhysicalOffset == 0x400200 &&
+       Targets[1].PhysicalOffset == 0x500200,
+       "RAID10 physical offsets incorrect\n");
+
+    /* RAID0 requests are split at a stripe boundary. */
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID0;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x10FF00, 1024,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_SUCCESS && MappedLength == 256,
+       "RAID0 did not stop at the stripe boundary\n");
+
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID0;
+    TargetCount = 99;
+    MappedLength = 99;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 0,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_INVALID_PARAMETER &&
+       TargetCount == 0 && MappedLength == 0,
+       "Zero-length request did not fail with cleared outputs\\n");
+
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101001, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_INVALID_PARAMETER,
+       "Unaligned logical write was accepted\\n");
+
+    Mapping->Flags = PO_BTRFS_HIBER_MAPPING_FLAG_DEGRADED;
+    TargetCount = 99;
+    MappedLength = 99;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_NOT_SUPPORTED,
+       "Degraded mapping was accepted\\n");
+    ok(TargetCount == 0 && MappedLength == 0,
+       "Failed mapping left stale target outputs\\n");
+    Mapping->Flags = 0;
+
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID1;
+    Mapping->StripeCount = 3;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_NOT_SUPPORTED,
+       "RAID1 with invalid stripe topology was accepted\\n");
+    Mapping->StripeCount = 4;
+
+    /* SINGLE is valid only with one stripe. */
+    Mapping->ChunkType = 0;
+    Mapping->StripeCount = 1;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_SUCCESS && TargetCount == 1,
+       "Valid SINGLE mapping rejected\\n");
+    Mapping->StripeCount = 4;
+
+    /* DUP mirrors must identify the same physical member. */
+    Mapping->ChunkType = PO_BTRFS_BLOCK_DUP;
+    Mapping->StripeCount = 2;
+    Mapping->Stripes[1].DeviceId = Mapping->Stripes[0].DeviceId;
+    Mapping->Stripes[1].DeviceUuid[0] = Mapping->Stripes[0].DeviceUuid[0];
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_SUCCESS && TargetCount == 2,
+       "Valid DUP mapping rejected\\n");
+    Mapping->Stripes[1].DeviceId = 2;
+    Mapping->Stripes[1].DeviceUuid[0] = 2;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_NOT_SUPPORTED,
+       "DUP across different devices was incorrectly accepted\\n");
+
+    Mapping->StripeCount = 4;
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID1C3;
+    Mapping->StripeCount = 3;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_SUCCESS && TargetCount == 3,
+       "RAID1C3 mapping failed\\n");
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID1C4;
+    Mapping->StripeCount = 4;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_SUCCESS && TargetCount == 4,
+       "RAID1C4 mapping failed\\n");
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID0 | PO_BTRFS_BLOCK_RAID1;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_FILE_CORRUPT_ERROR,
+       "Conflicting Btrfs profiles were accepted\\n");
+
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID5;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_NOT_SUPPORTED,
+       "RAID5 parity mapping was incorrectly enabled\n");
+
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID6;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_NOT_SUPPORTED,
+       "RAID6 parity mapping was incorrectly enabled\n");
+
+    Mapping->ChunkType = 0;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_NOT_SUPPORTED,
+       "Multi-stripe SINGLE layout was incorrectly accepted\n");
+
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID1;
+    Mapping->StripeCount = 3;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x101000, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_NOT_SUPPORTED,
+       "RAID1 with invalid stripe topology was accepted\n");
+    Mapping->StripeCount = 4;
+    Mapping->ChunkType = PO_BTRFS_BLOCK_RAID0;
+    Mapping->Stripes[1].Flags = PO_BTRFS_HIBER_STRIPE_MISSING;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x110200, 512,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_NOT_SUPPORTED, "Missing RAID0 member accepted\n");
+
+    Mapping->Stripes[1].Flags = 0;
+    Mapping->Stripes[1].DeviceSize = 0x300000;
+    Status = PopDumpBtrfsMapLogicalRange(Mapping, 0x110200, 4096,
+                                         Targets, &TargetCount, &MappedLength);
+    ok(Status == STATUS_DISK_FULL,
+       "Out-of-range member write was accepted\n");
+
+    Mapping->Stripes[1].DeviceSize = 0x1000000;
+
+    Mapping->Stripes[0].PhysicalOffset++;
+    Status = PopDumpBtrfsValidateMapping(Storage.Buffer,
+                                         sizeof(Storage.Buffer), &Mapping);
+    ok(Status == STATUS_FILE_CORRUPT_ERROR,
+       "Unaligned member physical offset accepted\\n");
+    Mapping->Stripes[0].PhysicalOffset--;
+
+    Mapping->Stripes[0].DeviceUuid[0] = 0;
+    Status = PopDumpBtrfsValidateMapping(Storage.Buffer,
+                                         sizeof(Storage.Buffer), &Mapping);
+    ok(Status == STATUS_FILE_CORRUPT_ERROR,
+       "Zero member UUID accepted\\n");
+    Mapping->Stripes[0].DeviceUuid[0] = 1;
+
+    Mapping->Reserved2 = 1;
+    Status = PopDumpBtrfsValidateMapping(Storage.Buffer,
+                                         sizeof(Storage.Buffer), &Mapping);
+    ok(Status == STATUS_FILE_CORRUPT_ERROR,
+       "Nonzero mapping reserved field accepted\n");
+}
+
 START_TEST(PoHiber)
 {
     TestAtaIdentify();
     TestAtaAddress();
+    TestBtrfsDeviceList();
+    TestBtrfsChunkMapping();
 }
