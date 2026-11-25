@@ -8,61 +8,96 @@
 #include <ntoskrnl.h>
 #define NDEBUG
 #include <debug.h>
-#include "inbv/logo.h"
 
+/*
+ * Perform the S1-S3 transition after PoSleepSystem has validated the
+ * requested state and refreshed the platform capabilities.
+ *
+ * Set rollback flags before invoking each suspend callback: a callback can
+ * fail after partially suspending its clients, so issue its matching resume
+ * notification even when the suspend callback reports failure.
+ */
 NTSTATUS
 NTAPI
-PopEnterSleepState(_In_ SYSTEM_POWER_STATE SystemState)
+PopEnterSleepState(
+    _In_ SYSTEM_POWER_STATE SystemState
+)
 {
-    if ((SystemState < PowerSystemSleeping1) ||
-        (SystemState > PowerSystemSleeping3))
+    WIN32_POWERSTATE_PARAMETERS Parameters;
+    NTSTATUS Status;
+    NTSTATUS ResumeStatus;
+    BOOLEAN AppsSuspendAttempted = FALSE;
+    BOOLEAN ServicesSuspendAttempted = FALSE;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
+
+    if (SystemState < PowerSystemSleeping1 ||
+        SystemState > PowerSystemSleeping3)
     {
         return STATUS_INVALID_PARAMETER;
     }
 
     DPRINT("Entering system sleep state %u\n", SystemState);
-    return PopSetSystemPowerState(SystemState, PowerActionSleep);
-}
 
-NTSTATUS
-NTAPI
-PopSaveHiberContextStates(
-    _Inout_ PPOP_HIBER_CONTEXT Context
-)
-{
-    TIME_FIELDS RtcTime;
-    NTSTATUS Status;
-
-    if (Context == NULL)
-        return STATUS_INVALID_PARAMETER;
-
-    if (Context->HiberStatusScreenInitialized)
-        return STATUS_SUCCESS;
-
-    if (!HalQueryRealTimeClock(&RtcTime))
-        return STATUS_UNSUCCESSFUL;
-
-    Context->ImageHeader.RtcTime.Year = RtcTime.Year;
-    Context->ImageHeader.RtcTime.Month = RtcTime.Month;
-    Context->ImageHeader.RtcTime.Day = RtcTime.Day;
-    Context->ImageHeader.RtcTime.Weekday = RtcTime.Weekday;
-    Context->ImageHeader.RtcTime.Hour = RtcTime.Hour;
-    Context->ImageHeader.RtcTime.Minute = RtcTime.Minute;
-    Context->ImageHeader.RtcTime.Second = RtcTime.Second;
-    Context->ImageHeader.RtcTime.Milliseconds = RtcTime.Milliseconds;
-    Context->ImageHeader.Flags |= HIBERFILE_FLAG_HAS_RTC_TIME;
-
-    Status = PopHiberWriteImageHeader(Context);
-    if (!NT_SUCCESS(Status))
-        return Status;
-
-    /* Put up a hibernating screen */
-    if ( !Context->HiberStatusScreenInitialized )
+    if (PopStateCallout != NULL)
     {
-        DisplayHibernationScreen();
-        Context->HiberStatusScreenInitialized = TRUE;
+        RtlZeroMemory(&Parameters, sizeof(Parameters));
+        Parameters.SystemAction = PowerActionSleep;
+        Parameters.MinSystemState = SystemState;
+        Parameters.Flags = PopAction.Flags;
+
+        AppsSuspendAttempted = TRUE;
+        Parameters.PowerStateTask = PowerState_SuspendApps;
+        Status = PopStateCallout(&Parameters);
+        if (!NT_SUCCESS(Status))
+        {
+            DPRINT1("Suspend-app notification failed: 0x%08lx\n", Status);
+            goto Resume;
+        }
+
+        ServicesSuspendAttempted = TRUE;
+        Parameters.PowerStateTask = PowerState_SuspendServices;
+        Status = PopStateCallout(&Parameters);
+        if (!NT_SUCCESS(Status))
+        {
+            DPRINT1("Suspend-service notification failed: 0x%08lx\n", Status);
+            goto Resume;
+        }
     }
 
-    Context->HiberPercentComplete = 0;
-    return STATUS_SUCCESS;
+    Status = PopSetSystemPowerState(SystemState, PowerActionSleep);
+
+Resume:
+    /* Resume in reverse order; preserve the original transition failure. */
+    if (PopStateCallout != NULL)
+    {
+        if (ServicesSuspendAttempted)
+        {
+            Parameters.PowerStateTask = PowerState_ResumeServices;
+            ResumeStatus = PopStateCallout(&Parameters);
+            if (!NT_SUCCESS(ResumeStatus))
+            {
+                DPRINT1("Resume-service notification failed: 0x%08lx\n",
+                        ResumeStatus);
+                if (NT_SUCCESS(Status))
+                    Status = ResumeStatus;
+            }
+        }
+
+        if (AppsSuspendAttempted)
+        {
+            Parameters.PowerStateTask = PowerState_ResumeApps;
+            ResumeStatus = PopStateCallout(&Parameters);
+            if (!NT_SUCCESS(ResumeStatus))
+            {
+                DPRINT1("Resume-app notification failed: 0x%08lx\n",
+                        ResumeStatus);
+                if (NT_SUCCESS(Status))
+                    Status = ResumeStatus;
+            }
+        }
+    }
+
+    return Status;
 }

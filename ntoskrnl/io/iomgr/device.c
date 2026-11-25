@@ -20,6 +20,7 @@
 ULONG IopDeviceObjectNumber = 0;
 LIST_ENTRY ShutdownListHead, LastChanceShutdownListHead;
 KSPIN_LOCK ShutdownListLock;
+static BOOLEAN IopShutdownInProgress;
 extern LIST_ENTRY IopDiskFileSystemQueueHead;
 extern LIST_ENTRY IopCdRomFileSystemQueueHead;
 extern LIST_ENTRY IopTapeFileSystemQueueHead;
@@ -131,133 +132,91 @@ IoShutdownPnpDevices(VOID)
     return;
 }
 
+static
+VOID
+NTAPI
+IopSendShutdownNotifications(
+    _In_ PLIST_ENTRY ShutdownList)
+{
+    PLIST_ENTRY ListEntry;
+    PSHUTDOWN_ENTRY ShutdownEntry;
+    PDEVICE_OBJECT DeviceObject;
+    PIRP Irp;
+    IO_STATUS_BLOCK StatusBlock;
+    KEVENT Event;
+    NTSTATUS Status;
+
+    KeInitializeEvent(&Event, NotificationEvent, FALSE);
+
+    while ((ListEntry = ExInterlockedRemoveHeadList(ShutdownList,
+                                                     &ShutdownListLock)) != NULL)
+    {
+        ShutdownEntry = CONTAINING_RECORD(ListEntry,
+                                          SHUTDOWN_ENTRY,
+                                          ShutdownList);
+
+        /* Hold the top of the device stack while dispatching the IRP. */
+        DeviceObject = IoGetAttachedDeviceReference(ShutdownEntry->DeviceObject);
+        if (DeviceObject)
+        {
+            KeClearEvent(&Event);
+            RtlZeroMemory(&StatusBlock, sizeof(StatusBlock));
+
+            Irp = IoBuildSynchronousFsdRequest(IRP_MJ_SHUTDOWN,
+                                               DeviceObject,
+                                               NULL,
+                                               0,
+                                               NULL,
+                                               &Event,
+                                               &StatusBlock);
+            if (Irp)
+            {
+                Status = IoCallDriver(DeviceObject, Irp);
+                if (Status == STATUS_PENDING)
+                {
+                    KeWaitForSingleObject(&Event,
+                                          Executive,
+                                          KernelMode,
+                                          FALSE,
+                                          NULL);
+                }
+            }
+
+            ObDereferenceObject(DeviceObject);
+        }
+
+        ShutdownEntry->DeviceObject->Flags &= ~DO_SHUTDOWN_REGISTERED;
+        ObDereferenceObject(ShutdownEntry->DeviceObject);
+        ExFreePoolWithTag(ShutdownEntry, TAG_SHUTDOWN_ENTRY);
+    }
+}
+
 VOID
 NTAPI
 IoShutdownSystem(IN ULONG Phase)
 {
-    PLIST_ENTRY ListEntry;
-    PDEVICE_OBJECT DeviceObject;
-    PSHUTDOWN_ENTRY ShutdownEntry;
-    IO_STATUS_BLOCK StatusBlock;
-    PIRP Irp;
-    KEVENT Event;
-    NTSTATUS Status;
+    KIRQL OldIrql;
 
-    /* Initialize an event to wait on */
-    KeInitializeEvent(&Event, NotificationEvent, FALSE);
-
-    /* What phase? */
     if (Phase == 0)
     {
-        /* Shutdown PnP */
+        /* Prevent new shutdown registrations before draining phase zero. */
+        KeAcquireSpinLock(&ShutdownListLock, &OldIrql);
+        IopShutdownInProgress = TRUE;
+        KeReleaseSpinLock(&ShutdownListLock, OldIrql);
+
         IoShutdownPnpDevices();
-
-        /* Loop first-chance shutdown notifications */
-        ListEntry = ExInterlockedRemoveHeadList(&ShutdownListHead,
-                                                &ShutdownListLock);
-        while (ListEntry)
-        {
-            /* Get the shutdown entry */
-            ShutdownEntry = CONTAINING_RECORD(ListEntry,
-                                              SHUTDOWN_ENTRY,
-                                              ShutdownList);
-
-            /* Get the attached device */
-            DeviceObject = IoGetAttachedDevice(ShutdownEntry->DeviceObject);
-
-            /* Build the shutdown IRP and call the driver */
-            Irp = IoBuildSynchronousFsdRequest(IRP_MJ_SHUTDOWN,
-                                               DeviceObject,
-                                               NULL,
-                                               0,
-                                               NULL,
-                                               &Event,
-                                               &StatusBlock);
-            if (Irp)
-            {
-                Status = IoCallDriver(DeviceObject, Irp);
-                if (Status == STATUS_PENDING)
-                {
-                    /* Wait on the driver */
-                    KeWaitForSingleObject(&Event, Executive, KernelMode, FALSE, NULL);
-                }
-            }
-
-            /* Remove the flag */
-            ShutdownEntry->DeviceObject->Flags &= ~DO_SHUTDOWN_REGISTERED;
-
-            /* Get rid of our reference to it */
-            ObDereferenceObject(ShutdownEntry->DeviceObject);
-
-            /* Free the shutdown entry and reset the event */
-            ExFreePoolWithTag(ShutdownEntry, TAG_SHUTDOWN_ENTRY);
-            KeClearEvent(&Event);
-
-            /* Go to the next entry */
-            ListEntry = ExInterlockedRemoveHeadList(&ShutdownListHead,
-                                                    &ShutdownListLock);
-         }
+        IopSendShutdownNotifications(&ShutdownListHead);
     }
     else if (Phase == 1)
     {
-        /* Acquire resource forever */
+        /* Keep the I/O database stable while filesystems are shut down. */
         ExAcquireResourceExclusiveLite(&IopDatabaseResource, TRUE);
 
-        /* Shutdown disk file systems */
         IopShutdownBaseFileSystems(&IopDiskFileSystemQueueHead);
-
-        /* Shutdown cdrom file systems */
         IopShutdownBaseFileSystems(&IopCdRomFileSystemQueueHead);
-
-        /* Shutdown tape filesystems */
         IopShutdownBaseFileSystems(&IopTapeFileSystemQueueHead);
 
-        /* Loop last-chance shutdown notifications */
-        ListEntry = ExInterlockedRemoveHeadList(&LastChanceShutdownListHead,
-                                                &ShutdownListLock);
-        while (ListEntry)
-        {
-            /* Get the shutdown entry */
-            ShutdownEntry = CONTAINING_RECORD(ListEntry,
-                                              SHUTDOWN_ENTRY,
-                                              ShutdownList);
-
-            /* Get the attached device */
-            DeviceObject = IoGetAttachedDevice(ShutdownEntry->DeviceObject);
-
-            /* Build the shutdown IRP and call the driver */
-            Irp = IoBuildSynchronousFsdRequest(IRP_MJ_SHUTDOWN,
-                                               DeviceObject,
-                                               NULL,
-                                               0,
-                                               NULL,
-                                               &Event,
-                                               &StatusBlock);
-            if (Irp)
-            {
-                Status = IoCallDriver(DeviceObject, Irp);
-                if (Status == STATUS_PENDING)
-                {
-                    /* Wait on the driver */
-                    KeWaitForSingleObject(&Event, Executive, KernelMode, FALSE, NULL);
-                }
-            }
-
-            /* Remove the flag */
-            ShutdownEntry->DeviceObject->Flags &= ~DO_SHUTDOWN_REGISTERED;
-
-            /* Get rid of our reference to it */
-            ObDereferenceObject(ShutdownEntry->DeviceObject);
-
-            /* Free the shutdown entry and reset the event */
-            ExFreePoolWithTag(ShutdownEntry, TAG_SHUTDOWN_ENTRY);
-            KeClearEvent(&Event);
-
-            /* Go to the next entry */
-            ListEntry = ExInterlockedRemoveHeadList(&LastChanceShutdownListHead,
-                                                    &ShutdownListLock);
-         }
-
+        IopSendShutdownNotifications(&LastChanceShutdownListHead);
     }
 }
 
@@ -1285,10 +1244,16 @@ IoDeleteDevice(IN PDEVICE_OBJECT DeviceObject)
         ObMakeTemporaryObject(DeviceObject);
     }
 
+    /*
+     * Stop per-device power-idle timers before the object becomes
+     * delete-pending.  The power manager drains its DPC/work-item path.
+     */
+    PoRemoveDevice(DeviceObject);
+
     /* Set the pending delete flag */
     IoGetDevObjExtension(DeviceObject)->ExtensionFlags |= DOE_DELETE_PENDING;
 
-    /* Unlink with the power manager */
+    /* Unlink volume bookkeeping from the power manager */
     if (DeviceObject->Vpb) PoRemoveVolumeDevice(DeviceObject);
 
     /* Check if the device object can be unloaded */
@@ -1677,32 +1642,55 @@ IoGetBaseFileSystemDeviceObject(IN PFILE_OBJECT FileObject)
 /*
  * @implemented
  */
+static
+NTSTATUS
+NTAPI
+IopRegisterShutdownNotification(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ BOOLEAN LastChance)
+{
+    PSHUTDOWN_ENTRY Entry;
+    PLIST_ENTRY ListHead;
+    KIRQL OldIrql;
+
+    if (DeviceObject == NULL) return STATUS_INVALID_PARAMETER;
+
+    Entry = ExAllocatePoolWithTag(NonPagedPool,
+                                  sizeof(*Entry),
+                                  TAG_SHUTDOWN_ENTRY);
+    if (Entry == NULL) return STATUS_INSUFFICIENT_RESOURCES;
+
+    Entry->DeviceObject = DeviceObject;
+    ObReferenceObject(DeviceObject);
+
+    ListHead = LastChance ? &LastChanceShutdownListHead : &ShutdownListHead;
+
+    KeAcquireSpinLock(&ShutdownListLock, &OldIrql);
+    if (IopShutdownInProgress ||
+        (DeviceObject->Flags & DO_SHUTDOWN_REGISTERED))
+    {
+        BOOLEAN ShuttingDown = IopShutdownInProgress;
+        KeReleaseSpinLock(&ShutdownListLock, OldIrql);
+        ObDereferenceObject(DeviceObject);
+        ExFreePoolWithTag(Entry, TAG_SHUTDOWN_ENTRY);
+        return ShuttingDown ? STATUS_SYSTEM_SHUTDOWN : STATUS_INVALID_DEVICE_REQUEST;
+    }
+
+    DeviceObject->Flags |= DO_SHUTDOWN_REGISTERED;
+    InsertHeadList(ListHead, &Entry->ShutdownList);
+    KeReleaseSpinLock(&ShutdownListLock, OldIrql);
+
+    return STATUS_SUCCESS;
+}
+
+/*
+ * @implemented
+ */
 NTSTATUS
 NTAPI
 IoRegisterLastChanceShutdownNotification(IN PDEVICE_OBJECT DeviceObject)
 {
-    PSHUTDOWN_ENTRY Entry;
-
-    /* Allocate the shutdown entry */
-    Entry = ExAllocatePoolWithTag(NonPagedPool,
-                                  sizeof(SHUTDOWN_ENTRY),
-                                  TAG_SHUTDOWN_ENTRY);
-    if (!Entry) return STATUS_INSUFFICIENT_RESOURCES;
-
-    /* Set the DO */
-    Entry->DeviceObject = DeviceObject;
-
-    /* Reference it so it doesn't go away */
-    ObReferenceObject(DeviceObject);
-
-    /* Insert it into the list */
-    ExInterlockedInsertHeadList(&LastChanceShutdownListHead,
-                                &Entry->ShutdownList,
-                                &ShutdownListLock);
-
-    /* Set the shutdown registered flag */
-    DeviceObject->Flags |= DO_SHUTDOWN_REGISTERED;
-    return STATUS_SUCCESS;
+    return IopRegisterShutdownNotification(DeviceObject, TRUE);
 }
 
 /*
@@ -1712,28 +1700,7 @@ NTSTATUS
 NTAPI
 IoRegisterShutdownNotification(PDEVICE_OBJECT DeviceObject)
 {
-    PSHUTDOWN_ENTRY Entry;
-
-    /* Allocate the shutdown entry */
-    Entry = ExAllocatePoolWithTag(NonPagedPool,
-                                  sizeof(SHUTDOWN_ENTRY),
-                                  TAG_SHUTDOWN_ENTRY);
-    if (!Entry) return STATUS_INSUFFICIENT_RESOURCES;
-
-    /* Set the DO */
-    Entry->DeviceObject = DeviceObject;
-
-    /* Reference it so it doesn't go away */
-    ObReferenceObject(DeviceObject);
-
-    /* Insert it into the list */
-    ExInterlockedInsertHeadList(&ShutdownListHead,
-                                &Entry->ShutdownList,
-                                &ShutdownListLock);
-
-    /* Set the shutdown registered flag */
-    DeviceObject->Flags |= DO_SHUTDOWN_REGISTERED;
-    return STATUS_SUCCESS;
+    return IopRegisterShutdownNotification(DeviceObject, FALSE);
 }
 
 /*
@@ -1747,10 +1714,7 @@ IoUnregisterShutdownNotification(PDEVICE_OBJECT DeviceObject)
     PLIST_ENTRY NextEntry;
     KIRQL OldIrql;
 
-    /* Remove the flag */
-    DeviceObject->Flags &= ~DO_SHUTDOWN_REGISTERED;
-
-    /* Acquire the shutdown lock and loop the shutdown list */
+    /* Acquire the shutdown lock before changing registration state. */
     KeAcquireSpinLock(&ShutdownListLock, &OldIrql);
     NextEntry = ShutdownListHead.Flink;
     while (NextEntry != &ShutdownListHead)
@@ -1804,6 +1768,9 @@ IoUnregisterShutdownNotification(PDEVICE_OBJECT DeviceObject)
         /* Go to the next entry */
         NextEntry = NextEntry->Flink;
     }
+
+    /* The flag covers both lists and is cleared only after both are drained. */
+    DeviceObject->Flags &= ~DO_SHUTDOWN_REGISTERED;
 
     /* Release the shutdown lock */
     KeReleaseSpinLock(&ShutdownListLock, OldIrql);

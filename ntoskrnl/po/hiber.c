@@ -755,6 +755,7 @@ PopHiberSystemHandler(
     RtlZeroMemory(&Context->ImageHeader, sizeof(Context->ImageHeader));
     Context->PagesOut = 0;
     Context->NoRanges = 0;
+    Context->HiberMetadataSaved = FALSE;
     Context->HiberStatusScreenInitialized = FALSE;
     Context->ResumeFlag = 0;
     if (KeNumberProcessors != 1)
@@ -919,7 +920,7 @@ PopHiberSystemHandler(
         KeLowerIrql(OldIrql);
     }
 
-    Status = PopSaveHiberContextStates(Context);
+    Status = PopSaveHiberContextState(Context);
     if (NT_SUCCESS(Status))
         Status = PopHiberSerializeMemory(Context);
 
@@ -940,6 +941,68 @@ PopHiberSystemHandler(
 
     return Status;
 #endif
+}
+
+/*
+ * Save the metadata required to identify and resume a hibernation image,
+ * then initialize the progress display.  Commit the header before showing
+ * the UI or starting memory serialization.
+ */
+NTSTATUS
+NTAPI
+PopSaveHiberContextState(
+    _Inout_ PPOP_HIBER_CONTEXT Context
+)
+{
+    TIME_FIELDS RtcTime;
+    LARGE_INTEGER ValidatedTime;
+    NTSTATUS Status;
+
+    if (Context == NULL || Context->LinkFileHandle == NULL)
+        return STATUS_INVALID_PARAMETER;
+
+    if (!Context->HiberMetadataSaved)
+    {
+        RtlZeroMemory(&Context->ImageHeader.RtcTime,
+                      sizeof(Context->ImageHeader.RtcTime));
+        Context->ImageHeader.Flags &= ~HIBERFILE_FLAG_HAS_RTC_TIME;
+
+        if (!HalQueryRealTimeClock(&RtcTime))
+            return STATUS_UNSUCCESSFUL;
+
+        if (!RtlTimeFieldsToTime(&RtcTime, &ValidatedTime))
+            return STATUS_DEVICE_DATA_ERROR;
+
+        Context->ImageHeader.RtcTime.Year = RtcTime.Year;
+        Context->ImageHeader.RtcTime.Month = RtcTime.Month;
+        Context->ImageHeader.RtcTime.Day = RtcTime.Day;
+        Context->ImageHeader.RtcTime.Weekday = RtcTime.Weekday;
+        Context->ImageHeader.RtcTime.Hour = RtcTime.Hour;
+        Context->ImageHeader.RtcTime.Minute = RtcTime.Minute;
+        Context->ImageHeader.RtcTime.Second = RtcTime.Second;
+        Context->ImageHeader.RtcTime.Milliseconds = RtcTime.Milliseconds;
+        Context->ImageHeader.Flags |= HIBERFILE_FLAG_HAS_RTC_TIME;
+
+        Status = PopHiberWriteImageHeader(Context);
+        if (!NT_SUCCESS(Status))
+        {
+            Context->ImageHeader.Flags &= ~HIBERFILE_FLAG_HAS_RTC_TIME;
+            RtlZeroMemory(&Context->ImageHeader.RtcTime,
+                          sizeof(Context->ImageHeader.RtcTime));
+            return Status;
+        }
+
+        Context->HiberMetadataSaved = TRUE;
+    }
+
+    if (!Context->HiberStatusScreenInitialized)
+    {
+        DisplayHibernationScreen();
+        Context->HiberStatusScreenInitialized = TRUE;
+    }
+
+    Context->HiberPercentComplete = 0;
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -1092,6 +1155,7 @@ PopHiberOpenFile(
     if (PopHiberContext != NULL && PopHiberContext->LinkFileHandle != NULL)
     {
         PopCapabilities.HiberFilePresent = TRUE;
+        PopCapabilities.SystemS4 = TRUE;
         return STATUS_SUCCESS;
     }
 
@@ -1163,6 +1227,7 @@ PopHiberOpenFile(
     }
 
     PopCapabilities.HiberFilePresent = TRUE;
+    PopCapabilities.SystemS4 = TRUE;
     return STATUS_SUCCESS;
 }
 
@@ -1175,6 +1240,7 @@ PopHiberCloseFile(
     if (PopHiberContext == NULL)
     {
         PopCapabilities.HiberFilePresent = FALSE;
+        PopCapabilities.SystemS4 = FALSE;
         return;
     }
 
@@ -1185,6 +1251,7 @@ PopHiberCloseFile(
     }
 
     PopCapabilities.HiberFilePresent = FALSE;
+    PopCapabilities.SystemS4 = FALSE;
 }
 
 VOID

@@ -1992,11 +1992,19 @@ Phase1InitializationDiscard(IN PVOID Context)
 
     /* Initialize VDM support */
 #if defined(_M_IX86)
+    DPRINT1("INIT: entering VDM initialization\n");
     KeI386VdmInitialize();
+    DPRINT1("INIT: VDM initialization complete\n");
 #endif
 
-    /* Initialize Power Subsystem in Phase 1*/
-    if (!PoInitSystem(1)) KeBugCheck(INTERNAL_POWER_ERROR);
+    /* Initialize Power Subsystem in Phase 1. */
+    DPRINT1("INIT: entering Power Manager phase 1\n");
+    if (!PoInitSystem(1))
+    {
+        DPRINT1("INIT: Power Manager phase 1 failed\n");
+        KeBugCheck(INTERNAL_POWER_ERROR);
+    }
+    DPRINT1("INIT: Power Manager phase 1 complete\n");
 
     /* Update progress bar */
     InbvUpdateProgressBar(90);

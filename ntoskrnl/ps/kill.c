@@ -87,7 +87,8 @@ PspTerminateProcess(IN PEPROCESS Process,
     PSREFTRACE(Process);
 
     /* Check if this is a Critical Process */
-    if (Process->BreakOnTermination)
+    if ((Process->BreakOnTermination) &&
+        (ExitStatus != STATUS_SYSTEM_SHUTDOWN))
     {
         /* Break to debugger */
         PspCatchCriticalBreak("Terminating critical process 0x%p (%s)\n",
@@ -135,20 +136,28 @@ NTAPI
 PsShutdownSystem(VOID)
 {
     PEPROCESS Process = NULL;
+    PEPROCESS NextProcess;
 
-    /* Loop every process */
-    Process = PsGetNextProcess(Process);
+    /*
+     * PsGetNextProcess consumes the reference passed as OldProcess. Keep an
+     * independent reference while terminating the current process, since
+     * termination can remove it from the active-process list.
+     */
+    Process = PsGetNextProcess(NULL);
     while (Process)
     {
-        /* Make sure this isn't the idle or initial process */
-        if ((Process != PsInitialSystemProcess) && (Process != PsIdleProcess))
+        ObReferenceObject(Process);
+        NextProcess = PsGetNextProcess(Process);
+
+        /* Preserve the system and idle processes during shutdown. */
+        if ((Process != PsInitialSystemProcess) &&
+            (Process != PsIdleProcess))
         {
-            /* Kill it */
             PspTerminateProcess(Process, STATUS_SYSTEM_SHUTDOWN);
         }
 
-        /* Get the next process */
-        Process = PsGetNextProcess(Process);
+        ObDereferenceObject(Process);
+        Process = NextProcess;
     }
 }
 
@@ -1228,7 +1237,8 @@ NtTerminateProcess(IN HANDLE ProcessHandle OPTIONAL,
     if (!NT_SUCCESS(Status)) return(Status);
 
     /* Check if this is a Critical Process, and Bugcheck */
-    if (Process->BreakOnTermination)
+    if ((Process->BreakOnTermination) &&
+        (ExitStatus != STATUS_SYSTEM_SHUTDOWN))
     {
         /* Break to debugger */
         PspCatchCriticalBreak("Terminating critical process 0x%p (%s)\n",

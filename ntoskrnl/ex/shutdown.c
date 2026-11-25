@@ -20,17 +20,21 @@ VOID
 NTAPI
 ExShutdownSystem(VOID)
 {
-    /* Dereference the hard-error port and process objects */
-    if (ExpDefaultErrorPort)
-    {
-        ObDereferenceObject(ExpDefaultErrorPort);
-        ExpDefaultErrorPort = NULL;
-    }
-    if (ExpDefaultErrorPortProcess)
-    {
-        ObDereferenceObject(ExpDefaultErrorPortProcess);
-        ExpDefaultErrorPortProcess = NULL;
-    }
+    PVOID ErrorPort;
+    PEPROCESS ErrorPortProcess;
+
+    /*
+     * Detach the global references before dropping them. This makes the
+     * shutdown operation idempotent and ensures the globals no longer retain
+     * references to objects that have already entered teardown.
+     */
+    ErrorPort = ExpDefaultErrorPort;
+    ErrorPortProcess = ExpDefaultErrorPortProcess;
+    ExpDefaultErrorPort = NULL;
+    ExpDefaultErrorPortProcess = NULL;
+
+    if (ErrorPort) ObDereferenceObject(ErrorPort);
+    if (ErrorPortProcess) ObDereferenceObject(ErrorPortProcess);
 }
 
 /* FUNCTIONS *****************************************************************/

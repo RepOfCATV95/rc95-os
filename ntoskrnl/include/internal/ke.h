@@ -355,6 +355,12 @@ KiIpiSend(
     ULONG IpiRequest
 );
 
+#if defined(_M_IX86)
+BOOLEAN
+NTAPI
+KiI386ProcessorFreezeHandler(VOID);
+#endif
+
 VOID
 NTAPI
 KiIpiSendPacket(

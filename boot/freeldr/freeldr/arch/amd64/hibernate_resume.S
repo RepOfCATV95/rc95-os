@@ -75,8 +75,13 @@ WinLdrResumeProcessorState:
     mov cr3, rax
 
     /* Load the restored descriptor tables and task state. */
+#ifdef _USE_ML
     lgdt fword ptr [rsi + HIBER_SPECIAL_GDTR + 6]
     lidt fword ptr [rsi + HIBER_SPECIAL_IDTR + 6]
+#else
+    lgdt [rsi + HIBER_SPECIAL_GDTR + 6]
+    lidt [rsi + HIBER_SPECIAL_IDTR + 6]
+#endif
 
     mov rax, [rsi + HIBER_SPECIAL_GDTR + 8]
     movzx ecx, word ptr [rsi + HIBER_SPECIAL_TR]

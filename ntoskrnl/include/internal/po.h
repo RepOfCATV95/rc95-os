@@ -89,6 +89,7 @@ typedef struct _POP_HIBER_CONTEXT
     PO_HIBER_PERF PerfInfo;
     PO_HIBER_IMAGE_HEADER ImageHeader;
     ULONG HiberPercentComplete;
+    BOOLEAN HiberMetadataSaved;
     BOOLEAN HiberStatusScreenInitialized;
     volatile ULONG ResumeFlag;
     volatile BOOLEAN DumpStackActive;
@@ -118,9 +119,10 @@ PopHiberUpdateComplete(
     _In_ ULONG Percentage
 );
 
+
 NTSTATUS
 NTAPI
-PopSaveHiberContextStates(
+PopSaveHiberContextState(
     _Inout_ PPOP_HIBER_CONTEXT Context
 );
 
@@ -302,6 +304,22 @@ PopInitShutdownList(
     VOID
 );
 
+NTSTATUS
+NTAPI
+PopRegisterPowerSettingPolicy(
+    _In_opt_ PDEVICE_OBJECT DeviceObject,
+    _In_ LPCGUID SettingGuid,
+    _In_ PPOWER_SETTING_CALLBACK Callback,
+    _In_opt_ PVOID Context,
+    _Out_ PVOID *Handle
+);
+
+NTSTATUS
+NTAPI
+PopUnregisterPowerSettingPolicy(
+    _In_ PVOID Handle
+);
+
 //
 // I/O Routines
 //
@@ -322,6 +340,11 @@ NTAPI
 PoRemoveVolumeDevice(
     _In_ PDEVICE_OBJECT DeviceObject);
 
+VOID
+NTAPI
+PoRemoveDevice(
+    _In_ PDEVICE_OBJECT DeviceObject);
+
 //
 // Power State routines
 //
@@ -335,6 +358,12 @@ PopSetSystemPowerState(
 NTSTATUS
 NTAPI
 PopEnterSleepState(
+    _In_ SYSTEM_POWER_STATE SystemState
+);
+
+NTSTATUS
+NTAPI
+PoSleepSystem(
     _In_ SYSTEM_POWER_STATE SystemState
 );
 

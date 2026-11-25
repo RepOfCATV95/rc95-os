@@ -266,25 +266,13 @@ VOID
 NTAPI
 PopGracefulShutdown(_In_opt_ PVOID Context)
 {
-    PEPROCESS Process = NULL;
 
     /* Process the registered waits and work items */
     PopProcessShutDownLists();
 
-    /* Loop every process */
-    Process = PsGetNextProcess(Process);
-    while (Process)
-    {
-        /* Make sure this isn't the idle or initial process */
-        if ((Process != PsInitialSystemProcess) && (Process != PsIdleProcess))
-        {
-            /* Print it */
-            DPRINT1("%15s is still RUNNING (%p)\n", Process->ImageFileName, Process->UniqueProcessId);
-        }
-
-        /* Get the next process */
-        Process = PsGetNextProcess(Process);
-    }
+    /* Terminate user processes before shutting down their devices. */
+    DPRINT("Process manager shutting down\n");
+    PsShutdownSystem();
 
     /* First, the HAL handles any "end of boot" special functionality */
     DPRINT("HAL shutting down\n");

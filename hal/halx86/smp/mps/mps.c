@@ -90,18 +90,32 @@ HalpMpsFindFloatingPointer(VOID)
 {
     PHALP_MPS_FP Fp;
     USHORT ConventionalKb, EbdaSegment;
-    Fp = HalpMpsScan(0, 0x400);
-    if (Fp) return Fp;
-    ConventionalKb = *(volatile PUSHORT)(ULONG_PTR)0x413;
-    if (ConventionalKb && (ConventionalKb * 1024) >= 0x400) {
-        Fp = HalpMpsScan((ConventionalKb * 1024) - 0x400, 0x400);
-        if (Fp) return Fp;
-    }
+    ULONG EbdaBase;
+
+    /*
+     * MPS 1.4 discovery order is EBDA, the last KiB of conventional
+     * memory, then the BIOS ROM window. Do not prefer arbitrary data in
+     * the first 1 KiB of base memory over the firmware-defined locations.
+     */
     EbdaSegment = *(volatile PUSHORT)(ULONG_PTR)0x40E;
-    if (EbdaSegment) {
-        Fp = HalpMpsScan((ULONG)EbdaSegment << 4, 0x400);
+    EbdaBase = (ULONG)EbdaSegment << 4;
+    if (EbdaSegment != 0 && EbdaBase >= 0x80000 && EbdaBase < 0xA0000)
+    {
+        Fp = HalpMpsScan(EbdaBase, 0x400);
         if (Fp) return Fp;
     }
+
+    ConventionalKb = *(volatile PUSHORT)(ULONG_PTR)0x413;
+    if (ConventionalKb != 0 && ConventionalKb <= 640)
+    {
+        ULONG ConventionalBytes = (ULONG)ConventionalKb * 1024;
+        if (ConventionalBytes >= 0x400)
+        {
+            Fp = HalpMpsScan(ConventionalBytes - 0x400, 0x400);
+            if (Fp) return Fp;
+        }
+    }
+
     return HalpMpsScan(0xF0000, 0x10000);
 }
 
@@ -176,11 +190,15 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
     ULONG i, ScanIndex, CpuCount = 0, IoCount = 0;
     UCHAR BootId = (UCHAR)KeGetCurrentPrcb()->InitialApicId;
     BOOLEAN BootFound = FALSE;
+    BOOLEAN BootFlagFound = FALSE;
+    BOOLEAN BusSeen[256] = {FALSE};
     ULONG BusTypes[256] = {0};
 
     if ((ULONG_PTR)Table + Table->Length + Table->ExtendedLength < (ULONG_PTR)Table ||
         RtlCompareMemory(Table->Signature, "PCMP", 4) != 4 ||
         Table->Length < sizeof(*Table) ||
+        Table->LocalApicAddress == 0 ||
+        (Table->LocalApicAddress & (PAGE_SIZE - 1)) != 0 ||
         (Table->Revision != 1 && Table->Revision != 4) ||
         !HalpMpsChecksum((const UCHAR *)Table, Table->Length))
         return FALSE;
@@ -211,6 +229,8 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
         if ((ULONG)(End - Scan) < ScanSize) return FALSE;
         if (Scan[0] == MPS_BUS)
         {
+            if (BusSeen[Scan[1]]) return FALSE;
+            BusSeen[Scan[1]] = TRUE;
             if (RtlCompareMemory(Scan + 2, "ISA   ", 6) == 6) BusTypes[Scan[1]] = 1;
             else if (RtlCompareMemory(Scan + 2, "EISA  ", 6) == 6) BusTypes[Scan[1]] = 2;
             else if (RtlCompareMemory(Scan + 2, "PCI   ", 6) == 6) BusTypes[Scan[1]] = 3;
@@ -235,12 +255,35 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
 
         if (Entry[0] == MPS_CPU) {
             PHALP_MPS_CPU Cpu = (PHALP_MPS_CPU)Entry;
-            if (Cpu->Flags & 1) {
-                if (CpuCount >= MAXIMUM_PROCESSORS) return FALSE;
+            if (Cpu->Flags & 1)
+            {
+                ULONG Previous;
+
+                if ((Cpu->Flags & ~3) != 0 ||
+                    Cpu->ApicId == 0xFF ||
+                    CpuCount >= MAXIMUM_PROCESSORS)
+                    return FALSE;
+
+                for (Previous = 0; Previous < CpuCount; ++Previous)
+                {
+                    if (HalpProcessorIdentity[Previous].LapicId == Cpu->ApicId)
+                        return FALSE;
+                }
+
+                if (Cpu->ApicId == BootId)
+                {
+                    BootFound = TRUE;
+                    if (Cpu->Flags & 2) BootFlagFound = TRUE;
+                }
+                else if (Cpu->Flags & 2)
+                {
+                    /* The firmware must not identify a different BSP. */
+                    return FALSE;
+                }
+
                 HalpProcessorIdentity[CpuCount].ProcessorId = Cpu->ApicId;
                 HalpProcessorIdentity[CpuCount].LapicId = Cpu->ApicId;
                 HalpProcessorIdentity[CpuCount].BSPCheck = (Cpu->Flags & 2) != 0;
-                if (Cpu->ApicId == BootId) BootFound = TRUE;
                 ++CpuCount;
             }
         } else if (Entry[0] == MPS_BUS) {
@@ -253,7 +296,10 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
             if (Io->Flags & 1)
             {
                 ULONG Previous;
-                if (Io->Address == 0 || IoCount >= HALP_APIC_INFO_TABLE_IOAPIC_NUMBER)
+                if ((Io->Flags & ~1) != 0 ||
+                    Io->Address == 0 ||
+                    (Io->Address & (PAGE_SIZE - 1)) != 0 ||
+                    IoCount >= HALP_APIC_INFO_TABLE_IOAPIC_NUMBER)
                     return FALSE;
                 for (Previous = 0; Previous < IoCount; ++Previous)
                     if (HalpApicInfoTable.IoApicId[Previous] == Io->ApicId)
@@ -269,9 +315,11 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
             if (n >= HALP_MPS_MAX_INTERRUPT_ROUTES) return FALSE;
             Route = &HalpApicInfoTable.MpsInterruptRoutes[n];
             Route->InterruptType = Entry[1];
-            Route->Flags = *(PUSHORT)(Entry + 2);
-            if ((Route->Flags & 0xFFF0) ||
-                ((Route->Flags & 3) == 2) || (((Route->Flags >> 2) & 3) == 2))
+            RtlCopyMemory(&Route->Flags, Entry + 2, sizeof(Route->Flags));
+            if (Route->InterruptType > 3 ||
+                (Route->Flags & 0xFFF0) ||
+                ((Route->Flags & 3) == 2) || (((Route->Flags >> 2) & 3) == 2) ||
+                !BusSeen[Entry[4]])
                 return FALSE;
             Route->SourceBus = Entry[4];
             Route->SourceBusType = (UCHAR)BusTypes[Entry[4]];
@@ -298,7 +346,29 @@ HalpMpsParseTable(_In_ PHALP_MPS_HEADER Table)
         Entry += Size;
     }
 
-    if (Entry != End || CpuCount == 0 || !BootFound) return FALSE;
+    if (Entry != End || CpuCount == 0 || !BootFound || !BootFlagFound)
+        return FALSE;
+
+    /* Every interrupt source must name an IOAPIC present in the table. */
+    for (i = 0; i < HalpApicInfoTable.MpsInterruptRouteCount; ++i)
+    {
+        ULONG IoIndex;
+        BOOLEAN DestinationFound = FALSE;
+        HALP_MPS_INTERRUPT_ROUTE *Route =
+            &HalpApicInfoTable.MpsInterruptRoutes[i];
+
+        for (IoIndex = 0; IoIndex < IoCount; ++IoIndex)
+        {
+            if (HalpApicInfoTable.IoApicId[IoIndex] == Route->DestinationApic)
+            {
+                DestinationFound = TRUE;
+                break;
+            }
+        }
+
+        if (!DestinationFound)
+            return FALSE;
+    }
     for (i = 0; i < CpuCount; ++i)
         if (HalpProcessorIdentity[i].LapicId == BootId) break;
     if (i == CpuCount) return FALSE;
@@ -324,6 +394,7 @@ HalpParseApicTables(_In_ PLOADER_PARAMETER_BLOCK LoaderBlock)
 
     Fp = HalpMpsFindFloatingPointer();
     if (!Fp || Fp->Feature[0] != 0 || Fp->TableAddress == 0 ||
+        (Fp->TableAddress & 0x0F) != 0 ||
         !HalpMpsParseTable((PHALP_MPS_HEADER)(ULONG_PTR)Fp->TableAddress)) {
         DPRINT1("HALMP: No usable Intel MPS configuration; continuing with BSP only\n");
         RtlZeroMemory(&HalpApicInfoTable, sizeof(HalpApicInfoTable));
@@ -344,8 +415,10 @@ HalpMpsGetPciInterruptGsi(
     ULONG Index;
     UCHAR SourceBusIrq;
 
-    if (HalpApicInfoTable.ApicMode != HALP_APIC_MODE_LEGACY ||
-        DeviceNumber > 31 || InterruptPin < 1 || InterruptPin > 4)
+    if (GlobalSystemInterrupt == NULL ||
+        HalpApicInfoTable.ApicMode != HALP_APIC_MODE_LEGACY ||
+        BusNumber > 0xFF || DeviceNumber > 31 ||
+        InterruptPin < 1 || InterruptPin > 4)
         return FALSE;
 
     /* MPS encodes PCI INT[A..D] as device-number << 2 | pin[1:0]. */

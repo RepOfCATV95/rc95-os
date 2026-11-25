@@ -95,7 +95,8 @@ HalStartNextProcessor(
         return FALSE;
 
     /* Bail out if we have started all available CPUs */
-    if (HalpStartedProcessorCount == HalpApicInfoTable.ProcessorCount)
+    if (HalpStartedProcessorCount >= HalpApicInfoTable.ProcessorCount ||
+        HalpStartedProcessorCount >= MAXIMUM_PROCESSORS)
         return FALSE;
 
     // Initalize the temporary page table
@@ -121,7 +122,15 @@ HalStartNextProcessor(
     };
 
     /* The AP marks its identity entry started from HalpSetupProcessorsTable. */
+    if (HalpProcessorIdentity[HalpStartedProcessorCount].ProcessorStarted)
+    {
+        DPRINT1("HAL: refusing to restart already-started AP index %lu\n",
+                HalpStartedProcessorCount);
+        return FALSE;
+    }
+
     HalpProcessorIdentity[HalpStartedProcessorCount].ProcessorStarted = FALSE;
+    KeMemoryBarrier();
     ApicStartApplicationProcessor(HalpStartedProcessorCount, HalpLowStubPhysicalAddress);
 
     for (ULONG Wait = 0; Wait < 1000; ++Wait)

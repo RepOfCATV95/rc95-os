@@ -36,8 +36,36 @@ FASTCALL
 KiIpiSend(IN KAFFINITY TargetProcessors,
           IN ULONG IpiRequest)
 {
-    /* FIXME: TODO */
-    ASSERTMSG("Not yet implemented\n", FALSE);
+#if defined(_M_IX86) && defined(CONFIG_SMP)
+    ULONG Index;
+
+    if (TargetProcessors == 0)
+        return;
+
+    ASSERT(IpiRequest == IPI_APC ||
+           IpiRequest == IPI_DPC ||
+           IpiRequest == IPI_FREEZE);
+
+    /* Set request bits on every destination before ringing the APIC. */
+    for (Index = 0; Index < KeNumberProcessors; ++Index)
+    {
+        PKPRCB TargetPrcb = KiProcessorBlock[Index];
+
+        if (TargetPrcb != NULL &&
+            (TargetProcessors & TargetPrcb->SetMember))
+        {
+            InterlockedBitTestAndSet((PLONG)&TargetPrcb->IpiFrozen,
+                                     IpiRequest);
+        }
+    }
+
+    KeMemoryBarrier();
+    HalRequestIpi(TargetProcessors);
+#else
+    UNREFERENCED_PARAMETER(TargetProcessors);
+    UNREFERENCED_PARAMETER(IpiRequest);
+    ASSERTMSG("KiIpiSend is not implemented for this architecture\n", FALSE);
+#endif
 }
 
 VOID
@@ -166,6 +194,13 @@ KiIpiServiceRoutine(IN PKTRAP_FRAME TrapFrame,
         Prcb->DpcInterruptRequested = TRUE;
         HalRequestSoftwareInterrupt(DISPATCH_LEVEL);
     }
+
+#if defined(_M_IX86)
+    if (InterlockedBitTestAndReset((PLONG)&Prcb->IpiFrozen, IPI_FREEZE))
+    {
+        (void)KiI386ProcessorFreezeHandler();
+    }
+#endif
 
     if (InterlockedBitTestAndReset((PLONG)&Prcb->IpiFrozen, IPI_SYNCH_REQUEST))
     {

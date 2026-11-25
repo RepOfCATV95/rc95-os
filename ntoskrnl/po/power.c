@@ -28,6 +28,63 @@ BOOLEAN PopAcpiPresent = FALSE;
 POP_POWER_ACTION PopAction;
 WORK_QUEUE_ITEM PopShutdownWorkItem;
 SYSTEM_POWER_CAPABILITIES PopCapabilities;
+/* Retain each PnP notification registration so phase-1 failure can roll back. */
+static PVOID PopPowerButtonNotification;
+static PVOID PopLidNotification;
+static PVOID PopBatteryNotification;
+
+/*
+ * NT 5.x execution-state and Vista power-setting registrations share one
+ * phase-0 initialized registry and one handle-validation/lifetime domain.
+ */
+typedef enum _POP_POWER_POLICY_REGISTRATION_TYPE
+{
+    PopPolicyRegistrationSystemState,
+    PopPolicyRegistrationPowerSetting
+} POP_POWER_POLICY_REGISTRATION_TYPE;
+
+typedef struct _POP_POWER_POLICY_REGISTRATION
+{
+    LIST_ENTRY ListEntry;
+    POP_POWER_POLICY_REGISTRATION_TYPE Type;
+    union
+    {
+        struct { EXECUTION_STATE Flags; } SystemState;
+        struct
+        {
+            PDEVICE_OBJECT DeviceObject;
+            GUID SettingGuid;
+            PPOWER_SETTING_CALLBACK Callback;
+            PVOID Context;
+        } PowerSetting;
+    } u;
+} POP_POWER_POLICY_REGISTRATION, *PPOP_POWER_POLICY_REGISTRATION;
+
+static KSPIN_LOCK PopPowerPolicyLock;
+static LIST_ENTRY PopPowerPolicyList;
+static KSPIN_LOCK PopDeviceIdleLock;
+static LIST_ENTRY PopDeviceIdleList;
+static BOOLEAN PopPhase0Initialized;
+
+typedef struct _POP_DEVICE_IDLE_REGISTRATION
+{
+    LIST_ENTRY ListEntry;
+    PDEVICE_OBJECT DeviceObject;
+    KTIMER Timer;
+    KDPC Dpc;
+    WORK_QUEUE_ITEM WorkItem;
+    KEVENT WorkComplete;
+    volatile LONG WorkQueued;
+    volatile LONG Removing;
+    volatile ULONG IdleCount;
+    ULONG LastIdleCount;
+    ULONG ConservationIdleTime;
+    ULONG PerformanceIdleTime;
+    ULONG IdleThreshold;
+    DEVICE_POWER_STATE TargetState;
+    DEVICE_POWER_STATE CurrentState;
+    ULONGLONG LastActivityTime;
+} POP_DEVICE_IDLE_REGISTRATION, *PPOP_DEVICE_IDLE_REGISTRATION;
 
 /* PRIVATE FUNCTIONS *********************************************************/
 
@@ -47,8 +104,14 @@ PopQuerySystemPowerCapabilities(VOID)
     PopCapabilities.SystemS1 = FALSE;
     PopCapabilities.SystemS2 = FALSE;
     PopCapabilities.SystemS3 = FALSE;
-    PopCapabilities.SystemS4 = FALSE;
+    PopCapabilities.SystemS4 = PopCapabilities.HiberFilePresent;
     PopCapabilities.SystemS5 = FALSE;
+    PopCapabilities.FullWake = FALSE;
+    PopCapabilities.AcOnLineWake = PowerSystemUnspecified;
+    PopCapabilities.SoftLidWake = PowerSystemUnspecified;
+    PopCapabilities.RtcWake = PowerSystemUnspecified;
+    PopCapabilities.MinDeviceWakeState = PowerSystemUnspecified;
+    PopCapabilities.DefaultLowLatencyWake = PowerSystemUnspecified;
 
     if (!PopAcpiPresent)
         return STATUS_SUCCESS;
@@ -61,6 +124,7 @@ PopQuerySystemPowerCapabilities(VOID)
     if (TopDeviceObject == DeviceObject)
     {
         ObDereferenceObject(TopDeviceObject);
+        ObDereferenceObject(DeviceObject);
         return STATUS_SUCCESS;
     }
 
@@ -77,6 +141,7 @@ PopQuerySystemPowerCapabilities(VOID)
     if (Irp == NULL)
     {
         ObDereferenceObject(TopDeviceObject);
+        ObDereferenceObject(DeviceObject);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -93,6 +158,7 @@ PopQuerySystemPowerCapabilities(VOID)
 
     Information = IoStatusBlock.Information;
     ObDereferenceObject(TopDeviceObject);
+    ObDereferenceObject(DeviceObject);
 
     if (!NT_SUCCESS(Status))
         return Status;
@@ -105,7 +171,15 @@ PopQuerySystemPowerCapabilities(VOID)
         BooleanFlagOn(SupportedStates, ACPI_SYSTEM_POWER_S2_SUPPORTED);
     PopCapabilities.SystemS5 =
         BooleanFlagOn(SupportedStates, ACPI_SYSTEM_POWER_S5_SUPPORTED);
-    PopCapabilities.SystemS4 = PopAcpiPresent;
+
+    /*
+     * The ACPI capability IOCTL used by this NT 5.x implementation only
+     * reports S1, S2 and S5.  Do not infer S3 or S4 from ACPI presence:
+     * this kernel has no S3 capability bit, and hibernation initialization
+     * alone does not mean that a hibernation file is configured.
+     */
+    PopCapabilities.SystemS3 = FALSE;
+    PopCapabilities.SystemS4 = PopCapabilities.HiberFilePresent;
 
     return STATUS_SUCCESS;
 }
@@ -206,6 +280,150 @@ PopPresentIrp(
 
 static IO_COMPLETION_ROUTINE PopRequestPowerIrpCompletion;
 
+static VOID NTAPI PopDeviceIdleDpc(
+    _In_ PKDPC Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2);
+
+static VOID NTAPI PopDeviceIdleWorker(_In_ PVOID Context);
+
+static NTSTATUS
+PopSendDevicePowerState(
+    _In_ PDEVICE_OBJECT DeviceObject,
+    _In_ DEVICE_POWER_STATE PowerState)
+{
+    PDEVICE_OBJECT TopDeviceObject;
+    KEVENT Event;
+    IO_STATUS_BLOCK IoStatusBlock;
+    PIRP Irp;
+    PIO_STACK_LOCATION Stack;
+    NTSTATUS Status;
+
+    TopDeviceObject = IoGetAttachedDeviceReference(DeviceObject);
+    if (TopDeviceObject == NULL)
+        return STATUS_NO_SUCH_DEVICE;
+
+    KeInitializeEvent(&Event, NotificationEvent, FALSE);
+    Irp = IoBuildSynchronousFsdRequest(IRP_MJ_POWER,
+                                       TopDeviceObject,
+                                       NULL,
+                                       0,
+                                       NULL,
+                                       &Event,
+                                       &IoStatusBlock);
+    if (Irp == NULL)
+    {
+        ObDereferenceObject(TopDeviceObject);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    Stack = IoGetNextIrpStackLocation(Irp);
+    Stack->MinorFunction = IRP_MN_SET_POWER;
+    Stack->Parameters.Power.Type = DevicePowerState;
+    Stack->Parameters.Power.State.DeviceState = PowerState;
+    Stack->Parameters.Power.ShutdownType = PowerActionNone;
+
+    Status = PoCallDriver(TopDeviceObject, Irp);
+    if (Status == STATUS_PENDING)
+    {
+        KeWaitForSingleObject(&Event, Executive, KernelMode, FALSE, NULL);
+        Status = IoStatusBlock.Status;
+    }
+
+    ObDereferenceObject(TopDeviceObject);
+    return Status;
+}
+
+static VOID NTAPI
+PopDeviceIdleDpc(
+    _In_ PKDPC Dpc,
+    _In_opt_ PVOID DeferredContext,
+    _In_opt_ PVOID SystemArgument1,
+    _In_opt_ PVOID SystemArgument2)
+{
+    PPOP_DEVICE_IDLE_REGISTRATION Registration = DeferredContext;
+
+    UNREFERENCED_PARAMETER(Dpc);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+
+    if (Registration == NULL || Registration->Removing)
+        return;
+
+    if (InterlockedCompareExchange(&Registration->WorkQueued, 1, 0) == 0)
+    {
+        KeClearEvent(&Registration->WorkComplete);
+        ExQueueWorkItem(&Registration->WorkItem, DelayedWorkQueue);
+    }
+}
+
+static VOID NTAPI
+PopDeviceIdleWorker(_In_ PVOID Context)
+{
+    PPOP_DEVICE_IDLE_REGISTRATION Registration = Context;
+    ULONG IdleCount;
+    ULONGLONG Now;
+    ULONGLONG IdleDuration;
+    DEVICE_POWER_STATE RequestedState;
+    KIRQL OldIrql;
+    LARGE_INTEGER DueTime;
+
+    ASSERT(KeGetCurrentIrql() == PASSIVE_LEVEL);
+
+    if (!Registration->Removing)
+    {
+        IdleCount = Registration->IdleCount;
+        Now = KeQueryInterruptTime();
+
+        if (IdleCount != Registration->LastIdleCount)
+        {
+            Registration->LastIdleCount = IdleCount;
+            Registration->LastActivityTime = Now;
+            RequestedState = PowerDeviceD0;
+        }
+        else
+        {
+            IdleDuration = Now - Registration->LastActivityTime;
+            RequestedState =
+                (IdleDuration >= ((ULONGLONG)Registration->IdleThreshold *
+                                  10000000ULL)) ?
+                Registration->TargetState : Registration->CurrentState;
+        }
+
+        if (!Registration->Removing &&
+            RequestedState != Registration->CurrentState)
+        {
+            NTSTATUS Status = PopSendDevicePowerState(
+                Registration->DeviceObject,
+                RequestedState);
+
+            if (NT_SUCCESS(Status))
+                Registration->CurrentState = RequestedState;
+            else
+                DPRINT1("Power idle transition for %p to D%u failed: 0x%08lx\n",
+                        Registration->DeviceObject,
+                        RequestedState,
+                        Status);
+        }
+    }
+
+    /*
+     * Rearm a one-shot timer only after this policy pass.  This prevents the
+     * same WORK_QUEUE_ITEM from being queued while its previous invocation
+     * is still returning.
+     */
+    InterlockedExchange(&Registration->WorkQueued, 0);
+    KeAcquireSpinLock(&PopDeviceIdleLock, &OldIrql);
+    if (!Registration->Removing)
+    {
+        DueTime.QuadPart = -10000000LL;
+        KeSetTimerEx(&Registration->Timer, DueTime, 0, &Registration->Dpc);
+    }
+    KeReleaseSpinLock(&PopDeviceIdleLock, OldIrql);
+    KeSetEvent(&Registration->WorkComplete, IO_NO_INCREMENT, FALSE);
+}
+
 static
 NTSTATUS
 NTAPI
@@ -221,7 +439,10 @@ PopRequestPowerIrpCompletion(
     Stack = IoGetCurrentIrpStackLocation(Irp);
     CompletionRoutine = Context;
 
-    PowerState.DeviceState = (ULONG_PTR)Stack->Parameters.Others.Argument3;
+    if ((UCHAR)(ULONG_PTR)Stack->Parameters.Others.Argument2 == IRP_MN_WAIT_WAKE)
+        PowerState.SystemState = (ULONG_PTR)Stack->Parameters.Others.Argument3;
+    else
+        PowerState.DeviceState = (ULONG_PTR)Stack->Parameters.Others.Argument3;
 
     if (CompletionRoutine)
     {
@@ -232,7 +453,12 @@ PopRequestPowerIrpCompletion(
                           &Irp->IoStatus);
     }
 
-    IoSkipCurrentIrpStackLocation(Irp);
+    /*
+     * PoRequestPowerIrp holds independent references on the original PDO
+     * and the top of its stack.  The completion callback's DeviceObject is
+     * the top-of-stack reference; Argument1 carries the original reference.
+     */
+    ObDereferenceObject(Stack->Parameters.Others.Argument1);
     IoFreeIrp(Irp);
     ObDereferenceObject(DeviceObject);
 
@@ -470,8 +696,8 @@ PopSetSystemPowerState(
     _In_ SYSTEM_POWER_STATE PowerState,
     _In_ POWER_ACTION PowerAction)
 {
-    PDEVICE_OBJECT DeviceObject;
-    PDEVICE_OBJECT Fdo;
+    PDEVICE_OBJECT DeviceObject = NULL;
+    PDEVICE_OBJECT Fdo = NULL;
     NTSTATUS Status;
     DEVICETREE_TRAVERSE_CONTEXT Context;
     POWER_STATE_TRAVERSE_CONTEXT PowerContext;
@@ -500,6 +726,7 @@ PopSetSystemPowerState(
         {
             DPRINT("An FDO was not attached\n");
             ObDereferenceObject(Fdo);
+            ObDereferenceObject(DeviceObject);
             return STATUS_UNSUCCESSFUL;
         }
     }
@@ -523,6 +750,8 @@ PopSetSystemPowerState(
         {
             if (Fdo != NULL)
                 ObDereferenceObject(Fdo);
+            if (DeviceObject != NULL)
+                ObDereferenceObject(DeviceObject);
             return Status;
         }
     }
@@ -540,6 +769,8 @@ PopSetSystemPowerState(
                     RestoreStatus);
         if (Fdo != NULL)
             ObDereferenceObject(Fdo);
+        if (DeviceObject != NULL)
+            ObDereferenceObject(DeviceObject);
         return Status;
     }
 
@@ -557,6 +788,8 @@ PopSetSystemPowerState(
         }
         if (Fdo != NULL)
             ObDereferenceObject(Fdo);
+        if (DeviceObject != NULL)
+            ObDereferenceObject(DeviceObject);
         return STATUS_NOT_IMPLEMENTED;
     }
 
@@ -588,7 +821,10 @@ PopSetSystemPowerState(
 
         ObDereferenceObject(Fdo);
     }
-    else if (Restore)
+    if (DeviceObject != NULL)
+        ObDereferenceObject(DeviceObject);
+
+    if (Fdo == NULL && Restore)
     {
         /* No system power driver to talk to, but the devices were lowered */
         RestoreStatus = PopRestoreWorkingPowerState(PowerAction, NULL);
@@ -602,52 +838,173 @@ PopSetSystemPowerState(
     return Status;
 }
 
+/*
+ * Validate and dispatch a system sleep request.  Transition details,
+ * including suspend/resume callouts and device-state rollback, live in
+ * sleep.c so the Power Manager entry point remains small and stable.
+ */
+NTSTATUS
+NTAPI
+PoSleepSystem(
+    _In_ SYSTEM_POWER_STATE SystemState
+)
+{
+    NTSTATUS Status;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
+
+    if (SystemState < PowerSystemSleeping1 ||
+        SystemState > PowerSystemSleeping3)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!PopAcpiPresent)
+        return STATUS_NOT_SUPPORTED;
+
+    Status = PopQuerySystemPowerCapabilities();
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    if ((SystemState == PowerSystemSleeping1 && !PopCapabilities.SystemS1) ||
+        (SystemState == PowerSystemSleeping2 && !PopCapabilities.SystemS2) ||
+        (SystemState == PowerSystemSleeping3 && !PopCapabilities.SystemS3))
+    {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    return PopEnterSleepState(SystemState);
+}
+
 CODE_SEG("INIT")
 BOOLEAN
 NTAPI
 PoInitSystem(_In_ ULONG BootPhase)
 {
-    PVOID NotificationEntry;
     PCHAR CommandLine;
+    PCHAR Option;
     BOOLEAN ForceAcpiDisable = FALSE;
 
     /* Check if this is phase 1 init */
     if (BootPhase == 1)
     {
         NTSTATUS Status;
-        /* Register power button notification */
+
+        /* Phase 1 depends on all phase-0 locks, lists and hibernation state. */
+        if (!PopPhase0Initialized)
+            return FALSE;
+
+        /* Phase 1 may be retried after a registration or query failure. */
+        if (PopPowerButtonNotification != NULL &&
+            PopLidNotification != NULL &&
+            PopBatteryNotification != NULL)
+        {
+            Status = PopQuerySystemPowerCapabilities();
+            if (!NT_SUCCESS(Status))
+                DPRINT1("Power capability retry failed (0x%08lx)\n", Status);
+            return TRUE;
+        }
+
+        /*
+         * Recover from any stale partial registration set before trying
+         * again.  Normal failure paths clear all three handles below.
+         */
+        if (PopBatteryNotification != NULL)
+        {
+            IoUnregisterPlugPlayNotification(PopBatteryNotification);
+            PopBatteryNotification = NULL;
+        }
+        if (PopLidNotification != NULL)
+        {
+            IoUnregisterPlugPlayNotification(PopLidNotification);
+            PopLidNotification = NULL;
+        }
+        if (PopPowerButtonNotification != NULL)
+        {
+            IoUnregisterPlugPlayNotification(PopPowerButtonNotification);
+            PopPowerButtonNotification = NULL;
+        }
+
+        if (IopRootDeviceNode == NULL ||
+            IopRootDeviceNode->PhysicalDeviceObject == NULL ||
+            IopRootDeviceNode->PhysicalDeviceObject->DriverObject == NULL)
+        {
+            return FALSE;
+        }
+
+        /* Register power button notification. */
         Status = IoRegisterPlugPlayNotification(EventCategoryDeviceInterfaceChange,
                                                 PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
                                                 (PVOID)&GUID_DEVICE_SYS_BUTTON,
                                                 IopRootDeviceNode->PhysicalDeviceObject->DriverObject,
                                                 PopAddRemoveSysCapsCallback,
                                                 (PVOID)(ULONG_PTR)PolicyDeviceSystemButton,
-                                                &NotificationEntry);
+                                                &PopPowerButtonNotification);
         if (!NT_SUCCESS(Status))
-            return FALSE;
+            goto Failure;
 
-        /* Register lid notification */
+        /* Register lid notification. */
         Status = IoRegisterPlugPlayNotification(EventCategoryDeviceInterfaceChange,
                                                 PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
                                                 (PVOID)&GUID_DEVICE_LID,
                                                 IopRootDeviceNode->PhysicalDeviceObject->DriverObject,
                                                 PopAddRemoveSysCapsCallback,
                                                 (PVOID)(ULONG_PTR)PolicyDeviceSystemButton,
-                                                &NotificationEntry);
+                                                &PopLidNotification);
         if (!NT_SUCCESS(Status))
-            return FALSE;
+            goto Failure;
 
-        /* Register battery notification */
+        /* Register battery notification. */
         Status = IoRegisterPlugPlayNotification(EventCategoryDeviceInterfaceChange,
                                                 PNPNOTIFY_DEVICE_INTERFACE_INCLUDE_EXISTING_INTERFACES,
                                                 (PVOID)&GUID_DEVICE_BATTERY,
                                                 IopRootDeviceNode->PhysicalDeviceObject->DriverObject,
                                                 PopAddRemoveSysCapsCallback,
                                                 (PVOID)(ULONG_PTR)PolicyDeviceBattery,
-                                                &NotificationEntry);
+                                                &PopBatteryNotification);
+        if (!NT_SUCCESS(Status))
+            goto Failure;
 
-        return NT_SUCCESS(Status);
+        /*
+         * Query only after the ACPI/PnP stack is available. Failure is
+         * non-fatal: conservative zeroed capabilities remain in force.
+         */
+        Status = PopQuerySystemPowerCapabilities();
+        if (!NT_SUCCESS(Status))
+            DPRINT1("Power capability query failed (0x%08lx); using conservative defaults\n",
+                    Status);
+
+        return TRUE;
+
+Failure:
+        /* Never leave a partially registered notification set behind. */
+        if (PopBatteryNotification != NULL)
+        {
+            IoUnregisterPlugPlayNotification(PopBatteryNotification);
+            PopBatteryNotification = NULL;
+        }
+        if (PopLidNotification != NULL)
+        {
+            IoUnregisterPlugPlayNotification(PopLidNotification);
+            PopLidNotification = NULL;
+        }
+        if (PopPowerButtonNotification != NULL)
+        {
+            IoUnregisterPlugPlayNotification(PopPowerButtonNotification);
+            PopPowerButtonNotification = NULL;
+        }
+
+        DPRINT1("PoInitSystem(1): PnP notification registration failed (0x%08lx)\n",
+                Status);
+        return FALSE;
     }
+
+    if (BootPhase != 0)
+        return FALSE;
+
+    if (PopPhase0Initialized)
+        return TRUE;
 
     /* Initialize the power capabilities */
     RtlZeroMemory(&PopCapabilities, sizeof(SYSTEM_POWER_CAPABILITIES));
@@ -658,8 +1015,15 @@ PoInitSystem(_In_ ULONG BootPhase)
     /* Upcase and inspect it only when the loader supplied one. */
     if (CommandLine != NULL)
     {
-        _strupr(CommandLine);
-        if (strstr(CommandLine, "NOACPI")) ForceAcpiDisable = TRUE;
+        /* Loader-owned load options are read-only from the kernel's point of view. */
+        for (Option = CommandLine; *Option != '\0'; ++Option)
+        {
+            if (_strnicmp(Option, "NOACPI", sizeof("NOACPI") - 1) == 0)
+            {
+                ForceAcpiDisable = TRUE;
+                break;
+            }
+        }
     }
 
     if (ForceAcpiDisable)
@@ -675,16 +1039,21 @@ PoInitSystem(_In_ ULONG BootPhase)
                          KeLoaderBlock->Extension->AcpiTable != NULL);
     }
 
-    /* Enable shutdown by power button */
-    if (PopAcpiPresent)
-        PopCapabilities.SystemS5 = TRUE;
+    /*
+     * The unified policy registry is initialized exactly once in phase 0.
+     * Phase 1 only verifies phase-0 completion and never resets this state.
+     */
+    KeInitializeSpinLock(&PopPowerPolicyLock);
+    InitializeListHead(&PopPowerPolicyList);
 
     /* Initialize volume support */
     InitializeListHead(&PopVolumeDevices);
     KeInitializeGuardedMutex(&PopVolumeLock);
 
-    /* Initialize support for dope */
+    /* Initialize support for device idle registrations and DOPE. */
     KeInitializeSpinLock(&PopDopeGlobalLock);
+    KeInitializeSpinLock(&PopDeviceIdleLock);
+    InitializeListHead(&PopDeviceIdleList);
 
     /* Initialize support for shutdown waits and work-items */
     PopInitShutdownList();
@@ -697,6 +1066,7 @@ PoInitSystem(_In_ ULONG BootPhase)
                     HiberStatus);
     }
 
+    PopPhase0Initialized = TRUE;
     return TRUE;
 }
 
@@ -878,7 +1248,12 @@ PoCallDriver(
 }
 
 /*
- * @unimplemented
+ * @implemented
+ *
+ * The idle counter is sampled once per second.  Any change records device
+ * activity; after the shortest enabled idle policy interval the worker
+ * requests the caller-selected low-power state.  Power IRPs are sent only
+ * from the PASSIVE_LEVEL worker, never from the timer DPC.
  */
 PULONG
 NTAPI
@@ -887,20 +1262,281 @@ PoRegisterDeviceForIdleDetection(_In_ PDEVICE_OBJECT DeviceObject,
                                  _In_ ULONG PerformanceIdleTime,
                                  _In_ DEVICE_POWER_STATE State)
 {
-    UNIMPLEMENTED;
-    return NULL;
+    PPOP_DEVICE_IDLE_REGISTRATION Registration;
+    PEXTENDED_DEVOBJ_EXTENSION DeviceExtension;
+    ULONG IdleThreshold = MAXULONG;
+    KIRQL OldIrql;
+    PLIST_ENTRY Entry;
+    LARGE_INTEGER DueTime;
+
+    PAGED_CODE();
+
+    if (!PopPhase0Initialized ||
+        DeviceObject == NULL ||
+        State <= PowerDeviceD0 ||
+        State >= PowerDeviceMaximum)
+        return NULL;
+
+    if (ConservationIdleTime != 0 && ConservationIdleTime != MAXULONG)
+        IdleThreshold = ConservationIdleTime;
+    if (PerformanceIdleTime != 0 &&
+        PerformanceIdleTime != MAXULONG &&
+        PerformanceIdleTime < IdleThreshold)
+        IdleThreshold = PerformanceIdleTime;
+
+    /* Both policies disabled: there is no idle transition to register. */
+    if (IdleThreshold == MAXULONG)
+        return NULL;
+
+    Registration = ExAllocatePoolWithTag(NonPagedPool,
+                                         sizeof(*Registration),
+                                         'iPoP');
+    if (Registration == NULL)
+        return NULL;
+
+    RtlZeroMemory(Registration, sizeof(*Registration));
+    Registration->DeviceObject = DeviceObject;
+    Registration->ConservationIdleTime = ConservationIdleTime;
+    Registration->PerformanceIdleTime = PerformanceIdleTime;
+    Registration->IdleThreshold = IdleThreshold;
+    Registration->TargetState = State;
+    Registration->CurrentState = PowerDeviceD0;
+    Registration->LastActivityTime = KeQueryInterruptTime();
+    KeInitializeTimerEx(&Registration->Timer, NotificationTimer);
+    KeInitializeDpc(&Registration->Dpc, PopDeviceIdleDpc, Registration);
+    ExInitializeWorkItem(&Registration->WorkItem,
+                         PopDeviceIdleWorker,
+                         Registration);
+    KeInitializeEvent(&Registration->WorkComplete, NotificationEvent, TRUE);
+
+    ObReferenceObject(DeviceObject);
+    DeviceExtension = IoGetDevObjExtension(DeviceObject);
+
+    KeAcquireSpinLock(&PopDeviceIdleLock, &OldIrql);
+    if (DeviceExtension->ExtensionFlags & DOE_DELETE_PENDING)
+    {
+        KeReleaseSpinLock(&PopDeviceIdleLock, OldIrql);
+        ObDereferenceObject(DeviceObject);
+        ExFreePoolWithTag(Registration, 'iPoP');
+        return NULL;
+    }
+
+    /* One idle policy per device object; callers may not alias its counter. */
+    for (Entry = PopDeviceIdleList.Flink;
+         Entry != &PopDeviceIdleList;
+         Entry = Entry->Flink)
+    {
+        PPOP_DEVICE_IDLE_REGISTRATION Existing =
+            CONTAINING_RECORD(Entry, POP_DEVICE_IDLE_REGISTRATION, ListEntry);
+        if (Existing->DeviceObject == DeviceObject)
+        {
+            KeReleaseSpinLock(&PopDeviceIdleLock, OldIrql);
+            ObDereferenceObject(DeviceObject);
+            ExFreePoolWithTag(Registration, 'iPoP');
+            return NULL;
+        }
+    }
+
+    InsertTailList(&PopDeviceIdleList, &Registration->ListEntry);
+
+    /*
+     * Start the one-shot timer before publishing the registration.  The
+     * worker rearms it after each scan, avoiding concurrent reuse of the
+     * embedded work item.
+     */
+    DueTime.QuadPart = -10000000LL;
+    KeSetTimerEx(&Registration->Timer, DueTime, 0, &Registration->Dpc);
+    KeReleaseSpinLock(&PopDeviceIdleLock, OldIrql);
+
+    return (PULONG)&Registration->IdleCount;
 }
 
 /*
- * @unimplemented
+ * Called by IoDeleteDevice before the object is marked delete-pending.
+ * Removing the registration from the list prevents new DPC/work references;
+ * cancel + DPC flush + worker event wait drains anything already in flight.
+ */
+VOID
+NTAPI
+PoRemoveDevice(_In_ PDEVICE_OBJECT DeviceObject)
+{
+    PPOP_DEVICE_IDLE_REGISTRATION Registration = NULL;
+    PEXTENDED_DEVOBJ_EXTENSION DeviceExtension;
+    PLIST_ENTRY Entry;
+    KIRQL OldIrql;
+
+    PAGED_CODE();
+
+    if (DeviceObject == NULL)
+        return;
+
+    DeviceExtension = IoGetDevObjExtension(DeviceObject);
+    if (!PopPhase0Initialized)
+    {
+        DeviceExtension->ExtensionFlags |= DOE_DELETE_PENDING;
+        return;
+    }
+
+    KeAcquireSpinLock(&PopDeviceIdleLock, &OldIrql);
+
+    DeviceExtension->ExtensionFlags |= DOE_DELETE_PENDING;
+
+    for (Entry = PopDeviceIdleList.Flink;
+         Entry != &PopDeviceIdleList;
+         Entry = Entry->Flink)
+    {
+        PPOP_DEVICE_IDLE_REGISTRATION Current =
+            CONTAINING_RECORD(Entry, POP_DEVICE_IDLE_REGISTRATION, ListEntry);
+        if (Current->DeviceObject == DeviceObject)
+        {
+            Registration = Current;
+            InterlockedExchange(&Registration->Removing, 1);
+            RemoveEntryList(&Registration->ListEntry);
+            break;
+        }
+    }
+
+    KeReleaseSpinLock(&PopDeviceIdleLock, OldIrql);
+
+    if (Registration == NULL)
+        return;
+
+    KeCancelTimer(&Registration->Timer);
+    KeFlushQueuedDpcs();
+    KeWaitForSingleObject(&Registration->WorkComplete,
+                          Executive,
+                          KernelMode,
+                          FALSE,
+                          NULL);
+
+    ObDereferenceObject(Registration->DeviceObject);
+    ExFreePoolWithTag(Registration, 'iPoP');
+}
+
+/*
+ * @implemented
+ */
+NTSTATUS
+NTAPI
+PopRegisterPowerSettingPolicy(
+    _In_opt_ PDEVICE_OBJECT DeviceObject,
+    _In_ LPCGUID SettingGuid,
+    _In_ PPOWER_SETTING_CALLBACK Callback,
+    _In_opt_ PVOID Context,
+    _Out_ PVOID *Handle)
+{
+    PPOP_POWER_POLICY_REGISTRATION Registration;
+    KIRQL OldIrql;
+
+    PAGED_CODE();
+    if (Handle == NULL || SettingGuid == NULL || Callback == NULL)
+        return STATUS_INVALID_PARAMETER;
+    *Handle = NULL;
+    if (!PopPhase0Initialized)
+        return STATUS_DEVICE_NOT_READY;
+
+    Registration = ExAllocatePoolWithTag(NonPagedPool, sizeof(*Registration), 'sPoP');
+    if (Registration == NULL)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(Registration, sizeof(*Registration));
+    Registration->Type = PopPolicyRegistrationPowerSetting;
+    Registration->u.PowerSetting.DeviceObject = DeviceObject;
+    Registration->u.PowerSetting.SettingGuid = *SettingGuid;
+    Registration->u.PowerSetting.Callback = Callback;
+    Registration->u.PowerSetting.Context = Context;
+
+    KeAcquireSpinLock(&PopPowerPolicyLock, &OldIrql);
+    InsertTailList(&PopPowerPolicyList, &Registration->ListEntry);
+    KeReleaseSpinLock(&PopPowerPolicyLock, OldIrql);
+    *Handle = Registration;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+NTAPI
+PopUnregisterPowerSettingPolicy(_In_ PVOID Handle)
+{
+    PLIST_ENTRY Entry;
+    PPOP_POWER_POLICY_REGISTRATION Registration;
+    KIRQL OldIrql;
+
+    PAGED_CODE();
+    if (Handle == NULL)
+        return STATUS_INVALID_PARAMETER;
+    if (!PopPhase0Initialized)
+        return STATUS_DEVICE_NOT_READY;
+
+    KeAcquireSpinLock(&PopPowerPolicyLock, &OldIrql);
+    for (Entry = PopPowerPolicyList.Flink;
+         Entry != &PopPowerPolicyList;
+         Entry = Entry->Flink)
+    {
+        Registration = CONTAINING_RECORD(Entry, POP_POWER_POLICY_REGISTRATION, ListEntry);
+        if ((PVOID)Registration == Handle &&
+            Registration->Type == PopPolicyRegistrationPowerSetting)
+        {
+            RemoveEntryList(Entry);
+            KeReleaseSpinLock(&PopPowerPolicyLock, OldIrql);
+            ExFreePoolWithTag(Registration, 'sPoP');
+            return STATUS_SUCCESS;
+        }
+    }
+    KeReleaseSpinLock(&PopPowerPolicyLock, OldIrql);
+    DPRINT1("PopUnregisterPowerSettingPolicy: invalid handle %p\n", Handle);
+    return STATUS_INVALID_PARAMETER;
+}
+
+/*
+ * @implemented
  */
 PVOID
 NTAPI
 PoRegisterSystemState(_In_opt_ PVOID StateHandle,
                       _In_ EXECUTION_STATE Flags)
 {
-    UNIMPLEMENTED;
-    return NULL;
+    const EXECUTION_STATE ValidFlags = ES_CONTINUOUS |
+                                       ES_SYSTEM_REQUIRED |
+                                       ES_DISPLAY_REQUIRED |
+                                       ES_USER_PRESENT;
+    PPOP_POWER_POLICY_REGISTRATION Registration;
+    PLIST_ENTRY Entry;
+    KIRQL OldIrql;
+
+    PAGED_CODE();
+    if ((Flags & ~ValidFlags) || !PopPhase0Initialized)
+        return NULL;
+
+    if (StateHandle != NULL)
+    {
+        KeAcquireSpinLock(&PopPowerPolicyLock, &OldIrql);
+        for (Entry = PopPowerPolicyList.Flink;
+             Entry != &PopPowerPolicyList;
+             Entry = Entry->Flink)
+        {
+            Registration = CONTAINING_RECORD(Entry, POP_POWER_POLICY_REGISTRATION, ListEntry);
+            if ((PVOID)Registration == StateHandle &&
+                Registration->Type == PopPolicyRegistrationSystemState)
+            {
+                Registration->u.SystemState.Flags = Flags;
+                KeReleaseSpinLock(&PopPowerPolicyLock, OldIrql);
+                return StateHandle;
+            }
+        }
+        KeReleaseSpinLock(&PopPowerPolicyLock, OldIrql);
+        return NULL;
+    }
+
+    Registration = ExAllocatePoolWithTag(NonPagedPool, sizeof(*Registration), 'sPoP');
+    if (Registration == NULL)
+        return NULL;
+    RtlZeroMemory(Registration, sizeof(*Registration));
+    Registration->Type = PopPolicyRegistrationSystemState;
+    Registration->u.SystemState.Flags = Flags;
+
+    KeAcquireSpinLock(&PopPowerPolicyLock, &OldIrql);
+    InsertTailList(&PopPowerPolicyList, &Registration->ListEntry);
+    KeReleaseSpinLock(&PopPowerPolicyLock, OldIrql);
+    return Registration;
 }
 
 /*
@@ -920,18 +1556,49 @@ PoRequestPowerIrp(
     PIO_STACK_LOCATION Stack;
     PIRP Irp;
 
-    if (MinorFunction != IRP_MN_QUERY_POWER
-        && MinorFunction != IRP_MN_SET_POWER
-        && MinorFunction != IRP_MN_WAIT_WAKE)
+    if (pIrp != NULL)
+        *pIrp = NULL;
+
+    if (DeviceObject == NULL)
+        return STATUS_INVALID_PARAMETER_1;
+
+    if (MinorFunction != IRP_MN_QUERY_POWER &&
+        MinorFunction != IRP_MN_SET_POWER &&
+        MinorFunction != IRP_MN_WAIT_WAKE)
         return STATUS_INVALID_PARAMETER_2;
 
-    /* Always call the top of the device stack */
+    /* Validate the union member before publishing an asynchronous request. */
+    if (MinorFunction == IRP_MN_WAIT_WAKE)
+    {
+        /* A wait/wake request targets a sleep state, never shutdown. */
+        if (PowerState.SystemState < PowerSystemSleeping1 ||
+            PowerState.SystemState > PowerSystemHibernate)
+            return STATUS_INVALID_PARAMETER_3;
+    }
+    else if (PowerState.DeviceState <= PowerDeviceUnspecified ||
+             PowerState.DeviceState >= PowerDeviceMaximum)
+    {
+        return STATUS_INVALID_PARAMETER_3;
+    }
+
+    /*
+     * Keep both objects alive until the completion routine runs.  The
+     * original PDO is passed through Argument1; the attached top object is
+     * the object used to send the IRP and is released by the completion.
+     */
+    ObReferenceObject(DeviceObject);
     TopDeviceObject = IoGetAttachedDeviceReference(DeviceObject);
+    if (TopDeviceObject == NULL)
+    {
+        ObDereferenceObject(DeviceObject);
+        return STATUS_NO_SUCH_DEVICE;
+    }
 
     Irp = IoAllocateIrp(TopDeviceObject->StackSize + 2, FALSE);
     if (!Irp)
     {
         ObDereferenceObject(TopDeviceObject);
+        ObDereferenceObject(DeviceObject);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -943,7 +1610,9 @@ PoRequestPowerIrp(
     Stack = IoGetNextIrpStackLocation(Irp);
     Stack->Parameters.Others.Argument1 = DeviceObject;
     Stack->Parameters.Others.Argument2 = (PVOID)(ULONG_PTR)MinorFunction;
-    Stack->Parameters.Others.Argument3 = (PVOID)(ULONG_PTR)PowerState.DeviceState;
+    Stack->Parameters.Others.Argument3 =
+        (PVOID)(ULONG_PTR)((MinorFunction == IRP_MN_WAIT_WAKE) ?
+                           PowerState.SystemState : PowerState.DeviceState);
     Stack->Parameters.Others.Argument4 = Context;
     Stack->DeviceObject = TopDeviceObject;
     IoSetNextIrpStackLocation(Irp);
@@ -974,22 +1643,65 @@ PoRequestPowerIrp(
 }
 
 /*
- * @unimplemented
+ * @implemented
  */
+_IRQL_requires_max_(DISPATCH_LEVEL)
 POWER_STATE
 NTAPI
 PoSetPowerState(_In_ PDEVICE_OBJECT DeviceObject,
                 _In_ POWER_STATE_TYPE Type,
                 _In_ POWER_STATE State)
 {
-    POWER_STATE ps;
+    POWER_STATE PreviousState;
+    KIRQL OldIrql;
+    ULONG PowerFlags;
 
     ASSERT_IRQL_LESS_OR_EQUAL(DISPATCH_LEVEL);
 
-    ps.SystemState = PowerSystemWorking;  // Fully on
-    ps.DeviceState = PowerDeviceD0;       // Fully on
+    if (DeviceObject == NULL)
+    {
+        PreviousState.SystemState = PowerSystemUnspecified;
+        PreviousState.DeviceState = PowerDeviceUnspecified;
+        return PreviousState;
+    }
 
-    return ps;
+    /*
+     * The low nibble stores the last reported system state and the next
+     * nibble stores the device state. Preserve the remaining extension flags.
+     * Serialize the read/modify/write because drivers may report state
+     * changes concurrently.
+     */
+    KeAcquireSpinLock(&PopDopeGlobalLock, &OldIrql);
+    PowerFlags = DeviceObject->DeviceObjectExtension->PowerFlags;
+    PreviousState.SystemState = (SYSTEM_POWER_STATE)(PowerFlags & 0x0F);
+    PreviousState.DeviceState = (DEVICE_POWER_STATE)((PowerFlags >> 4) & 0x0F);
+
+    switch (Type)
+    {
+        case SystemPowerState:
+            if (State.SystemState < PowerSystemMaximum)
+            {
+                PowerFlags = (PowerFlags & ~0x0FUL) |
+                             ((ULONG)State.SystemState & 0x0FUL);
+            }
+            break;
+
+        case DevicePowerState:
+            if (State.DeviceState < PowerDeviceMaximum)
+            {
+                PowerFlags = (PowerFlags & ~0xF0UL) |
+                             (((ULONG)State.DeviceState & 0x0FUL) << 4);
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    DeviceObject->DeviceObjectExtension->PowerFlags = PowerFlags;
+    KeReleaseSpinLock(&PopDopeGlobalLock, OldIrql);
+
+    return PreviousState;
 }
 
 /*
@@ -1013,13 +1725,37 @@ PoStartNextPowerIrp(_In_ PIRP Irp)
 }
 
 /*
- * @unimplemented
+ * @implemented
  */
 VOID
 NTAPI
 PoUnregisterSystemState(_In_ PVOID StateHandle)
 {
-    UNIMPLEMENTED;
+    PLIST_ENTRY Entry;
+    PPOP_POWER_POLICY_REGISTRATION Registration;
+    KIRQL OldIrql;
+
+    PAGED_CODE();
+    if (StateHandle == NULL || !PopPhase0Initialized)
+        return;
+
+    KeAcquireSpinLock(&PopPowerPolicyLock, &OldIrql);
+    for (Entry = PopPowerPolicyList.Flink;
+         Entry != &PopPowerPolicyList;
+         Entry = Entry->Flink)
+    {
+        Registration = CONTAINING_RECORD(Entry, POP_POWER_POLICY_REGISTRATION, ListEntry);
+        if ((PVOID)Registration == StateHandle &&
+            Registration->Type == PopPolicyRegistrationSystemState)
+        {
+            RemoveEntryList(Entry);
+            KeReleaseSpinLock(&PopPowerPolicyLock, OldIrql);
+            ExFreePoolWithTag(Registration, 'sPoP');
+            return;
+        }
+    }
+    KeReleaseSpinLock(&PopPowerPolicyLock, OldIrql);
+    DPRINT1("PoUnregisterSystemState: invalid registration handle %p\n", StateHandle);
 }
 
 /*
@@ -1301,8 +2037,58 @@ NTAPI
 NtGetDevicePowerState(_In_ HANDLE Device,
                       _Out_ PDEVICE_POWER_STATE PowerState)
 {
-    UNIMPLEMENTED;
-    return STATUS_NOT_IMPLEMENTED;
+    PDEVICE_OBJECT DeviceObject;
+    DEVICE_POWER_STATE CurrentState;
+    KPROCESSOR_MODE PreviousMode = KeGetPreviousMode();
+    KIRQL OldIrql;
+    ULONG PowerFlags;
+    NTSTATUS Status;
+
+    PAGED_CODE();
+
+    if (PreviousMode != KernelMode)
+    {
+        _SEH2_TRY
+        {
+            ProbeForWrite(PowerState, sizeof(*PowerState), sizeof(UCHAR));
+        }
+        _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER)
+        {
+            _SEH2_YIELD(return _SEH2_GetExceptionCode());
+        }
+        _SEH2_END;
+    }
+
+    Status = ObReferenceObjectByHandle(Device,
+                                       0,
+                                       IoDeviceObjectType,
+                                       PreviousMode,
+                                       (PVOID *)&DeviceObject,
+                                       NULL);
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    KeAcquireSpinLock(&PopDopeGlobalLock, &OldIrql);
+    PowerFlags = DeviceObject->DeviceObjectExtension->PowerFlags;
+    KeReleaseSpinLock(&PopDopeGlobalLock, OldIrql);
+
+    CurrentState = (DEVICE_POWER_STATE)((PowerFlags >> 4) & 0x0F);
+    if (CurrentState >= PowerDeviceMaximum)
+        CurrentState = PowerDeviceUnspecified;
+
+    _SEH2_TRY
+    {
+        *PowerState = CurrentState;
+        Status = STATUS_SUCCESS;
+    }
+    _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER)
+    {
+        Status = _SEH2_GetExceptionCode();
+    }
+    _SEH2_END;
+
+    ObDereferenceObject(DeviceObject);
+    return Status;
 }
 
 BOOLEAN
@@ -1332,9 +2118,12 @@ NtSetThreadExecutionState(_In_ EXECUTION_STATE esFlags,
     PAGED_CODE();
 
     /* Validate flags */
-    if (esFlags & ~(ES_CONTINUOUS | ES_USER_PRESENT))
+    if (esFlags & ~(ES_CONTINUOUS |
+                    ES_SYSTEM_REQUIRED |
+                    ES_DISPLAY_REQUIRED |
+                    ES_USER_PRESENT))
     {
-        /* Fail the request */
+        /* Reject unsupported execution-state bits, but accept all NT 5.x bits. */
         return STATUS_INVALID_PARAMETER;
     }
 
@@ -1640,45 +2429,7 @@ NtSetSystemPowerState(_In_ POWER_ACTION SystemAction,
 
         if (PopAction.Action == PowerActionSleep)
         {
-            if ((PopAction.SystemState < PowerSystemSleeping1) ||
-                (PopAction.SystemState > PowerSystemSleeping3))
-            {
-                Status = STATUS_INVALID_PARAMETER;
-                break;
-            }
-
-            DPRINT("Entering system sleep state %u\n", PopAction.SystemState);
-            if (PopStateCallout != NULL)
-            {
-                WIN32_POWERSTATE_PARAMETERS Parameters = {0};
-
-                Parameters.SystemAction = PopAction.Action;
-                Parameters.MinSystemState = PopAction.SystemState;
-                Parameters.Flags = PopAction.Flags;
-                Parameters.PowerStateTask = PowerState_SuspendApps;
-                Status = PopStateCallout(&Parameters);
-                if (!NT_SUCCESS(Status))
-                    DPRINT1("Suspend-app notification failed: 0x%lx\n", Status);
-
-                Parameters.PowerStateTask = PowerState_SuspendServices;
-                Status = PopStateCallout(&Parameters);
-                if (!NT_SUCCESS(Status))
-                    DPRINT1("Suspend-service notification failed: 0x%lx\n", Status);
-            }
-
-            Status = PopEnterSleepState(PopAction.SystemState);
-            if (PopStateCallout != NULL)
-            {
-                WIN32_POWERSTATE_PARAMETERS Parameters = {0};
-
-                Parameters.SystemAction = PopAction.Action;
-                Parameters.MinSystemState = PopAction.SystemState;
-                Parameters.Flags = PopAction.Flags;
-                Parameters.PowerStateTask = PowerState_ResumeServices;
-                (VOID)PopStateCallout(&Parameters);
-                Parameters.PowerStateTask = PowerState_ResumeApps;
-                (VOID)PopStateCallout(&Parameters);
-            }
+            Status = PoSleepSystem(PopAction.SystemState);
             break;
         }
 

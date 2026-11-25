@@ -12,6 +12,9 @@
 #include "apicp.h"
 #include <smp.h>
 
+/* Defined by the HAL's MPS/APIC discovery code. */
+extern HALP_APIC_INFO_TABLE HalpApicInfoTable;
+
 #define NDEBUG
 #include <debug.h>
 
@@ -132,9 +135,19 @@ ApicStartApplicationProcessor(
 {
     APIC_VERSION_REGISTER ApicVersion;
 
-    ASSERT(StartupLoc.HighPart == 0);
-    ASSERT((StartupLoc.QuadPart & 0xFFF) == 0);
-    ASSERT((StartupLoc.QuadPart & 0xFFF00FFF) == 0);
+    if (NTProcessorNumber == 0 ||
+        NTProcessorNumber >= HalpApicInfoTable.ProcessorCount ||
+        NTProcessorNumber >= MAXIMUM_PROCESSORS ||
+        StartupLoc.HighPart != 0 ||
+        StartupLoc.LowPart == 0 ||
+        StartupLoc.LowPart > 0xFF000 ||
+        (StartupLoc.LowPart & (PAGE_SIZE - 1)) != 0 ||
+        HalpProcessorIdentity[NTProcessorNumber].ProcessorStarted)
+    {
+        DPRINT1("HAL: invalid AP startup request (processor %lu, address %08lx:%08lx)\n",
+                NTProcessorNumber, (ULONG)StartupLoc.HighPart, StartupLoc.LowPart);
+        return;
+    }
 
     /* Init IPI */
     ApicRequestGlobalInterrupt(HalpProcessorIdentity[NTProcessorNumber].LapicId, 0,

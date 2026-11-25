@@ -149,6 +149,7 @@ PopFlushVolumeWorker(_In_ PVOID Context)
 {
     PPOP_FLUSH_VOLUME FlushContext = (PPOP_FLUSH_VOLUME)Context;
     PDEVICE_OBJECT_POWER_EXTENSION Dope;
+    PDEVICE_OBJECT VolumeDeviceObject;
     PLIST_ENTRY NextEntry;
     NTSTATUS Status;
     UCHAR Buffer[sizeof(OBJECT_NAME_INFORMATION) + 512];
@@ -174,11 +175,13 @@ PopFlushVolumeWorker(_In_ PVOID Context)
         /* Done touching the volume list */
         KeReleaseGuardedMutex(&PopVolumeLock);
 
-        /* Get the dope from the volume link */
+        /* Get a stable device reference before dropping the list lock. */
         Dope = CONTAINING_RECORD(NextEntry, DEVICE_OBJECT_POWER_EXTENSION, Volume);
+        VolumeDeviceObject = Dope->DeviceObject;
+        ObReferenceObject(VolumeDeviceObject);
 
         /* Get the name */
-        Status = ObQueryNameString(Dope->DeviceObject,
+        Status = ObQueryNameString(VolumeDeviceObject,
                                    NameInfo,
                                    sizeof(Buffer),
                                    &Length);
@@ -211,12 +214,15 @@ PopFlushVolumeWorker(_In_ PVOID Context)
             }
         }
 
+        ObDereferenceObject(VolumeDeviceObject);
+
         /* Acquire the flush lock again since we'll touch the list */
         KeAcquireGuardedMutex(&PopVolumeLock);
     }
 
     /* One more flush completed... if it was the last, signal the caller */
-    if (!--FlushContext->Count) KeSetEvent(&FlushContext->Wait, IO_NO_INCREMENT, FALSE);
+    if (InterlockedDecrement(&FlushContext->Count) == 0)
+        KeSetEvent(&FlushContext->Wait, IO_NO_INCREMENT, FALSE);
 
     /* Serialize with flushers */
     KeReleaseGuardedMutex(&PopVolumeLock);
@@ -328,6 +334,8 @@ PopFlushVolumes(_In_ BOOLEAN ShuttingDown)
         /* Create a new one */
         ThreadCount--;
         DPRINT("Creating flush thread\n");
+        /* Publish the worker in the count before it can start running. */
+        InterlockedIncrement(&FlushContext.Count);
         Status = PsCreateSystemThread(&ThreadHandle,
                                       THREAD_ALL_ACCESS,
                                       &ObjectAttributes,
@@ -337,9 +345,11 @@ PopFlushVolumes(_In_ BOOLEAN ShuttingDown)
                                       &FlushContext);
         if (NT_SUCCESS(Status))
         {
-            /* One more created... */
-            FlushContext.Count++;
             ZwClose(ThreadHandle);
+        }
+        else
+        {
+            InterlockedDecrement(&FlushContext.Count);
         }
     }
 
