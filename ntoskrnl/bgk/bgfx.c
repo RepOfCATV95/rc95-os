@@ -12,10 +12,24 @@
 #define NDEBUG
 #include <debug.h>
 
+BOOLEAN
+NTAPI
+IsBootResGenuine(VOID)
+{
+	// STUB
+	return FALSE;
+}
+
 CODE_SEG("INIT")
 VOID
 NTAPI
-DisplayGopBitmap(VOID)
+DisplayGopBitmap(
+    _In_ BOOLEAN InText
+    )
 {
-    
+    if (!IsBootResGenuine())
+    {
+        DisplayBootBitmap(InText);
+        return;
+    }
 }

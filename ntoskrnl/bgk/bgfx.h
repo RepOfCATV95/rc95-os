@@ -1,7 +1,12 @@
 #pragma once
 
+BOOLEAN
+NTAPI
+IsBootResGenuine(VOID);
+
 CODE_SEG("INIT")
 VOID
 NTAPI
-DisplayGOPBitmap(VOID);
-
+DisplayGopBitmap(
+    _In_ BOOLEAN InText
+    );
