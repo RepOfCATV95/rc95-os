@@ -175,9 +175,11 @@ PCI\CC_0106 = pciide
 USB\CLASS_09 = usbhub
 USB\ROOT_HUB = usbhub
 USB\ROOT_HUB20 = usbhub
+USB\ROOT_HUB30 = usbhub3
 PCI\CC_0C0300 = usbuhci
 PCI\CC_0C0310 = usbohci
 PCI\CC_0C0320 = usbehci
+PCI\CC_0C0330 = usbxhci
 USB\Class_08&SubClass_06&Prot_50 = usbstor
 USB\Class_08&SubClass_05&Prot_50 = usbstor
 HID_DEVICE_SYSTEM_KEYBOARD = kbdhid,{4D36E96B-E325-11CE-BFC1-08002BE10318}
@@ -197,9 +199,12 @@ isapnp = isapnp.sys
 
 [InputDevicesSupport.Load]
 usbehci = usbehci.sys
+usbxhci = usbxhci.sys
+ucx01000 = ucx01000.sys
 usbohci = usbohci.sys
 usbuhci = usbuhci.sys
 usbhub = usbhub.sys
+usbhub3 = usbhub3.sys
 usbccgp = usbccgp.sys
 hidusb = hidusb.sys
 usbstor = usbstor.sys
@@ -226,7 +231,7 @@ inport = inport.sys
 Cabinet = reactos.cab
 
 [SetupData]
-DefaultPath = \ReactOS
+DefaultPath = \WINNT
 SetupDebugOptions = "/DEBUG /KDSERIAL /DEBUGPORT=COM1 /FIRSTCHANCE"
 ;SetupDebugOptions = "/DEBUG /SOS /DEBUGPORT=SCREEN"
 OsLoadOptions = "/FASTDETECT /NOGUIBOOT /NODEBUG"
@@ -240,7 +245,7 @@ DefaultLanguage  = 00000409
 
 [Computer.NTx86]
 pci_up = "Standard PC Uniprocessor"
-;pci_mp = "Standard PC Multiprocessor"
+pci_mp = "Standard PC Multiprocessor"
 acpi_up = "ACPI PC Uniprocessor"
 acpi_mp = "ACPI PC Multiprocessor"
 apic_up = "Standard APIC PC Uniprocessor"
@@ -255,7 +260,7 @@ x64_mp = "Standard x64 Multiprocessor"
 [Map.Computer.NTx86]
 ;<id> = <pnp id string>
 pci_up = "PC UP"
-;pci_mp = "PC MP"
+pci_mp = "PC MP"
 acpi_up = "ACPI UP"
 acpi_mp = "ACPI MP"
 apic_up = "APIC UP"
@@ -271,9 +276,9 @@ x64_mp = "X64 MP"
 ntoskrnl.exe = 1,,,,,,,2,,,,1,2
 hal.dll      = 1,,,,,,,2,,,,1,2
 
-;[Files.pci_mp]
-;ntkrnlmp.exe = 1,,,,,,,2,,,ntoskrnl.exe,1,2
-;halmps.dll   = 1,,,,,,,2,,,hal.dll,1,2
+[Files.pci_mp]
+ntkrnlmp.exe = 1,,,,,,,2,,,ntoskrnl.exe,1,2
+halmp.dll   = 1,,,,,,,2,,,hal.dll,1,2
 
 [Files.acpi_up]
 ntoskrnl.exe = 1,,,,,,,2,,,,1,2
