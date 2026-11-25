@@ -198,6 +198,17 @@ UhciOpenEndpoint(IN PVOID uhciExtension,
     SIZE_T BufferLength;
     PUHCI_HCD_QH QH;
 
+    if (!EndpointProperties || !UhciEndpoint || !EndpointProperties->BufferVA ||
+        (EndpointProperties->TransferType != USBPORT_TRANSFER_TYPE_ISOCHRONOUS &&
+         EndpointProperties->BufferLength <
+             sizeof(UHCI_HCD_QH) + sizeof(UHCI_HCD_TD)) ||
+        (EndpointProperties->TransferType == USBPORT_TRANSFER_TYPE_ISOCHRONOUS &&
+         EndpointProperties->BufferLength < sizeof(UHCI_HCD_TD)))
+    {
+        DPRINT1("UhciOpenEndpoint: invalid DMA buffer\\n");
+        return MP_STATUS_FAILURE;
+    }
+
     RtlCopyMemory(&UhciEndpoint->EndpointProperties,
                   EndpointProperties,
                   sizeof(UhciEndpoint->EndpointProperties));
@@ -1417,7 +1428,15 @@ UhciBulkOrInterruptTransfer(IN PUHCI_EXTENSION UhciExtension,
 
         for (ix = 0; ix < SgCount; ++ix)
         {
-            TransferLength += SgList->SgElement[ix].SgTransferLength;
+            ULONG ElementLength = SgList->SgElement[ix].SgTransferLength;
+
+            if (ElementLength > MAXULONG - TransferLength)
+            {
+                DPRINT1("UhciBulkOrInterruptTransfer: SG length overflow\n");
+                return MP_STATUS_FAILURE;
+            }
+
+            TransferLength += ElementLength;
         }
 
         DPRINT("UhciBulkOrInterruptTransfer: SgCount - %X, TransferLength - %X\n",

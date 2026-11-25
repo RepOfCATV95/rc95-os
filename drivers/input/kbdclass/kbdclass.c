@@ -336,8 +336,10 @@ ReadRegistryEntries(
         {
             DriverExtension->ConnectMultiplePorts = DefaultConnectMultiplePorts;
         }
-        if (DriverExtension->DataQueueSize == 0)
+        if (DriverExtension->DataQueueSize == 0 ||
+            DriverExtension->DataQueueSize > MAXULONG / sizeof(KEYBOARD_INPUT_DATA))
         {
+            /* Prevent a 32-bit allocation-size multiplication from wrapping. */
             DriverExtension->DataQueueSize = DefaultDataQueueSize;
         }
     }
@@ -442,7 +444,7 @@ cleanup:
         return STATUS_NO_MEMORY;
     }
     KeInitializeSpinLock(&DeviceExtension->ReadData->SpinLock);
-    DeviceExtension->ReadData->PortData = ExAllocatePoolWithTag(NonPagedPool, DeviceExtension->DriverExtension->DataQueueSize * sizeof(KEYBOARD_INPUT_DATA), CLASS_TAG);
+    DeviceExtension->ReadData->PortData = ExAllocatePoolWithTag(NonPagedPool, (SIZE_T)DeviceExtension->DriverExtension->DataQueueSize * sizeof(KEYBOARD_INPUT_DATA), CLASS_TAG);
     if (!DeviceExtension->ReadData->PortData)
     {
         ExFreePoolWithTag(DeviceNameU.Buffer, CLASS_TAG);
@@ -526,30 +528,42 @@ ClassCallback(
     if (InputCount > 0)
     {
         KeAcquireSpinLock(&ClassDeviceExtension->ReadData->SpinLock, &OldIrql);
-        if (ClassDeviceExtension->ReadData->InputCount + InputCount > ClassDeviceExtension->DriverExtension->DataQueueSize)
+        /*
+         * Keep the queue count within its allocated capacity.  In particular,
+         * do not subtract an already-invalid InputCount from the capacity:
+         * that would underflow SIZE_T and turn a full queue into an oversized
+         * copy.
+         */
+        if (ClassDeviceExtension->ReadData->InputCount >=
+            ClassDeviceExtension->DriverExtension->DataQueueSize)
         {
-            /*
-             * We're exceeding the buffer, and data will be thrown away...
-             * FIXME: What could we do, as we are at DISPATCH_LEVEL?
-             */
-            ReadSize = ClassDeviceExtension->DriverExtension->DataQueueSize - ClassDeviceExtension->ReadData->InputCount;
+            ReadSize = 0;
         }
         else
-            ReadSize = InputCount;
+        {
+            SIZE_T AvailableEntries =
+                ClassDeviceExtension->DriverExtension->DataQueueSize -
+                ClassDeviceExtension->ReadData->InputCount;
+            ReadSize = MIN(InputCount, AvailableEntries);
+        }
 
         /*
          * Move the input data from the port data queue to our class data
          * queue.
          */
-        RtlCopyMemory(
-            &ClassDeviceExtension->ReadData->PortData[ClassDeviceExtension->ReadData->InputCount],
-            (PCHAR)DataStart,
-            sizeof(KEYBOARD_INPUT_DATA) * ReadSize);
+        if (ReadSize != 0)
+        {
+            RtlCopyMemory(
+                &ClassDeviceExtension->ReadData->PortData[ClassDeviceExtension->ReadData->InputCount],
+                (PCHAR)DataStart,
+                sizeof(KEYBOARD_INPUT_DATA) * ReadSize);
+        }
 
         /* Move the counter up */
         ClassDeviceExtension->ReadData->InputCount += ReadSize;
 
-        (*ConsumedCount) += (ULONG)ReadSize;
+        /* Entries that did not fit are intentionally dropped, not replayed. */
+        (*ConsumedCount) += (ULONG)InputCount;
 
         KeReleaseSpinLock(&ClassDeviceExtension->ReadData->SpinLock, OldIrql);
 

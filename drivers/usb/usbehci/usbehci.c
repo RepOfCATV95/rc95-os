@@ -237,6 +237,12 @@ EHCI_OpenBulkOrControlEndpoint(IN PEHCI_EXTENSION EhciExtension,
            EhciEndpoint,
            IsControl);
 
+    /* Reserve the dummy TD, queue head and at least one transfer descriptor. */
+    if (!EndpointProperties || !EhciEndpoint || !EndpointProperties->BufferVA ||
+        EndpointProperties->BufferLength <
+            sizeof(EHCI_HCD_TD) + sizeof(EHCI_HCD_QH) + sizeof(EHCI_HCD_TD))
+        return MP_STATUS_FAILURE;
+
     InitializeListHead(&EhciEndpoint->ListTDs);
 
     EhciEndpoint->DmaBufferVA = (PVOID)EndpointProperties->BufferVA;
@@ -345,6 +351,13 @@ EHCI_OpenInterruptEndpoint(IN PEHCI_EXTENSION EhciExtension,
            EhciExtension,
            EndpointProperties,
            EhciEndpoint);
+
+    /* Interrupt endpoints reserve a dummy TD, QH and the minimum TD pool. */
+    if (!EndpointProperties || !EhciEndpoint || !EndpointProperties->BufferVA ||
+        EndpointProperties->BufferLength <
+            sizeof(EHCI_HCD_TD) + sizeof(EHCI_HCD_QH) +
+            (EHCI_MAX_INTERRUPT_TD_COUNT + 1) * sizeof(EHCI_HCD_TD))
+        return MP_STATUS_FAILURE;
 
     Period = EndpointProperties->Period;
     ScheduleOffset = EndpointProperties->ScheduleOffset;
@@ -501,6 +514,10 @@ EHCI_OpenEndpoint(IN PVOID ehciExtension,
     MPSTATUS MPStatus;
 
     DPRINT("EHCI_OpenEndpoint: ... \n");
+
+    if (!EhciExtension || !EndpointProperties || !EhciEndpoint ||
+        !EndpointProperties->BufferVA)
+        return MP_STATUS_FAILURE;
 
     RtlCopyMemory(&EhciEndpoint->EndpointProperties,
                   EndpointProperties,

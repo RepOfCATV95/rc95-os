@@ -2478,6 +2478,11 @@ XhciEvtPreprocessSetPower(
     if (Controller != NULL && Stack->Parameters.Power.Type == SystemPowerState)
         Controller->TrackSystemPowerIrp(Stack);
 
+    /*
+     * This is a KMDF-preprocessed power IRP.  Forward it exactly once through
+     * the framework: KMDF owns PO queue advancement and completion here, so
+     * do not call PoStartNextPowerIrp or complete the IRP in this callback.
+     */
     IoSkipCurrentIrpStackLocation(Irp);
     Status = WdfDeviceWdmDispatchPreprocessedIrp(Device, Irp);
     if (!NT_SUCCESS(Status))

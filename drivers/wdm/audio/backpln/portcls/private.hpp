@@ -414,6 +414,7 @@ typedef struct
 
     DEVICE_POWER_STATE DevicePowerState;
     SYSTEM_POWER_STATE  SystemPowerState;
+    BOOLEAN TimerStarted;
 
 } PCLASS_DEVICE_EXTENSION, *PPCLASS_DEVICE_EXTENSION;
 

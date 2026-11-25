@@ -382,6 +382,7 @@ ASSERT(PropertyItem->Set);
         // initialize property set
         SubDeviceDescriptor->FilterPropertySet[PropertySetIndex].Set = Guid;
         SubDeviceDescriptor->FilterPropertySet[PropertySetIndex].PropertiesCount = 0;
+        SubDeviceDescriptor->FilterPropertySet[PropertySetIndex].PropertyItem = NULL;
     }
 
     // as the property set has been identified, now search for duplicate property set item entries
@@ -436,6 +437,7 @@ ASSERT(PropertyItem->Set);
 
         // now initialize property item
         FilterPropertyItem = (PKSPROPERTY_ITEM)&SubDeviceDescriptor->FilterPropertySet[PropertySetIndex].PropertyItem[PropertySetItemIndex];
+        RtlZeroMemory(FilterPropertyItem, sizeof(KSPROPERTY_ITEM));
         FilterPropertyItem->PropertyId = PropertyItem->Id;
         FilterPropertyItem->MinProperty = sizeof(KSPROPERTY);
         FilterPropertyItem->MinData = 0;
@@ -772,23 +774,119 @@ PcCreateSubdeviceDescriptor(
     PPCNODE_DESCRIPTOR NodeDescriptor;
     PPCPROPERTY_ITEM PropertyItem;
 
+    if (!OutSubdeviceDescriptor || !FilterDescription ||
+        (InterfaceCount != 0 && !InterfaceGuids) ||
+        (FilterPropertiesCount != 0 && !FilterProperties) ||
+        (PinPropertiesCount != 0 && !PinProperties) ||
+        (EventSetCount != 0 && !EventSet) ||
+        (FilterDescription->PinCount != 0 &&
+         (!FilterDescription->Pins || FilterDescription->PinSize < sizeof(PCPIN_DESCRIPTOR))) ||
+        (FilterDescription->NodeCount != 0 &&
+         (!FilterDescription->Nodes || FilterDescription->NodeSize < sizeof(PCNODE_DESCRIPTOR))) ||
+        (FilterDescription->ConnectionCount != 0 && !FilterDescription->Connections))
+        return STATUS_INVALID_PARAMETER;
+
+    *OutSubdeviceDescriptor = NULL;
+
+    /* Validate all variable-length descriptor tables before walking them. */
+    if (FilterDescription->AutomationTable &&
+        FilterDescription->AutomationTable->PropertyCount &&
+        (!FilterDescription->AutomationTable->Properties ||
+         FilterDescription->AutomationTable->PropertyItemSize < sizeof(PCPROPERTY_ITEM)))
+        return STATUS_INVALID_PARAMETER;
+
+    if (FilterDescription->AutomationTable &&
+        FilterDescription->AutomationTable->PropertyCount) {
+        PropertyItem = (PPCPROPERTY_ITEM)FilterDescription->AutomationTable->Properties;
+        for (Index = 0; Index < FilterDescription->AutomationTable->PropertyCount; Index++) {
+            if (!PropertyItem->Set)
+                return STATUS_INVALID_PARAMETER;
+            PropertyItem = (PPCPROPERTY_ITEM)((ULONG_PTR)PropertyItem +
+                FilterDescription->AutomationTable->PropertyItemSize);
+        }
+    }
+
+    for (Index = 0; Index < FilterPropertiesCount; Index++) {
+        if (!FilterProperties[Index].Set ||
+            (FilterProperties[Index].PropertiesCount &&
+             !FilterProperties[Index].PropertyItem))
+            return STATUS_INVALID_PARAMETER;
+    }
+
+    if (FilterDescription->PinCount) {
+        SrcDescriptor = (PPCPIN_DESCRIPTOR)FilterDescription->Pins;
+        for (Index = 0; Index < FilterDescription->PinCount; Index++) {
+            if (SrcDescriptor->AutomationTable &&
+                SrcDescriptor->AutomationTable->PropertyCount &&
+                (!SrcDescriptor->AutomationTable->Properties ||
+                 SrcDescriptor->AutomationTable->PropertyItemSize < sizeof(PCPROPERTY_ITEM)))
+                return STATUS_INVALID_PARAMETER;
+
+            if (SrcDescriptor->AutomationTable &&
+                SrcDescriptor->AutomationTable->PropertyCount) {
+                PropertyItem = (PPCPROPERTY_ITEM)SrcDescriptor->AutomationTable->Properties;
+                for (SubIndex = 0; SubIndex < SrcDescriptor->AutomationTable->PropertyCount; SubIndex++) {
+                    if (!PropertyItem->Set)
+                        return STATUS_INVALID_PARAMETER;
+                    PropertyItem = (PPCPROPERTY_ITEM)((ULONG_PTR)PropertyItem +
+                        SrcDescriptor->AutomationTable->PropertyItemSize);
+                }
+            }
+
+            SrcDescriptor = (PPCPIN_DESCRIPTOR)((ULONG_PTR)SrcDescriptor + FilterDescription->PinSize);
+        }
+    }
+
+    if (FilterDescription->NodeCount) {
+        NodeDescriptor = (PPCNODE_DESCRIPTOR)FilterDescription->Nodes;
+        for (Index = 0; Index < FilterDescription->NodeCount; Index++) {
+            if (NodeDescriptor->AutomationTable &&
+                NodeDescriptor->AutomationTable->PropertyCount &&
+                (!NodeDescriptor->AutomationTable->Properties ||
+                 NodeDescriptor->AutomationTable->PropertyItemSize < sizeof(PCPROPERTY_ITEM)))
+                return STATUS_INVALID_PARAMETER;
+
+            if (NodeDescriptor->AutomationTable &&
+                NodeDescriptor->AutomationTable->PropertyCount) {
+                PropertyItem = (PPCPROPERTY_ITEM)NodeDescriptor->AutomationTable->Properties;
+                for (SubIndex = 0; SubIndex < NodeDescriptor->AutomationTable->PropertyCount; SubIndex++) {
+                    if (!PropertyItem->Set)
+                        return STATUS_INVALID_PARAMETER;
+                    PropertyItem = (PPCPROPERTY_ITEM)((ULONG_PTR)PropertyItem +
+                        NodeDescriptor->AutomationTable->PropertyItemSize);
+                }
+            }
+
+            NodeDescriptor = (PPCNODE_DESCRIPTOR)((ULONG_PTR)NodeDescriptor + FilterDescription->NodeSize);
+        }
+    }
+
     // allocate subdevice descriptor
     Descriptor = (PSUBDEVICE_DESCRIPTOR)AllocateItem(NonPagedPool, sizeof(SUBDEVICE_DESCRIPTOR), TAG_PORTCLASS);
     if (!Descriptor)
         return STATUS_INSUFFICIENT_RESOURCES;
+
+    /* Pool allocations are not guaranteed to be zeroed. Initialize every
+     * optional pointer/count before any failure path can inspect the descriptor. */
+    RtlZeroMemory(Descriptor, sizeof(SUBDEVICE_DESCRIPTOR));
 
     // initialize physical / symbolic link connection list
     InitializeListHead(&Descriptor->SymbolicLinkList);
     InitializeListHead(&Descriptor->PhysicalConnectionList);
 
     //FIXME add driver category guids
-    Descriptor->Interfaces = (GUID*)AllocateItem(NonPagedPool, sizeof(GUID) * InterfaceCount, TAG_PORTCLASS);
-    if (!Descriptor->Interfaces)
-        goto cleanup;
+    if (InterfaceCount) {
+        if (InterfaceCount > MAXULONG / sizeof(GUID))
+            goto cleanup;
 
-    // copy interface guids
-    RtlCopyMemory(Descriptor->Interfaces, InterfaceGuids, sizeof(GUID) * InterfaceCount);
-    Descriptor->InterfaceCount = InterfaceCount;
+        Descriptor->Interfaces = (GUID*)AllocateItem(
+            NonPagedPool, sizeof(GUID) * InterfaceCount, TAG_PORTCLASS);
+        if (!Descriptor->Interfaces)
+            goto cleanup;
+
+        RtlCopyMemory(Descriptor->Interfaces, InterfaceGuids, sizeof(GUID) * InterfaceCount);
+        Descriptor->InterfaceCount = InterfaceCount;
+    }
 
 #if DBG
     DumpFilterDescriptor(FilterDescription);
@@ -915,6 +1013,8 @@ PcCreateSubdeviceDescriptor(
     if (!Descriptor->Topology)
         goto cleanup;
 
+    RtlZeroMemory(Descriptor->Topology, sizeof(KSTOPOLOGY));
+
     // are there any connections
     if (FilterDescription->ConnectionCount)
     {
@@ -937,11 +1037,15 @@ PcCreateSubdeviceDescriptor(
         Descriptor->Topology->TopologyNodes = (const GUID *)AllocateItem(NonPagedPool, sizeof(GUID) * FilterDescription->NodeCount, TAG_PORTCLASS);
         if (!Descriptor->Topology->TopologyNodes)
             goto cleanup;
+        RtlZeroMemory((PVOID)Descriptor->Topology->TopologyNodes,
+                      sizeof(GUID) * FilterDescription->NodeCount);
 
         // allocate topology node names array
         Descriptor->Topology->TopologyNodesNames = (const GUID *)AllocateItem(NonPagedPool, sizeof(GUID) * FilterDescription->NodeCount, TAG_PORTCLASS);
         if (!Descriptor->Topology->TopologyNodesNames)
             goto cleanup;
+        RtlZeroMemory((PVOID)Descriptor->Topology->TopologyNodesNames,
+                      sizeof(GUID) * FilterDescription->NodeCount);
 
         // grab first entry
        NodeDescriptor = (PPCNODE_DESCRIPTOR)FilterDescription->Nodes;

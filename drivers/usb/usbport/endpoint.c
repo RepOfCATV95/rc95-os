@@ -82,6 +82,9 @@ USBPORT_AllocateBandwidth(IN PDEVICE_OBJECT FdoDevice,
            FdoDevice,
            Endpoint);
 
+    if (!FdoDevice || !Endpoint || !FdoDevice->DeviceExtension)
+        return FALSE;
+
     FdoExtension = FdoDevice->DeviceExtension;
     EndpointProperties = &Endpoint->EndpointProperties;
     TransferType = EndpointProperties->TransferType;
@@ -98,7 +101,8 @@ USBPORT_AllocateBandwidth(IN PDEVICE_OBJECT FdoDevice,
     EndpointBandwidth = EndpointProperties->UsbBandwidth;
 
     Period = EndpointProperties->Period;
-    ASSERT(Period != 0);
+    if (Period == 0 || Period > USB2_FRAMES || (USB2_FRAMES % Period) != 0)
+        return FALSE;
     Factor = USB2_FRAMES / Period;
 
     for (Offset = 0; Offset < Period; Offset++)
@@ -134,11 +138,12 @@ USBPORT_AllocateBandwidth(IN PDEVICE_OBJECT FdoDevice,
     {
         EndpointProperties->ScheduleOffset = ScheduleOffset;
 
-        Bandwidth = &FdoExtension->Bandwidth[ScheduleOffset * Factor];
-
-        for (Factor = USB2_FRAMES / Period; Factor; Factor--)
+        /* Reserve the same contiguous frame window that was evaluated
+         * above. Multiplying ScheduleOffset by the shrinking loop counter
+         * aliases entries and corrupts the bandwidth accounting table. */
+        for (ix = 0; ix < Factor; ix++)
         {
-            FdoExtension->Bandwidth[ScheduleOffset * Factor] -= EndpointBandwidth;
+            FdoExtension->Bandwidth[(ScheduleOffset * Factor) + ix] -= EndpointBandwidth;
         }
 
         if (TransferType == USBPORT_TRANSFER_TYPE_INTERRUPT)
@@ -178,11 +183,15 @@ USBPORT_FreeBandwidth(IN PDEVICE_OBJECT FdoDevice,
     ULONG EndpointBandwidth;
     ULONG Period;
     ULONG Factor;
+    ULONG ix;
     UCHAR Bit;
 
     DPRINT("USBPORT_FreeBandwidth: FdoDevice - %p, Endpoint - %p\n",
            FdoDevice,
            Endpoint);
+
+    if (!FdoDevice || !Endpoint || !FdoDevice->DeviceExtension)
+        return;
 
     FdoExtension = FdoDevice->DeviceExtension;
 
@@ -200,11 +209,14 @@ USBPORT_FreeBandwidth(IN PDEVICE_OBJECT FdoDevice,
     EndpointBandwidth = Endpoint->EndpointProperties.UsbBandwidth;
 
     Period = Endpoint->EndpointProperties.Period;
-    ASSERT(Period != 0);
+    if (Period == 0 || Period > USB2_FRAMES ||
+        (USB2_FRAMES % Period) != 0 || Offset >= Period)
+        return;
 
-    for (Factor = USB2_FRAMES / Period; Factor; Factor--)
+    Factor = USB2_FRAMES / Period;
+    for (ix = 0; ix < Factor; ix++)
     {
-        FdoExtension->Bandwidth[Offset * Factor] += EndpointBandwidth;
+        FdoExtension->Bandwidth[(Offset * Factor) + ix] += EndpointBandwidth;
     }
 
     if (TransferType == USBPORT_TRANSFER_TYPE_INTERRUPT)

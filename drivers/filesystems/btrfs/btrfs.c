@@ -367,6 +367,7 @@ static void __stdcall DriverUnload(_In_ PDRIVER_OBJECT DriverObject) {
 
     ExDeleteResourceLite(&global_loading_lock);
     ExDeleteResourceLite(&pdo_list_lock);
+    ExDeleteResourceLite(&boot_lock);
 
     if (log_device.Buffer)
         ExFreePool(log_device.Buffer);
@@ -5446,8 +5447,16 @@ void do_shutdown(PIRP Irp) {
 
             newvpb = ExAllocatePoolWithTag(NonPagedPool, sizeof(VPB), ALLOC_TAG);
             if (!newvpb) {
-                ERR("out of memory\n");
-                return;
+                /* Keep the volume reference alive rather than freeing a device whose
+                 * VPB still describes it as mounted. Continue shutting down other volumes. */
+                ERR("out of memory allocating shutdown VPB; retaining volume reference\n");
+                vde->removing = true;
+
+                if (devobj)
+                    ObDereferenceObject(devobj);
+
+                le = le2;
+                continue;
             }
 
             RtlZeroMemory(newvpb, sizeof(VPB));
@@ -5595,14 +5604,25 @@ static bool device_still_valid(device* dev, uint64_t expected_generation) {
     return true;
 }
 
+typedef struct {
+    device_extension* Vcb;
+    PIO_WORKITEM WorkItem;
+} wake_work_context;
+
 _Function_class_(IO_WORKITEM_ROUTINE)
 static void __stdcall check_after_wakeup(PDEVICE_OBJECT DeviceObject, PVOID con) {
-    device_extension* Vcb = (device_extension*)con;
+    wake_work_context* context = (wake_work_context*)con;
+    device_extension* Vcb = context->Vcb;
+    PIO_WORKITEM work_item = context->WorkItem;
     LIST_ENTRY* le;
+    bool remove_from_list = false;
 
     UNUSED(DeviceObject);
 
     ExAcquireResourceExclusiveLite(&Vcb->tree_lock, true);
+
+    if (Vcb->removing)
+        goto done;
 
     le = Vcb->devices.Flink;
 
@@ -5611,54 +5631,58 @@ static void __stdcall check_after_wakeup(PDEVICE_OBJECT DeviceObject, PVOID con)
     while (le != &Vcb->devices) {
         device* dev = CONTAINING_RECORD(le, device, list_entry);
 
-        if (dev->devobj) {
-            if (!device_still_valid(dev, Vcb->superblock.generation - 1)) {
-                PDEVICE_OBJECT voldev = Vcb->Vpb->RealDevice;
-                KIRQL irql;
-                PVPB newvpb;
+        if (dev->devobj && !device_still_valid(dev, Vcb->superblock.generation - 1)) {
+            PDEVICE_OBJECT voldev = Vcb->Vpb->RealDevice;
+            KIRQL irql;
+            PVPB newvpb;
 
-                WARN("forcing remount\n");
+            WARN("forcing remount\n");
 
-                newvpb = ExAllocatePoolWithTag(NonPagedPool, sizeof(VPB), ALLOC_TAG);
-                if (!newvpb) {
-                    ERR("out of memory\n");
-                    return;
-                }
-
-                RtlZeroMemory(newvpb, sizeof(VPB));
-
-                newvpb->Type = IO_TYPE_VPB;
-                newvpb->Size = sizeof(VPB);
-                newvpb->RealDevice = voldev;
-                newvpb->Flags = VPB_DIRECT_WRITES_ALLOWED;
-
-                Vcb->removing = true;
-
-                IoAcquireVpbSpinLock(&irql);
-                voldev->Vpb = newvpb;
-                IoReleaseVpbSpinLock(irql);
-
-                Vcb->vde = NULL;
-
-                ExReleaseResourceLite(&Vcb->tree_lock);
-
-                if (Vcb->open_files == 0)
-                    uninit(Vcb);
-                else { // remove from VcbList
-                    ExAcquireResourceExclusiveLite(&global_loading_lock, true);
-                    RemoveEntryList(&Vcb->list_entry);
-                    Vcb->list_entry.Flink = NULL;
-                    ExReleaseResourceLite(&global_loading_lock);
-                }
-
-                return;
+            newvpb = ExAllocatePoolWithTag(NonPagedPool, sizeof(VPB), ALLOC_TAG);
+            if (!newvpb) {
+                ERR("out of memory while preparing wake-up remount\n");
+                break;
             }
+
+            RtlZeroMemory(newvpb, sizeof(VPB));
+
+            newvpb->Type = IO_TYPE_VPB;
+            newvpb->Size = sizeof(VPB);
+            newvpb->RealDevice = voldev;
+            newvpb->Flags = VPB_DIRECT_WRITES_ALLOWED;
+
+            Vcb->removing = true;
+
+            IoAcquireVpbSpinLock(&irql);
+            voldev->Vpb = newvpb;
+            IoReleaseVpbSpinLock(irql);
+
+            Vcb->vde = NULL;
+            remove_from_list = true;
+            break;
         }
 
         le = le->Flink;
     }
 
+done:
     ExReleaseResourceLite(&Vcb->tree_lock);
+
+    if (remove_from_list) {
+        ExAcquireResourceExclusiveLite(&global_loading_lock, true);
+        if (Vcb->list_entry.Flink && Vcb->list_entry.Blink) {
+            RemoveEntryList(&Vcb->list_entry);
+            Vcb->list_entry.Flink = NULL;
+            Vcb->list_entry.Blink = NULL;
+        }
+        ExReleaseResourceLite(&global_loading_lock);
+    }
+
+    IoFreeWorkItem(work_item);
+    ExFreePool(context);
+
+    if (InterlockedDecrement(&Vcb->open_files) == 0 && Vcb->removing)
+        uninit(Vcb);
 }
 
 _Dispatch_type_(IRP_MJ_POWER)
@@ -5683,7 +5707,7 @@ static NTSTATUS __stdcall drv_power(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP 
             device_extension* Vcb2 = vde->mounted_device->DeviceExtension;
 
             /* If power state is about to go to sleep or hibernate, do a flush. We do this on IRP_MJ_QUERY_POWER
-            * rather than IRP_MJ_SET_POWER because we know that the hard disks are still awake. */
+             * rather than IRP_MJ_SET_POWER because we know that the hard disks are still awake. */
 
             if (Vcb2) {
                 ExAcquireResourceExclusiveLite(&Vcb2->tree_lock, true);
@@ -5705,16 +5729,27 @@ static NTSTATUS __stdcall drv_power(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP 
             IrpSp->Parameters.Power.State.SystemState == PowerSystemWorking && vde->mounted_device) {
             device_extension* Vcb2 = vde->mounted_device->DeviceExtension;
 
-            /* If waking up, make sure that the FS hasn't been changed while we've been out (e.g., by dual-boot Linux) */
+            /* If waking up, make sure that the FS hasn't been changed while we've been out (e.g., by dual-boot Linux). */
 
             if (Vcb2) {
                 PIO_WORKITEM work_item;
+                wake_work_context* context;
 
                 work_item = IoAllocateWorkItem(DeviceObject);
                 if (!work_item) {
-                    ERR("out of memory\n");
-                } else
-                    IoQueueWorkItem(work_item, check_after_wakeup, DelayedWorkQueue, Vcb2);
+                    ERR("IoAllocateWorkItem failed during wake-up verification\n");
+                } else {
+                    context = ExAllocatePoolWithTag(NonPagedPool, sizeof(wake_work_context), ALLOC_TAG);
+                    if (!context) {
+                        ERR("out of memory allocating wake-up context\n");
+                        IoFreeWorkItem(work_item);
+                    } else {
+                        context->Vcb = Vcb2;
+                        context->WorkItem = work_item;
+                        InterlockedIncrement(&Vcb2->open_files);
+                        IoQueueWorkItem(work_item, check_after_wakeup, DelayedWorkQueue, context);
+                    }
+                }
             }
         }
 
@@ -5724,9 +5759,9 @@ static NTSTATUS __stdcall drv_power(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIRP 
 
         goto exit;
     } else if (Vcb && Vcb->type == VCB_TYPE_FS) {
+        PoStartNextPowerIrp(Irp);
         IoSkipCurrentIrpStackLocation(Irp);
-
-        Status = IoCallDriver(Vcb->Vpb->RealDevice, Irp);
+        Status = PoCallDriver(Vcb->Vpb->RealDevice, Irp);
 
         goto exit;
     } else if (Vcb && Vcb->type == VCB_TYPE_BUS) {
@@ -6312,9 +6347,20 @@ NTSTATUS __stdcall DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_S
     InitializeListHead(&gid_map_list);
 
 #ifdef _DEBUG
-    ExInitializeResourceLite(&log_lock);
+    Status = ExInitializeResourceLite(&log_lock);
+    if (!NT_SUCCESS(Status)) {
+        ERR("ExInitializeResourceLite(log_lock) returned %08lx\n", Status);
+        return Status;
+    }
 #endif
-    ExInitializeResourceLite(&mapping_lock);
+    Status = ExInitializeResourceLite(&mapping_lock);
+    if (!NT_SUCCESS(Status)) {
+        ERR("ExInitializeResourceLite(mapping_lock) returned %08lx\n", Status);
+#ifdef _DEBUG
+        ExDeleteResourceLite(&log_lock);
+#endif
+        return Status;
+    }
 
     log_device.Buffer = NULL;
     log_device.Length = log_device.MaximumLength = 0;
@@ -6326,6 +6372,10 @@ NTSTATUS __stdcall DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_S
 
     if (!registry_path.Buffer) {
         ERR("out of memory\n");
+        ExDeleteResourceLite(&mapping_lock);
+#ifdef _DEBUG
+        ExDeleteResourceLite(&log_lock);
+#endif
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 

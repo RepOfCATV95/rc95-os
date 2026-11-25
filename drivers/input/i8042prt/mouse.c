@@ -72,6 +72,19 @@ i8042MouHandle(
 	PMOUSE_INPUT_DATA MouseInput;
 	CHAR Scroll;
 
+	/*
+	 * The interrupt parser writes into the current queue slot before the
+	 * packet-complete callback advances MouseInBuffer.  Never form that
+	 * pointer when the configured queue is full (or has zero capacity).
+	 */
+	if (DeviceExtension->MouseInBuffer >=
+	    DeviceExtension->Common.PortDeviceExtension->Settings.MouseDataQueueSize)
+	{
+		WARN_(I8042PRT, "Mouse input queue is full; dropping packet data\n");
+		DeviceExtension->MouseState = MouseIdle;
+		return;
+	}
+
 	MouseInput = DeviceExtension->MouseBuffer + DeviceExtension->MouseInBuffer;
 
 	switch (DeviceExtension->MouseState)
@@ -337,6 +350,12 @@ i8042MouDpcRoutine(
 		&MouseTransferred);
 
 	Irql = KeAcquireInterruptSpinLock(PortDeviceExtension->HighestDIRQLInterrupt);
+	/* A class callback must never be allowed to consume beyond the
+	 * snapshot that was offered to it, even if it reports a bad count. */
+	if (MouseTransferred > MouseInBufferCopy)
+		MouseTransferred = MouseInBufferCopy;
+	if (MouseTransferred > DeviceExtension->MouseInBuffer)
+		MouseTransferred = DeviceExtension->MouseInBuffer;
 	DeviceExtension->MouseInBuffer -= MouseTransferred;
 	if (DeviceExtension->MouseInBuffer)
 		RtlMoveMemory(

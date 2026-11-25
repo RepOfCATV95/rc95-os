@@ -22,9 +22,18 @@ PcGetDeviceProperty(
 {
     PPCLASS_DEVICE_EXTENSION DeviceExtension;
 
-    PC_ASSERT_IRQL_EQUAL(PASSIVE_LEVEL);
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
+
+    if (!DeviceObject || !ResultLength || (BufferLength != 0 && !PropertyBuffer))
+        return STATUS_INVALID_PARAMETER;
+
+    if (!((PDEVICE_OBJECT)DeviceObject)->DeviceExtension)
+        return STATUS_INVALID_DEVICE_STATE;
 
     DeviceExtension = (PPCLASS_DEVICE_EXTENSION)((PDEVICE_OBJECT)DeviceObject)->DeviceExtension;
+    if (!DeviceExtension->PhysicalDeviceObject)
+        return STATUS_DEVICE_NOT_CONNECTED;
 
     return IoGetDeviceProperty(DeviceExtension->PhysicalDeviceObject, DeviceProperty, BufferLength, PropertyBuffer, ResultLength);
 }
@@ -64,7 +73,8 @@ PcIoTimerRoutine(
     {
         CurContext = (PTIMER_CONTEXT)CONTAINING_RECORD(ListEntry, TIMER_CONTEXT, Entry);
 
-        CurContext->pTimerRoutine(DeviceObject, CurContext->Context);
+        if (CurContext->pTimerRoutine)
+            CurContext->pTimerRoutine(DeviceObject, CurContext->Context);
         ListEntry = ListEntry->Flink;
     }
 
@@ -85,10 +95,14 @@ PcRegisterIoTimeout(
     BOOLEAN bFound;
     PPCLASS_DEVICE_EXTENSION DeviceExtension;
 
-    PC_ASSERT_IRQL_EQUAL(PASSIVE_LEVEL);
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
 
-    if (!pDeviceObject || !pDeviceObject->DeviceExtension)
+    if (!pDeviceObject || !pTimerRoutine || !pDeviceObject->DeviceExtension)
         return STATUS_INVALID_PARAMETER;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
 
     DeviceExtension = (PPCLASS_DEVICE_EXTENSION)pDeviceObject->DeviceExtension;
 
@@ -142,10 +156,14 @@ PcUnregisterIoTimeout(
     BOOLEAN bFound;
     PPCLASS_DEVICE_EXTENSION DeviceExtension;
 
-    PC_ASSERT_IRQL_EQUAL(PASSIVE_LEVEL);
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
 
-    if (!pDeviceObject || !pDeviceObject->DeviceExtension)
+    if (!pDeviceObject || !pTimerRoutine || !pDeviceObject->DeviceExtension)
         return STATUS_INVALID_PARAMETER;
+
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
 
     DeviceExtension = (PPCLASS_DEVICE_EXTENSION)pDeviceObject->DeviceExtension;
 
@@ -216,6 +234,9 @@ PcDmaMasterDescription(
     OUT PDEVICE_DESCRIPTION DeviceDescription)
 {
 
+    if (!DeviceDescription)
+        return STATUS_INVALID_PARAMETER;
+
     RtlZeroMemory(DeviceDescription, sizeof(DEVICE_DESCRIPTION));
 
     DeviceDescription->Master = TRUE;
@@ -244,6 +265,9 @@ PcDmaSlaveDescription(
     IN ULONG DmaPort,
     OUT PDEVICE_DESCRIPTION DeviceDescription)
 {
+
+    if (!DeviceDescription)
+        return STATUS_INVALID_PARAMETER;
 
     RtlZeroMemory(DeviceDescription, sizeof(DEVICE_DESCRIPTION));
 

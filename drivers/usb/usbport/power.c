@@ -314,6 +314,7 @@ USBPORT_CancelPendingWakeIrp(IN PDEVICE_OBJECT PdoDevice,
 
     Irp->IoStatus.Status = STATUS_CANCELLED;
     Irp->IoStatus.Information = 0;
+    PoStartNextPowerIrp(Irp);
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
 }
 
@@ -364,8 +365,10 @@ USBPORT_PdoPower(IN PDEVICE_OBJECT PdoDevice,
 
                   DPRINT("USBPORT_PdoPower: IRP_MN_WAIT_WAKE - STATUS_CANCELLED\n");
 
-                  /* IRP is cancelled */
+                  /* We removed the cancel routine, so this path owns
+                   * completion of the power IRP and must advance the PO queue. */
                   Status = STATUS_CANCELLED;
+                  PoStartNextPowerIrp(Irp);
                   break;
               }
           }

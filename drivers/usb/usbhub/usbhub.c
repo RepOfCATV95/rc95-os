@@ -100,6 +100,8 @@ USBH_SyncIrpComplete(IN PDEVICE_OBJECT DeviceObject,
     DPRINT("USBH_SyncIrpComplete: ... \n");
 
     HubTimeoutContext = Context;
+    if (!HubTimeoutContext)
+        return STATUS_SUCCESS;
 
     KeAcquireSpinLock(&HubTimeoutContext->UrbTimeoutSpinLock, &OldIrql);
     HubTimeoutContext->IsNormalCompleted = TRUE;
@@ -198,14 +200,8 @@ USBH_UrbTimeoutDPC(IN PKDPC Dpc,
     IsCompleted = HubTimeoutContext->IsNormalCompleted;
     KeReleaseSpinLock(&HubTimeoutContext->UrbTimeoutSpinLock, OldIrql);
 
-    if (!IsCompleted)
-    {
+    if (!IsCompleted && HubTimeoutContext->Irp)
         IoCancelIrp(HubTimeoutContext->Irp);
-    }
-
-    KeSetEvent(&HubTimeoutContext->UrbTimeoutEvent,
-               EVENT_INCREMENT,
-               FALSE);
 }
 
 NTSTATUS
@@ -261,6 +257,9 @@ USBH_SyncSubmitUrb(IN PDEVICE_OBJECT DeviceObject,
 
     DPRINT("USBH_SyncSubmitUrb: ... \n");
 
+    if (!DeviceObject || !Urb || KeGetCurrentIrql() > APC_LEVEL)
+        return STATUS_INVALID_PARAMETER;
+
     Urb->UrbHeader.UsbdDeviceHandle = NULL;
 
     KeInitializeEvent(&Event, NotificationEvent, FALSE);
@@ -287,7 +286,12 @@ USBH_SyncSubmitUrb(IN PDEVICE_OBJECT DeviceObject,
                                               sizeof(USBHUB_URB_TIMEOUT_CONTEXT),
                                               USB_HUB_TAG);
 
-    if (HubTimeoutContext)
+    if (!HubTimeoutContext)
+    {
+        IoFreeIrp(Irp);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
     {
         RtlZeroMemory(HubTimeoutContext, sizeof(USBHUB_URB_TIMEOUT_CONTEXT));
 
@@ -338,12 +342,11 @@ USBH_SyncSubmitUrb(IN PDEVICE_OBJECT DeviceObject,
 
     if (IsWaitTimeout)
     {
-        KeWaitForSingleObject(&HubTimeoutContext->UrbTimeoutEvent,
-                              Suspended,
-                              KernelMode,
-                              FALSE,
-                              NULL);
-
+        /* The IRP completion event is signaled after the completion routine.
+         * Flush a timeout DPC that may already have started before releasing
+         * the context it uses to cancel this IRP. */
+        KeCancelTimer(&HubTimeoutContext->UrbTimeoutTimer);
+        KeFlushQueuedDpcs();
         ExFreePoolWithTag(HubTimeoutContext, USB_HUB_TAG);
     }
 
@@ -384,6 +387,10 @@ USBH_Transact(IN PUSBHUB_FDO_EXTENSION HubExtension,
     NTSTATUS Status;
 
     DPRINT("USBH_Transact: ... \n");
+
+    if ((BufferLen != 0 && !TransferBuffer) ||
+        BufferLen > (MAXULONG - sizeof(ULONG)))
+        return STATUS_INVALID_PARAMETER;
 
     if (BufferLen)
     {

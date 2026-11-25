@@ -357,6 +357,9 @@ HidClass_ReadCompleteIrp(
     KIRQL OldLevel;
     PUCHAR Address;
     ULONG Offset;
+    ULONG CopyLength;
+    ULONG MdlLength;
+    PMDL Mdl;
     PHIDP_COLLECTION_DESC CollectionDescription;
     PHIDP_REPORT_IDS ReportDescription;
     BOOLEAN IsEmpty;
@@ -377,12 +380,15 @@ HidClass_ReadCompleteIrp(
     //
     // copy result
     //
+    Address = NULL;
+    IrpContext->OriginalIrp->IoStatus.Information = 0;
     if (Irp->IoStatus.Information)
     {
         //
         // get address
         //
-        Address = MmGetSystemAddressForMdlSafe(IrpContext->OriginalIrp->MdlAddress, NormalPagePriority);
+        Mdl = IrpContext->OriginalIrp->MdlAddress;
+        Address = Mdl ? MmGetSystemAddressForMdlSafe(Mdl, NormalPagePriority) : NULL;
         if (Address)
         {
             //
@@ -414,9 +420,23 @@ HidClass_ReadCompleteIrp(
             }
 
             //
-            // copy result
+            // Bound the copy by both the completed transfer and the caller's
+            // MDL.  The collection offset must not let a short read write past
+            // the end of the original request buffer.
             //
-            RtlCopyMemory(&Address[Offset], IrpContext->InputReportBuffer, IrpContext->InputReportBufferLength);
+            MdlLength = MmGetMdlByteCount(Mdl);
+            CopyLength = (ULONG)min((ULONG_PTR)Irp->IoStatus.Information,
+                                    (ULONG_PTR)IrpContext->InputReportBufferLength);
+            if (Offset > MdlLength)
+                CopyLength = 0;
+            else if (CopyLength > MdlLength - Offset)
+                CopyLength = MdlLength - Offset;
+
+            if (CopyLength)
+                RtlCopyMemory(&Address[Offset],
+                              IrpContext->InputReportBuffer,
+                              CopyLength);
+            IrpContext->OriginalIrp->IoStatus.Information = CopyLength;
         }
     }
 
@@ -424,7 +444,16 @@ HidClass_ReadCompleteIrp(
     // copy result status
     //
     IrpContext->OriginalIrp->IoStatus.Status = Irp->IoStatus.Status;
-    IrpContext->OriginalIrp->IoStatus.Information = Irp->IoStatus.Information;
+    if (!IrpContext->OriginalIrp->MdlAddress)
+    {
+        IrpContext->OriginalIrp->IoStatus.Status = STATUS_INVALID_USER_BUFFER;
+        IrpContext->OriginalIrp->IoStatus.Information = 0;
+    }
+    else if (Irp->IoStatus.Information && Address == NULL)
+    {
+        IrpContext->OriginalIrp->IoStatus.Status = STATUS_INSUFFICIENT_RESOURCES;
+        IrpContext->OriginalIrp->IoStatus.Information = 0;
+    }
 
     //
     // free input report buffer
@@ -615,6 +644,22 @@ HidClass_BuildIrp(
                                                          IrpContext->FileOp->DeviceExtension->CollectionNumber);
     ASSERT(ReportDescription);
 
+    if (!CollectionDescription || !ReportDescription ||
+        ReportDescription->InputLength == 0 ||
+        CollectionDescription->InputLength < ReportDescription->InputLength)
+    {
+        IoFreeIrp(Irp);
+        ExFreePoolWithTag(IrpContext, HIDCLASS_TAG);
+        return STATUS_DEVICE_CONFIGURATION_ERROR;
+    }
+
+    if (BufferLength < CollectionDescription->InputLength)
+    {
+        IoFreeIrp(Irp);
+        ExFreePoolWithTag(IrpContext, HIDCLASS_TAG);
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+
     //
     // sanity check
     //
@@ -626,8 +671,8 @@ HidClass_BuildIrp(
          // stop in progress
          //
          DPRINT1("[HIDCLASS] Stop In Progress\n");
-         Irp->IoStatus.Status = STATUS_CANCELLED;
-         IoCompleteRequest(Irp, IO_NO_INCREMENT);
+         IoFreeIrp(Irp);
+         ExFreePoolWithTag(IrpContext, HIDCLASS_TAG);
          return STATUS_CANCELLED;
 
     }

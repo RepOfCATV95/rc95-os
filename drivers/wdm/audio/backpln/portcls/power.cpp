@@ -23,21 +23,34 @@ PcRegisterAdapterPowerManagement(
     IAdapterPowerManagement * pPower;
 
     DPRINT("PcRegisterAdapterPowerManagement pUnknown %p pvContext %p\n", pUnknown, pvContext);
-    PC_ASSERT_IRQL_EQUAL(PASSIVE_LEVEL);
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
 
     if (!pUnknown || !pvContext)
         return STATUS_INVALID_PARAMETER;
 
     pDeviceObject = (PDEVICE_OBJECT)pvContext;
+    if (!pDeviceObject->DeviceExtension)
+        return STATUS_INVALID_DEVICE_STATE;
+
     DeviceExt = (PPCLASS_DEVICE_EXTENSION)pDeviceObject->DeviceExtension;
 
     Status = pUnknown->QueryInterface(IID_IAdapterPowerManagement, (PVOID*)&pPower);
     if (!NT_SUCCESS(Status))
     {
         DPRINT1("PcRegisterAdapterPowerManagement no IAdapterPowerManagement interface %x\n", Status);
-        DeviceExt->AdapterPowerManagement = NULL;
+        if (DeviceExt->AdapterPowerManagement) {
+            DeviceExt->AdapterPowerManagement->Release();
+            DeviceExt->AdapterPowerManagement = NULL;
+        }
         return STATUS_SUCCESS;
     }
+
+    if (!pPower)
+        return STATUS_INVALID_DEVICE_STATE;
+
+    if (DeviceExt->AdapterPowerManagement)
+        DeviceExt->AdapterPowerManagement->Release();
 
     DeviceExt->AdapterPowerManagement = pPower;
     DPRINT("PcRegisterAdapterPowerManagement success %x\n", Status);
@@ -52,10 +65,14 @@ PcUnregisterAdapterPowerManagement(
     PPCLASS_DEVICE_EXTENSION DeviceExt;
 
     DPRINT("PcUnregisterAdapterPowerManagement pUnknown %p pvContext %p\n", DeviceObject);
-    PC_ASSERT_IRQL_EQUAL(PASSIVE_LEVEL);
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
 
     if (!DeviceObject)
         return STATUS_INVALID_PARAMETER;
+
+    if (!DeviceObject->DeviceExtension)
+        return STATUS_INVALID_DEVICE_STATE;
 
     DeviceExt = (PPCLASS_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
 
@@ -91,12 +108,19 @@ PcRequestNewPowerState(
     POWER_STATE PowerState;
     PPCLASS_DEVICE_EXTENSION DeviceExt;
 
-    PC_ASSERT_IRQL_EQUAL(PASSIVE_LEVEL);
+    if (KeGetCurrentIrql() != PASSIVE_LEVEL)
+        return STATUS_INVALID_DEVICE_STATE;
 
-    if (!DeviceObject || !RequestedNewState)
+    if (!DeviceObject || RequestedNewState < PowerDeviceD0 || RequestedNewState > PowerDeviceD3)
         return STATUS_INVALID_PARAMETER;
 
+    if (!DeviceObject->DeviceExtension)
+        return STATUS_INVALID_DEVICE_STATE;
+
     DeviceExt = (PPCLASS_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+    if (!DeviceExt->PhysicalDeviceObject)
+        return STATUS_DEVICE_NOT_CONNECTED;
+
     KeInitializeEvent(&Event, SynchronizationEvent, FALSE);
 
     PowerState.DeviceState = RequestedNewState;

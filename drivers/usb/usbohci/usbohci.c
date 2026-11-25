@@ -394,6 +394,13 @@ OHCI_OpenEndpoint(IN PVOID ohciExtension,
 
     DPRINT_OHCI("OHCI_OpenEndpoint: ... \n");
 
+    /* An endpoint needs room for its ED and at least one transfer descriptor. */
+    if (!OhciExtension || !EndpointProperties || !OhciEndpoint ||
+        !EndpointProperties->BufferVA ||
+        EndpointProperties->BufferLength <
+            sizeof(OHCI_HCD_ED) + sizeof(OHCI_HCD_TD))
+        return MP_STATUS_FAILURE;
+
     RtlCopyMemory(&OhciEndpoint->EndpointProperties,
                   EndpointProperties,
                   sizeof(OhciEndpoint->EndpointProperties));

@@ -6,7 +6,7 @@
  * PROGRAMMERS: Copyright Victor Kirhenshtein (sauros@iname.com)
                 Copyright Jason Filby (jasonfilby@yahoo.com)
                 Copyright Martijn Vernooij (o112w8r02@sneakemail.com)
-                Copyright 2006-2007 Hervé Poussineau (hpoussin@reactos.org)
+                Copyright 2006-2007 HervÃ© Poussineau (hpoussin@reactos.org)
  */
 
 /* INCLUDES ****************************************************************/
@@ -373,6 +373,11 @@ i8042KbdDpcRoutine(
 	ASSERT(KeGetCurrentIrql() == Irql);
 
 	Irql = KeAcquireInterruptSpinLock(PortDeviceExtension->HighestDIRQLInterrupt);
+	/* Bound the callback's consumed count to the offered snapshot. */
+	if (KeysTransferred > KeysInBufferCopy)
+		KeysTransferred = KeysInBufferCopy;
+	if (KeysTransferred > DeviceExtension->KeysInBuffer)
+		KeysTransferred = DeviceExtension->KeysInBuffer;
 	DeviceExtension->KeysInBuffer -= KeysTransferred;
 	KeReleaseInterruptSpinLock(PortDeviceExtension->HighestDIRQLInterrupt, Irql);
 }
@@ -803,6 +808,15 @@ i8042KbdInterruptService(
 	__analysis_assume(Context != NULL);
 	DeviceExtension = Context;
 	PortDeviceExtension = DeviceExtension->Common.PortDeviceExtension;
+
+	/* Do not form a slot pointer when the configured queue is full. */
+	if (DeviceExtension->KeysInBuffer >=
+	    PortDeviceExtension->Settings.KeyboardDataQueueSize)
+	{
+		WARN_(I8042PRT, "Keyboard input queue is full; dropping scan code\n");
+		return TRUE;
+	}
+
 	InputData = DeviceExtension->KeyboardBuffer + DeviceExtension->KeysInBuffer;
 	Counter = PortDeviceExtension->Settings.PollStatusIterations;
 
