@@ -21,7 +21,10 @@
 
 ## Use of AI
 
-Use of AI tools are strictly restricted in ReactOS since October 2026.
+AI is here to help RC95-OS reach its goals. The AGENTS.md proves that otherwise.
+
+> [!WARNING]
+> Use of AI tools are strictly restricted in ReactOS since October 2026. In LiberNT, a reviewer of AI-assisted code must be strictly human.
 
 ---
 
