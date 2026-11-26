@@ -1,0 +1,27 @@
+/*
+ * Clean-room bounded binary interval coder. Its interval convention is an
+ * internal primitive; LZMS wire-format conformance requires independent vectors.
+ */
+#include <string.h>
+#include <libwim/lzms_range.h>
+#define HALF 0x80000000u
+#define QTR 0x40000000u
+#define THREE_QTR 0xC0000000u
+static LZMS_RANGE_STATUS putbit(LZMS_RANGE_ENCODER *e,uint32_t b){
+ if(e->BitsInAccumulator==8){if(e->OutputPosition>=e->OutputCapacity){e->Status=LZMS_RANGE_OUTPUT_FULL;return e->Status;}e->Output[e->OutputPosition++]=e->BitAccumulator;e->BitAccumulator=0;e->BitsInAccumulator=0;}
+ e->BitAccumulator=(uint8_t)((e->BitAccumulator<<1)|(b&1));++e->BitsInAccumulator;return LZMS_RANGE_OK;}
+static LZMS_RANGE_STATUS emit(LZMS_RANGE_ENCODER *e,uint32_t b){LZMS_RANGE_STATUS s=putbit(e,b);if(s)return s;while(e->PendingBits){s=putbit(e,b^1);if(s)return s;--e->PendingBits;}return LZMS_RANGE_OK;}
+static LZMS_RANGE_STATUS getbit(LZMS_RANGE_DECODER*d,uint32_t*b){if(d->InputPosition>=d->InputSize){d->Status=LZMS_RANGE_INPUT_EXHAUSTED;return d->Status;}*b=(d->Input[d->InputPosition]>>(7-d->BitPosition))&1;if(++d->BitPosition==8){d->BitPosition=0;++d->InputPosition;}return LZMS_RANGE_OK;}
+void LzmsAdaptiveModelInitialize(LZMS_ADAPTIVE_MODEL*m,uint32_t z,uint32_t o,uint32_t max){if(!m)return;if(max<4)max=4;if(!z)z=1;if(!o)o=1;if(z>=max)z=max-1;if(o>max-z)o=max-z;if(!o)o=1;m->ZeroCount=z;m->OneCount=o;m->MaximumTotal=max;}
+uint32_t LzmsAdaptiveModelGetZeroProbability(const LZMS_ADAPTIVE_MODEL*m){uint64_t t,p;if(!m||!m->ZeroCount||!m->OneCount)return 2048;t=(uint64_t)m->ZeroCount+m->OneCount;p=((uint64_t)m->ZeroCount*4096+t/2)/t;if(p<1)p=1;if(p>4095)p=4095;return(uint32_t)p;}
+void LzmsAdaptiveModelUpdate(LZMS_ADAPTIVE_MODEL*m,uint32_t b){if(!m||m->MaximumTotal<4||b>1)return;if(!b)++m->ZeroCount;else ++m->OneCount;if((uint64_t)m->ZeroCount+m->OneCount>=m->MaximumTotal){m->ZeroCount=(m->ZeroCount+1)>>1;m->OneCount=(m->OneCount+1)>>1;if(!m->ZeroCount)m->ZeroCount=1;if(!m->OneCount)m->OneCount=1;}}
+LZMS_RANGE_STATUS LzmsRangeEncoderInitialize(LZMS_RANGE_ENCODER*e,uint8_t*out,size_t n){if(!e||(!out&&n))return LZMS_RANGE_INVALID_ARGUMENT;memset(e,0,sizeof(*e));e->High=UINT32_MAX;e->Output=out;e->OutputCapacity=n;e->Status=LZMS_RANGE_OK;return e->Status;}
+static LZMS_RANGE_STATUS encprob(LZMS_RANGE_ENCODER*e,uint32_t p,uint32_t b){uint64_t r;uint32_t s;LZMS_RANGE_STATUS st;if(!e||b>1)return LZMS_RANGE_INVALID_ARGUMENT;if(e->Status)return e->Status;if(e->Finalized)return LZMS_RANGE_FINALIZED;if(p<1||p>4095)return LZMS_RANGE_INVALID_ARGUMENT;r=(uint64_t)e->High-e->Low+1;s=e->Low+(uint32_t)(r*p/4096)-1;if(!b)e->High=s;else e->Low=s+1;for(;;){if(e->High<HALF)st=emit(e,0);else if(e->Low>=HALF){st=emit(e,1);e->Low-=HALF;e->High-=HALF;}else if(e->Low>=QTR&&e->High<THREE_QTR){++e->PendingBits;e->Low-=QTR;e->High-=QTR;st=LZMS_RANGE_OK;}else break;if(st)return st;e->Low<<=1;e->High=(e->High<<1)|1;}return LZMS_RANGE_OK;}
+LZMS_RANGE_STATUS LzmsRangeEncodeBit(LZMS_RANGE_ENCODER*e,LZMS_ADAPTIVE_MODEL*m,uint32_t b){LZMS_RANGE_STATUS s;if(!m||b>1)return LZMS_RANGE_INVALID_ARGUMENT;s=encprob(e,LzmsAdaptiveModelGetZeroProbability(m),b);if(!s)LzmsAdaptiveModelUpdate(m,b);return s;}
+LZMS_RANGE_STATUS LzmsRangeEncodeUniformBit(LZMS_RANGE_ENCODER*e,uint32_t b){return encprob(e,2048,b);}
+LZMS_RANGE_STATUS LzmsRangeEncoderFinish(LZMS_RANGE_ENCODER*e){LZMS_RANGE_STATUS s;uint32_t i;if(!e)return LZMS_RANGE_INVALID_ARGUMENT;if(e->Status)return e->Status;if(e->Finalized)return LZMS_RANGE_FINALIZED;++e->PendingBits;s=emit(e,e->Low<QTR?0:1);if(s)return s;for(i=0;i<32;i++){s=putbit(e,0);if(s)return s;}if(e->BitsInAccumulator){while(e->BitsInAccumulator<8){e->BitAccumulator<<=1;++e->BitsInAccumulator;}if(e->OutputPosition>=e->OutputCapacity){e->Status=LZMS_RANGE_OUTPUT_FULL;return e->Status;}e->Output[e->OutputPosition++]=e->BitAccumulator;e->BitAccumulator=0;e->BitsInAccumulator=0;}e->Finalized=1;return LZMS_RANGE_OK;}
+size_t LzmsRangeEncoderBytesWritten(const LZMS_RANGE_ENCODER*e){return e?e->OutputPosition+(e->BitsInAccumulator!=0):0;}
+LZMS_RANGE_STATUS LzmsRangeDecoderInitialize(LZMS_RANGE_DECODER*d,const uint8_t*in,size_t n){uint32_t i;if(!d||(!in&&n))return LZMS_RANGE_INVALID_ARGUMENT;memset(d,0,sizeof(*d));d->High=UINT32_MAX;d->Input=in;d->InputSize=n;d->Status=LZMS_RANGE_OK;for(i=0;i<32;i++){uint32_t b;if(getbit(d,&b))return d->Status;d->Code=(d->Code<<1)|b;}return LZMS_RANGE_OK;}
+static LZMS_RANGE_STATUS decprob(LZMS_RANGE_DECODER*d,uint32_t p,uint32_t*b){uint64_t r;uint32_t s;if(!d||!b)return LZMS_RANGE_INVALID_ARGUMENT;if(d->Status)return d->Status;if(p<1||p>4095)return LZMS_RANGE_INVALID_ARGUMENT;r=(uint64_t)d->High-d->Low+1;s=d->Low+(uint32_t)(r*p/4096)-1;if(d->Code<=s){*b=0;d->High=s;}else{*b=1;d->Low=s+1;}for(;;){uint32_t n;if(d->High<HALF){}else if(d->Low>=HALF){d->Code-=HALF;d->Low-=HALF;d->High-=HALF;}else if(d->Low>=QTR&&d->High<THREE_QTR){d->Code-=QTR;d->Low-=QTR;d->High-=QTR;}else break;d->Low<<=1;d->High=(d->High<<1)|1;if(getbit(d,&n))return d->Status;d->Code=(d->Code<<1)|n;}return LZMS_RANGE_OK;}
+LZMS_RANGE_STATUS LzmsRangeDecodeBit(LZMS_RANGE_DECODER*d,LZMS_ADAPTIVE_MODEL*m,uint32_t*b){LZMS_RANGE_STATUS s;if(!m||!b)return LZMS_RANGE_INVALID_ARGUMENT;s=decprob(d,LzmsAdaptiveModelGetZeroProbability(m),b);if(!s)LzmsAdaptiveModelUpdate(m,*b);return s;}
+LZMS_RANGE_STATUS LzmsRangeDecodeUniformBit(LZMS_RANGE_DECODER*d,uint32_t*b){return decprob(d,2048,b);}

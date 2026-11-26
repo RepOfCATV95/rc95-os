@@ -1,4 +1,3 @@
-
 add_subdirectory(atl)
 add_subdirectory(cmlib)
 add_subdirectory(inflib)
@@ -66,6 +65,7 @@ add_subdirectory(vcstartup)
 add_subdirectory(vkd3d)
 add_subdirectory(wine2ros)
 add_subdirectory(wdmguid)
+add_subdirectory(libwim)
 
 else()
 
