@@ -41,6 +41,13 @@ else()
 endif()
 
 list(APPEND SOURCE
+    ${REACTOS_SOURCE_DIR}/ntoskrnl/bgk/bgfx.c
+    ${REACTOS_SOURCE_DIR}/ntoskrnl/bgk/bgfx_animation.c
+    ${REACTOS_SOURCE_DIR}/ntoskrnl/bgk/bgfx_bitmap.c
+    ${REACTOS_SOURCE_DIR}/ntoskrnl/bgk/bgfx_framebuffer.c
+    ${REACTOS_SOURCE_DIR}/ntoskrnl/bgk/bgfx_progress.c
+    ${REACTOS_SOURCE_DIR}/ntoskrnl/bgk/bgfx_rendering.c
+    ${REACTOS_SOURCE_DIR}/ntoskrnl/bgk/bgfx_resource.c
     ${REACTOS_SOURCE_DIR}/ntoskrnl/cache/section/io.c
     ${REACTOS_SOURCE_DIR}/ntoskrnl/cache/section/sptab.c
     ${REACTOS_SOURCE_DIR}/ntoskrnl/config/cmalloc.c

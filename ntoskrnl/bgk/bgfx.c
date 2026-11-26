@@ -5,3 +5,17 @@
  * Created: 11-21-2026 (Saturday) at 10:38 a.m.
  * Author: Republic of CATV 95
  */
+
+#include <ntoskrnl.h>
+#include "bgfx.h"
+#include "../inbv/logo.h"
+#define NDEBUG
+#include <debug.h>
+
+CODE_SEG("INIT")
+VOID
+NTAPI
+DisplayGopBitmap(VOID)
+{
+    
+}
