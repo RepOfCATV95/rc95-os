@@ -32,6 +32,7 @@ list(APPEND _keyboard_layouts
     kbdda
     kbddv
     kbdeo
+    kbdes
     kbdest
     kbdfa
     kbdfar
@@ -39,6 +40,7 @@ list(APPEND _keyboard_layouts
     kbdfi
     kbdfo
     kbdfr
+    kbdgae
     kbdgeo
     kbdgerg
     kbdgkl
@@ -53,6 +55,7 @@ list(APPEND _keyboard_layouts
     kbdheb
     kbdhela2
     kbdhela3
+    kbdhept
     kbdhu
     kbdibm02
     kbdic
