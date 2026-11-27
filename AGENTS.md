@@ -35,3 +35,4 @@ RC95-OS is a free NT operating system. It is a fork of ReactOS with extensive ch
 
 - Use a `[COMPONENT]` subject and a body with `Problem:`, `Why:`, and `How:` paragraphs separated by blank lines. For ABI and layout changes, name the evidence.
 - For general changes to more than just one component, use `[RC95MAIN]` and body with `-` paragraph separated by blank lines and document such change.
+- DO NOT put changes into mainline branch as it will VIOLATE repository rules.
