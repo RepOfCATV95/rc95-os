@@ -255,6 +255,8 @@ typedef struct {
     BOOL recovered;
     BOOL is_metadata;
     BOOL parity;
+    BOOL read_error;
+    NTSTATUS read_status;
 
     union {
         struct {

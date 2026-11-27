@@ -716,6 +716,8 @@ typedef struct {
     bool recovered;
     bool is_metadata;
     bool parity;
+    bool read_error;
+    NTSTATUS read_status;
     LIST_ENTRY list_entry;
 
     union {

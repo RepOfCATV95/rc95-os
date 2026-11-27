@@ -297,6 +297,8 @@ static void log_file_checksum_error(device_extension* Vcb, uint64_t addr, uint64
     err->recovered = false;
     err->is_metadata = false;
     err->parity = false;
+    err->read_error = false;
+    err->read_status = STATUS_SUCCESS;
 
     err->data.subvol = not_in_tree ? subvol : 0;
     err->data.offset = offset;
@@ -380,6 +382,8 @@ static void log_tree_checksum_error(device_extension* Vcb, uint64_t addr, uint64
     err->recovered = false;
     err->is_metadata = true;
     err->parity = false;
+    err->read_error = false;
+    err->read_status = STATUS_SUCCESS;
 
     err->metadata.root = root;
     err->metadata.level = level;
@@ -626,6 +630,8 @@ static void log_error(device_extension* Vcb, uint64_t addr, uint64_t devid, bool
         err->recovered = true;
         err->is_metadata = metadata;
         err->parity = parity;
+        err->read_error = false;
+        err->read_status = STATUS_SUCCESS;
 
         if (metadata)
             RtlZeroMemory(&err->metadata, sizeof(err->metadata));
@@ -646,6 +652,39 @@ static void log_error(device_extension* Vcb, uint64_t addr, uint64_t devid, bool
 
         log_unrecoverable_error(Vcb, addr, devid);
     }
+}
+
+/* Record a failed device read in the queryable scrub error list. The address
+ * is the physical byte offset on the affected device; scrub never repairs it. */
+static void log_read_error(device_extension* Vcb, uint64_t address, uint64_t devid, bool metadata, NTSTATUS status) {
+    scrub_error* err;
+
+    ERR("scrub read error at device %I64x, offset %I64x: %08lx (%s)\n", devid, address, status,
+        metadata ? "metadata" : "data");
+
+    err = ExAllocatePoolWithTag(PagedPool, sizeof(scrub_error), ALLOC_TAG);
+    if (!err) {
+        ERR("out of memory while recording scrub read error\n");
+        return;
+    }
+
+    err->address = address;
+    err->device = devid;
+    err->recovered = false;
+    err->is_metadata = metadata;
+    err->parity = false;
+    err->read_error = true;
+    err->read_status = status;
+
+    if (metadata)
+        RtlZeroMemory(&err->metadata, sizeof(err->metadata));
+    else
+        RtlZeroMemory(&err->data, sizeof(err->data));
+
+    ExAcquireResourceExclusiveLite(&Vcb->scrub.stats_lock, true);
+    Vcb->scrub.num_errors++;
+    InsertTailList(&Vcb->scrub.errors, &err->list_entry);
+    ExReleaseResourceLite(&Vcb->scrub.stats_lock);
 }
 
 _Function_class_(IO_COMPLETION_ROUTINE)
@@ -684,14 +723,12 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
                                         context->stripes[good_stripe].length) != context->stripes[i].length) {
                         context->stripes[i].csum_error = true;
                         csum_error = true;
-                        log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                     }
                 } else {
                     Status = check_csum(Vcb, context->stripes[i].buf, context->stripes[i].length >> Vcb->sector_shift, csum);
                     if (Status == STATUS_CRC_ERROR) {
                         context->stripes[i].csum_error = true;
                         csum_error = true;
-                        log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                     } else if (!NT_SUCCESS(Status)) {
                         ERR("check_csum returned %08lx\n", Status);
                         return Status;
@@ -713,7 +750,6 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
                                          context->stripes[good_stripe].length) != context->stripes[i].length) {
                         context->stripes[i].csum_error = true;
                         csum_error = true;
-                        log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                     }
                 } else {
                     for (j = 0; j < context->stripes[i].length / Vcb->superblock.node_size; j++) {
@@ -722,7 +758,6 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
                         if (!check_tree_checksum(Vcb, th) || th->address != offset + UInt32x32To64(j, Vcb->superblock.node_size)) {
                             context->stripes[i].csum_error = true;
                             csum_error = true;
-                            log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                         }
                     }
 
@@ -785,11 +820,10 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
 
                     if (csum) {
                         for (j = 0; j < context->stripes[i].length >> Vcb->sector_shift; j++) {
-                            if (RtlCompareMemory((uint8_t*)context->stripes[i].bad_csums + (j * Vcb->csum_size), (uint8_t*)csum + (j + Vcb->csum_size), Vcb->csum_size) != Vcb->csum_size) {
+                            if (RtlCompareMemory((uint8_t*)context->stripes[i].bad_csums + (j * Vcb->csum_size), (uint8_t*)csum + (j * Vcb->csum_size), Vcb->csum_size) != Vcb->csum_size) {
                                 uint64_t addr = offset + ((uint64_t)j << Vcb->sector_shift);
 
                                 log_error(Vcb, addr, c->devices[i]->devitem.dev_id, false, true, false);
-                                log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                             }
                         }
                     } else {
@@ -799,27 +833,13 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
 
                             if (RtlCompareMemory((uint8_t*)context->stripes[i].bad_csums + (j * Vcb->csum_size), th, Vcb->csum_size) != Vcb->csum_size || th->address != addr) {
                                 log_error(Vcb, addr, c->devices[i]->devitem.dev_id, true, true, false);
-                                log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                             }
                         }
                     }
                 }
             }
 
-            // write good data over bad
-
-            for (i = 0; i < c->chunk_item->num_stripes; i++) {
-                if (context->stripes[i].csum_error && !c->devices[i]->readonly) {
-                    Status = write_data_phys(c->devices[i]->devobj, c->devices[i]->fileobj, cis[i].offset + offset - c->offset,
-                                             context->stripes[good_stripe].buf, context->stripes[i].length);
-
-                    if (!NT_SUCCESS(Status)) {
-                        ERR("write_data_phys returned %08lx\n", Status);
-                        log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_WRITE_ERRORS);
-                        return Status;
-                    }
-                }
-            }
+            /* Verification-only scrub reports bad mirrors without repairing them. */
 
             return STATUS_SUCCESS;
         }
@@ -840,7 +860,6 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
                                     RtlCompareMemory((uint8_t*)context->stripes[k].bad_csums + (j * Vcb->csum_size),
                                                      (uint8_t*)csum + (j * Vcb->csum_size), Vcb->csum_size) == Vcb->csum_size) {
                                     log_error(Vcb, addr, c->devices[i]->devitem.dev_id, false, true, false);
-                                    log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
 
                                     RtlCopyMemory(context->stripes[i].buf + (j << Vcb->sector_shift),
                                                   context->stripes[k].buf + (j << Vcb->sector_shift), Vcb->superblock.sector_size);
@@ -852,7 +871,6 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
 
                             if (!recovered) {
                                 log_error(Vcb, addr, c->devices[i]->devitem.dev_id, false, false, false);
-                                log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                             }
                         }
                     }
@@ -871,7 +889,6 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
 
                                     if (RtlCompareMemory((uint8_t*)context->stripes[k].bad_csums + (j * Vcb->csum_size), th2, Vcb->csum_size) == Vcb->csum_size && th2->address == addr) {
                                         log_error(Vcb, addr, c->devices[i]->devitem.dev_id, true, true, false);
-                                        log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
 
                                         RtlCopyMemory(th, th2, Vcb->superblock.node_size);
 
@@ -883,7 +900,6 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
 
                             if (!recovered) {
                                 log_error(Vcb, addr, c->devices[i]->devitem.dev_id, true, false, false);
-                                log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                             }
                         }
                     }
@@ -891,19 +907,7 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
             }
         }
 
-        // write good data over bad
-
-        for (i = 0; i < c->chunk_item->num_stripes; i++) {
-            if (c->devices[i]->devobj && !c->devices[i]->readonly) {
-                Status = write_data_phys(c->devices[i]->devobj, c->devices[i]->fileobj, cis[i].offset + offset - c->offset,
-                                         context->stripes[i].buf, context->stripes[i].length);
-                if (!NT_SUCCESS(Status)) {
-                    ERR("write_data_phys returned %08lx\n", Status);
-                    log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
-                    return Status;
-                }
-            }
-        }
+        /* Verification-only scrub never overwrites a damaged mirror. */
 
         return STATUS_SUCCESS;
     }
@@ -914,7 +918,7 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
 
             if (csum) {
                 for (j = 0; j < context->stripes[i].length >> Vcb->sector_shift; j++) {
-                    if (RtlCompareMemory((uint8_t*)context->stripes[i].bad_csums + (j * Vcb->csum_size), (uint8_t*)csum + (j + Vcb->csum_size), Vcb->csum_size) != Vcb->csum_size) {
+                    if (RtlCompareMemory((uint8_t*)context->stripes[i].bad_csums + (j * Vcb->csum_size), (uint8_t*)csum + (j * Vcb->csum_size), Vcb->csum_size) != Vcb->csum_size) {
                         uint64_t addr = offset + ((uint64_t)j << Vcb->sector_shift);
 
                         log_error(Vcb, addr, c->devices[i]->devitem.dev_id, false, false, false);
@@ -964,7 +968,6 @@ static NTSTATUS scrub_extent_raid0(device_extension* Vcb, chunk* c, uint64_t off
                     uint64_t addr = offset + pos;
 
                     log_error(Vcb, addr, c->devices[stripe]->devitem.dev_id, false, false, false);
-                    log_device_error(Vcb, c->devices[stripe], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                 }
 
                 pos += Vcb->superblock.sector_size;
@@ -977,7 +980,6 @@ static NTSTATUS scrub_extent_raid0(device_extension* Vcb, chunk* c, uint64_t off
 
                 if (!check_tree_checksum(Vcb, th) || th->address != addr) {
                     log_error(Vcb, addr, c->devices[stripe]->devitem.dev_id, true, false, false);
-                    log_device_error(Vcb, c->devices[stripe], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                 }
 
                 pos += Vcb->superblock.node_size;
@@ -1032,7 +1034,6 @@ static NTSTATUS scrub_extent_raid10(device_extension* Vcb, chunk* c, uint64_t of
                                             readlen) != readlen) {
                             context->stripes[(stripe * sub_stripes) + k].csum_error = true;
                             csum_error = true;
-                            log_device_error(Vcb, c->devices[(stripe * sub_stripes) + k], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                         }
                     } else {
                         for (j = 0; j < readlen; j += Vcb->superblock.sector_size) {
@@ -1040,7 +1041,6 @@ static NTSTATUS scrub_extent_raid10(device_extension* Vcb, chunk* c, uint64_t of
                                                    (uint8_t*)csum + (((pos + j) * Vcb->csum_size) >> Vcb->sector_shift))) {
                                 csum_error = true;
                                 context->stripes[(stripe * sub_stripes) + k].csum_error = true;
-                                log_device_error(Vcb, c->devices[(stripe * sub_stripes) + k], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                                 break;
                             }
                         }
@@ -1066,7 +1066,6 @@ static NTSTATUS scrub_extent_raid10(device_extension* Vcb, chunk* c, uint64_t of
                                             readlen) != readlen) {
                             context->stripes[(stripe * sub_stripes) + k].csum_error = true;
                             csum_error = true;
-                            log_device_error(Vcb, c->devices[(stripe * sub_stripes) + k], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                         }
                     } else {
                         for (j = 0; j < readlen; j += Vcb->superblock.node_size) {
@@ -1076,7 +1075,6 @@ static NTSTATUS scrub_extent_raid10(device_extension* Vcb, chunk* c, uint64_t of
                             if (!check_tree_checksum(Vcb, th) || th->address != addr) {
                                 csum_error = true;
                                 context->stripes[(stripe * sub_stripes) + k].csum_error = true;
-                                log_device_error(Vcb, c->devices[(stripe * sub_stripes) + k], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                                 break;
                             }
                         }
@@ -1177,22 +1175,7 @@ static NTSTATUS scrub_extent_raid10(device_extension* Vcb, chunk* c, uint64_t of
                             stripe = (stripe + 1) % (c->chunk_item->num_stripes / sub_stripes);
                         }
 
-                        if (recovered) {
-                            // write good data over bad
-
-                            if (!c->devices[j + k]->readonly) {
-                                CHUNK_ITEM_STRIPE* cis = (CHUNK_ITEM_STRIPE*)&c->chunk_item[1];
-
-                                Status = write_data_phys(c->devices[j + k]->devobj, c->devices[j + k]->fileobj, cis[j + k].offset + offset - c->offset,
-                                                         context->stripes[j + goodstripe].buf, context->stripes[j + goodstripe].length);
-
-                                if (!NT_SUCCESS(Status)) {
-                                    ERR("write_data_phys returned %08lx\n", Status);
-                                    log_device_error(Vcb, c->devices[j + k], BTRFS_DEV_STAT_WRITE_ERRORS);
-                                    goto end;
-                                }
-                            }
-                        }
+                        /* Keep recovered data in memory only; scrub does not repair devices. */
                     }
                 }
             } else {
@@ -1289,7 +1272,6 @@ static NTSTATUS scrub_extent_raid10(device_extension* Vcb, chunk* c, uint64_t of
                                         for (k = 0; k < sub_stripes; k++) {
                                             if (c->devices[j + j]->devobj) {
                                                 log_error(Vcb, addr, c->devices[j + k]->devitem.dev_id, false, false, false);
-                                                log_device_error(Vcb, c->devices[j + k], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                                             }
                                         }
                                     }
@@ -1322,7 +1304,6 @@ static NTSTATUS scrub_extent_raid10(device_extension* Vcb, chunk* c, uint64_t of
                                                         recovered = true;
                                                         break;
                                                     } else
-                                                        log_device_error(Vcb, c->devices[j + m], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                                                 }
                                             }
 
@@ -1342,24 +1323,7 @@ static NTSTATUS scrub_extent_raid10(device_extension* Vcb, chunk* c, uint64_t of
                     stripe = (stripe + 1) % (c->chunk_item->num_stripes / sub_stripes);
                 }
 
-                if (recovered) {
-                    // write good data over bad
-
-                    for (k = 0; k < sub_stripes; k++) {
-                        if (c->devices[j + k]->devobj && !c->devices[j + k]->readonly) {
-                            CHUNK_ITEM_STRIPE* cis = (CHUNK_ITEM_STRIPE*)&c->chunk_item[1];
-
-                            Status = write_data_phys(c->devices[j + k]->devobj, c->devices[j + k]->fileobj, cis[j + k].offset + offset - c->offset,
-                                                     context->stripes[j + k].buf, context->stripes[j + k].length);
-
-                            if (!NT_SUCCESS(Status)) {
-                                ERR("write_data_phys returned %08lx\n", Status);
-                                log_device_error(Vcb, c->devices[j + k], BTRFS_DEV_STAT_WRITE_ERRORS);
-                                goto end;
-                            }
-                        }
-                    }
-                }
+                /* Reconstructed mirror contents are diagnostic only, never written back. */
             }
         }
     }
@@ -1390,6 +1354,7 @@ static NTSTATUS scrub_extent(device_extension* Vcb, chunk* c, ULONG type, uint64
 
     RtlZeroMemory(context.stripes, sizeof(scrub_context_stripe) * c->chunk_item->num_stripes);
 
+    Status = STATUS_SUCCESS;
     context.stripes_left = 0;
 
     cis = (CHUNK_ITEM_STRIPE*)&c->chunk_item[1];
@@ -1569,14 +1534,19 @@ static NTSTATUS scrub_extent(device_extension* Vcb, chunk* c, ULONG type, uint64
 
     KeWaitForSingleObject(&context.Event, Executive, KernelMode, false, NULL);
 
-    // return an error if any of the stripes returned an error
+    // Report every failed stripe read before aborting this extent.
     for (i = 0; i < c->chunk_item->num_stripes; i++) {
-        if (!NT_SUCCESS(context.stripes[i].iosb.Status)) {
-            Status = context.stripes[i].iosb.Status;
-            log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_READ_ERRORS);
-            goto end;
+        if (context.stripes[i].Irp &&
+            (!NT_SUCCESS(context.stripes[i].iosb.Status) || context.stripes[i].iosb.Information < context.stripes[i].length)) {
+            uint64_t physical = context.stripes[i].start + cis[i].offset;
+            NTSTATUS read_status = NT_SUCCESS(context.stripes[i].iosb.Status) ? STATUS_DEVICE_DATA_ERROR : context.stripes[i].iosb.Status;
+            log_read_error(Vcb, physical, c->devices[i]->devitem.dev_id, csum == NULL, read_status);
+            if (NT_SUCCESS(Status))
+                Status = read_status;
         }
     }
+    if (!NT_SUCCESS(Status))
+        goto end;
 
     if (type == BLOCK_FLAG_DUPLICATE) {
         Status = scrub_extent_dup(Vcb, c, offset, csum, &context);
@@ -1727,7 +1697,6 @@ static void scrub_raid5_stripe(device_extension* Vcb, chunk* c, scrub_context_ra
 
                     if (!check_tree_checksum(Vcb, th) || th->address != addr) {
                         RtlSetBits(&context->stripes[stripe].error, i, Vcb->superblock.node_size >> Vcb->sector_shift);
-                        log_device_error(Vcb, c->devices[stripe], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
 
                         if (missing_devices > 0)
                             log_error(Vcb, addr, c->devices[stripe]->devitem.dev_id, true, false, false);
@@ -1741,7 +1710,6 @@ static void scrub_raid5_stripe(device_extension* Vcb, chunk* c, scrub_context_ra
                 } else if (RtlCheckBit(&context->has_csum, off)) {
                     if (!check_sector_csum(Vcb, context->stripes[stripe].buf + (stripeoff << Vcb->sector_shift), (uint8_t*)context->csum + (Vcb->csum_size * off))) {
                         RtlSetBit(&context->stripes[stripe].error, i);
-                        log_device_error(Vcb, c->devices[stripe], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
 
                         if (missing_devices > 0) {
                             uint64_t addr = c->offset + (stripe_start * (c->chunk_item->num_stripes - 1) * c->chunk_item->stripe_length) + (off << Vcb->sector_shift);
@@ -1829,7 +1797,6 @@ static void scrub_raid5_stripe(device_extension* Vcb, chunk* c, scrub_context_ra
             context->stripes[parity].rewrite = true;
 
             log_error(Vcb, addr, c->devices[parity]->devitem.dev_id, false, true, true);
-            log_device_error(Vcb, c->devices[parity], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
         } else if (num_errors == 1) {
             uint64_t addr = c->offset + (stripe_start * (c->chunk_item->num_stripes - 1) * c->chunk_item->stripe_length) + (bad_off << Vcb->sector_shift);
 
@@ -1920,7 +1887,6 @@ static void scrub_raid6_stripe(device_extension* Vcb, chunk* c, scrub_context_ra
 
                     if (!check_tree_checksum(Vcb, th) || th->address != addr) {
                         RtlSetBits(&context->stripes[stripe].error, i, Vcb->superblock.node_size >> Vcb->sector_shift);
-                        log_device_error(Vcb, c->devices[stripe], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
 
                         if (missing_devices == 2)
                             log_error(Vcb, addr, c->devices[stripe]->devitem.dev_id, true, false, false);
@@ -1940,7 +1906,6 @@ static void scrub_raid6_stripe(device_extension* Vcb, chunk* c, scrub_context_ra
                         uint64_t addr = c->offset + (stripe_start * (c->chunk_item->num_stripes - 2) * c->chunk_item->stripe_length) + (off << Vcb->sector_shift);
 
                         RtlSetBit(&context->stripes[stripe].error, i);
-                        log_device_error(Vcb, c->devices[stripe], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
 
                         if (missing_devices == 2)
                             log_error(Vcb, addr, c->devices[stripe]->devitem.dev_id, false, false, false);
@@ -2053,7 +2018,6 @@ static void scrub_raid6_stripe(device_extension* Vcb, chunk* c, scrub_context_ra
                 context->stripes[parity1].rewrite = true;
 
                 log_error(Vcb, addr, c->devices[parity1]->devitem.dev_id, false, true, true);
-                log_device_error(Vcb, c->devices[parity1], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
             }
 
             if (RtlCheckBit(&context->stripes[parity2].error, i)) {
@@ -2067,7 +2031,6 @@ static void scrub_raid6_stripe(device_extension* Vcb, chunk* c, scrub_context_ra
                 context->stripes[parity2].rewrite = true;
 
                 log_error(Vcb, addr, c->devices[parity2]->devitem.dev_id, false, true, true);
-                log_device_error(Vcb, c->devices[parity2], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
             }
         } else if (num_errors == 1) {
             uint32_t len;
@@ -2154,7 +2117,6 @@ static void scrub_raid6_stripe(device_extension* Vcb, chunk* c, scrub_context_ra
                             context->stripes[parity1].rewrite = true;
 
                             log_error(Vcb, addr, c->devices[parity1]->devitem.dev_id, false, true, true);
-                            log_device_error(Vcb, c->devices[parity1], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                         }
                     } else {
                         RtlCopyMemory(&context->stripes[bad_stripe1].buf[(num * c->chunk_item->stripe_length) + (i << Vcb->sector_shift)],
@@ -2184,7 +2146,6 @@ static void scrub_raid6_stripe(device_extension* Vcb, chunk* c, scrub_context_ra
                                 context->stripes[parity2].rewrite = true;
 
                                 log_error(Vcb, addr, c->devices[parity2]->devitem.dev_id, false, true, true);
-                                log_device_error(Vcb, c->devices[parity2], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                             }
                         }
                     }
@@ -2234,7 +2195,6 @@ static void scrub_raid6_stripe(device_extension* Vcb, chunk* c, scrub_context_ra
                             context->stripes[parity1].rewrite = true;
 
                             log_error(Vcb, addr, c->devices[parity1]->devitem.dev_id, false, true, true);
-                            log_device_error(Vcb, c->devices[parity1], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                         }
                     } else {
                         RtlCopyMemory(&context->stripes[bad_stripe1].buf[(num * c->chunk_item->stripe_length) + (i << Vcb->sector_shift)],
@@ -2263,7 +2223,6 @@ static void scrub_raid6_stripe(device_extension* Vcb, chunk* c, scrub_context_ra
                             context->stripes[parity2].rewrite = true;
 
                             log_error(Vcb, addr, c->devices[parity2]->devitem.dev_id, false, true, true);
-                            log_device_error(Vcb, c->devices[parity2], BTRFS_DEV_STAT_CORRUPTION_ERRORS);
                         }
                     }
 
@@ -2761,14 +2720,20 @@ static NTSTATUS scrub_chunk_raid56_stripe_run(device_extension* Vcb, chunk* c, u
             KeWaitForSingleObject(&context.Event, Executive, KernelMode, false, NULL);
         }
 
-        // return an error if any of the stripes returned an error
+        // Report every failed device read before stopping this RAID56 run.
         for (i = 0; i < c->chunk_item->num_stripes; i++) {
-            if (!context.stripes[i].missing && !NT_SUCCESS(context.stripes[i].iosb.Status)) {
-                Status = context.stripes[i].iosb.Status;
-                log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_READ_ERRORS);
-                goto end3;
+            if (!context.stripes[i].missing && context.stripes[i].Irp &&
+                (!NT_SUCCESS(context.stripes[i].iosb.Status) ||
+                 context.stripes[i].iosb.Information < read_stripes * c->chunk_item->stripe_length)) {
+                uint64_t physical = cis[i].offset + context.stripes[i].offset;
+                NTSTATUS read_status = NT_SUCCESS(context.stripes[i].iosb.Status) ? STATUS_DEVICE_DATA_ERROR : context.stripes[i].iosb.Status;
+                log_read_error(Vcb, physical, c->devices[i]->devitem.dev_id, false, read_status);
+                if (NT_SUCCESS(Status))
+                    Status = read_status;
             }
         }
+        if (!NT_SUCCESS(Status))
+            goto end3;
 
         if (c->chunk_item->type & BLOCK_FLAG_RAID6) {
             for (i = 0; i < read_stripes; i++) {
@@ -2791,16 +2756,7 @@ end3:
                 IoFreeIrp(context.stripes[i].Irp);
                 context.stripes[i].Irp = NULL;
 
-                if (context.stripes[i].rewrite) {
-                    Status = write_data_phys(c->devices[i]->devobj, c->devices[i]->fileobj, cis[i].offset + context.stripes[i].offset,
-                                             context.stripes[i].buf, (uint32_t)(read_stripes * c->chunk_item->stripe_length));
-
-                    if (!NT_SUCCESS(Status)) {
-                        ERR("write_data_phys returned %08lx\n", Status);
-                        log_device_error(Vcb, c->devices[i], BTRFS_DEV_STAT_WRITE_ERRORS);
-                        goto end2;
-                    }
-                }
+                /* Scrub is verification-only: never write reconstructed data or parity. */
             }
         }
 
@@ -3148,19 +3104,9 @@ static void __stdcall scrub_thread(void* context) {
 
     ExAcquireResourceExclusiveLite(&Vcb->tree_lock, true);
 
-    if (Vcb->need_write && !Vcb->readonly)
-        Status = do_write(Vcb, NULL);
-    else
-        Status = STATUS_SUCCESS;
-
+    /* Scrub must not flush pending filesystem metadata or issue writes. */
+    Status = STATUS_SUCCESS;
     free_trees(Vcb);
-
-    if (!NT_SUCCESS(Status)) {
-        ExReleaseResourceLite(&Vcb->tree_lock);
-        ERR("do_write returned %08lx\n", Status);
-        Vcb->scrub.error = Status;
-        goto end;
-    }
 
     ExConvertExclusiveToSharedLite(&Vcb->tree_lock);
 
@@ -3188,11 +3134,10 @@ static void __stdcall scrub_thread(void* context) {
 
         acquire_chunk_lock(c, Vcb);
 
-        if (!c->readonly) {
-            InsertTailList(&chunks, &c->list_entry_balance);
-            Vcb->scrub.total_chunks++;
-            Vcb->scrub.chunks_left++;
-        }
+        /* Read-only scrub must inspect every chunk, including read-only chunks. */
+        InsertTailList(&chunks, &c->list_entry_balance);
+        Vcb->scrub.total_chunks++;
+        Vcb->scrub.chunks_left++;
 
         release_chunk_lock(c, Vcb);
 
@@ -3279,9 +3224,7 @@ NTSTATUS start_scrub(device_extension* Vcb, KPROCESSOR_MODE processor_mode) {
         return STATUS_DEVICE_NOT_READY;
     }
 
-    if (Vcb->readonly)
-        return STATUS_MEDIA_WRITE_PROTECTED;
-
+    /* Scrub only reads on-disk data and is valid on a read-only volume. */
     Vcb->scrub.stopping = false;
     Vcb->scrub.paused = false;
     Vcb->scrub.error = STATUS_SUCCESS;
@@ -3374,6 +3317,8 @@ NTSTATUS query_scrub(device_extension* Vcb, KPROCESSOR_MODE processor_mode, void
         bse->recovered = err->recovered;
         bse->is_metadata = err->is_metadata;
         bse->parity = err->parity;
+        bse->read_error = err->read_error;
+        bse->read_status = err->read_status;
 
         if (err->is_metadata) {
             bse->metadata.root = err->metadata.root;
