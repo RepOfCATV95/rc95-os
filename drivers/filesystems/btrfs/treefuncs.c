@@ -18,6 +18,18 @@
 #include "btrfs_drv.h"
 #include "crc32c.h"
 
+static void free_unregistered_tree(tree* t) {
+    while (!IsListEmpty(&t->itemlist)) {
+        tree_data* td = CONTAINING_RECORD(RemoveHeadList(&t->itemlist), tree_data, list_entry);
+        ExFreeToPagedLookasideList(&t->Vcb->tree_data_lookaside, td);
+    }
+
+    if (t->nonpaged)
+        ExFreePool(t->nonpaged);
+
+    ExFreePool(t);
+}
+
 __attribute__((nonnull(1,3,4,5)))
 NTSTATUS load_tree(device_extension* Vcb, uint64_t addr, uint8_t* buf, root* r, tree** pt) {
     tree_header* th;
@@ -26,6 +38,10 @@ NTSTATUS load_tree(device_extension* Vcb, uint64_t addr, uint8_t* buf, root* r, 
     uint8_t h;
     bool inserted;
     LIST_ENTRY* le;
+    uint64_t item_array_size, data_size, previous_offset;
+
+    if (Vcb->superblock.node_size < sizeof(tree_header))
+        return STATUS_INTERNAL_ERROR;
 
     th = (tree_header*)buf;
 
@@ -67,17 +83,42 @@ NTSTATUS load_tree(device_extension* Vcb, uint64_t addr, uint8_t* buf, root* r, 
         leaf_node* ln = (leaf_node*)(buf + sizeof(tree_header));
         unsigned int i;
 
-        if ((t->header.num_items * sizeof(leaf_node)) + sizeof(tree_header) > Vcb->superblock.node_size) {
+        data_size = Vcb->superblock.node_size - sizeof(tree_header);
+        item_array_size = (uint64_t)t->header.num_items * sizeof(leaf_node);
+
+        if (item_array_size > data_size) {
             ERR("tree at %I64x has more items than expected (%x)\n", addr, t->header.num_items);
-            ExFreePool(t);
+            free_unregistered_tree(t);
             return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        /* Validate leaf key ordering and item ranges before exposing data pointers. */
+        previous_offset = data_size;
+        for (i = 0; i < t->header.num_items; i++) {
+            if (i > 0 && keycmp(ln[i - 1].key, ln[i].key) >= 0) {
+                ERR("tree at %I64x has out-of-order leaf keys at item %u\n", addr, i);
+                free_unregistered_tree(t);
+                return STATUS_INTERNAL_ERROR;
+            }
+
+            if (ln[i].size > 0) {
+                if (ln[i].offset < item_array_size || ln[i].offset > data_size ||
+                    ln[i].size > data_size - ln[i].offset ||
+                    (uint64_t)ln[i].offset + ln[i].size > previous_offset) {
+                    ERR("tree at %I64x has invalid leaf item range at item %u\n", addr, i);
+                    free_unregistered_tree(t);
+                    return STATUS_INTERNAL_ERROR;
+                }
+
+                previous_offset = ln[i].offset;
+            }
         }
 
         for (i = 0; i < t->header.num_items; i++) {
             td = ExAllocateFromPagedLookasideList(&Vcb->tree_data_lookaside);
             if (!td) {
                 ERR("out of memory\n");
-                ExFreePool(t);
+                free_unregistered_tree(t);
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
 
@@ -87,13 +128,6 @@ NTSTATUS load_tree(device_extension* Vcb, uint64_t addr, uint8_t* buf, root* r, 
                 td->data = buf + sizeof(tree_header) + ln[i].offset;
             else
                 td->data = NULL;
-
-            if (ln[i].size + sizeof(tree_header) + sizeof(leaf_node) > Vcb->superblock.node_size) {
-                ERR("overlarge item in tree %I64x: %u > %Iu\n", addr, ln[i].size, Vcb->superblock.node_size - sizeof(tree_header) - sizeof(leaf_node));
-                ExFreeToPagedLookasideList(&t->Vcb->tree_data_lookaside, td);
-                ExFreePool(t);
-                return STATUS_INTERNAL_ERROR;
-            }
 
             td->size = (uint16_t)ln[i].size;
             td->ignore = false;
@@ -110,17 +144,28 @@ NTSTATUS load_tree(device_extension* Vcb, uint64_t addr, uint8_t* buf, root* r, 
         internal_node* in = (internal_node*)(buf + sizeof(tree_header));
         unsigned int i;
 
-        if ((t->header.num_items * sizeof(internal_node)) + sizeof(tree_header) > Vcb->superblock.node_size) {
+        data_size = Vcb->superblock.node_size - sizeof(tree_header);
+        item_array_size = (uint64_t)t->header.num_items * sizeof(internal_node);
+
+        if (item_array_size > data_size) {
             ERR("tree at %I64x has more items than expected (%x)\n", addr, t->header.num_items);
-            ExFreePool(t);
+            free_unregistered_tree(t);
             return STATUS_INSUFFICIENT_RESOURCES;
+        }
+
+        for (i = 1; i < t->header.num_items; i++) {
+            if (keycmp(in[i - 1].key, in[i].key) >= 0) {
+                ERR("tree at %I64x has out-of-order internal keys at item %u\n", addr, i);
+                free_unregistered_tree(t);
+                return STATUS_INTERNAL_ERROR;
+            }
         }
 
         for (i = 0; i < t->header.num_items; i++) {
             td = ExAllocateFromPagedLookasideList(&Vcb->tree_data_lookaside);
             if (!td) {
                 ERR("out of memory\n");
-                ExFreePool(t);
+                free_unregistered_tree(t);
                 return STATUS_INSUFFICIENT_RESOURCES;
             }
 
@@ -493,6 +538,9 @@ static NTSTATUS find_item_in_tree(device_extension* Vcb, tree* t, traverse_ptr* 
     if ((cmp == -1 || !td) && lasttd)
         td = lasttd;
 
+    if (!td)
+        return STATUS_NOT_FOUND;
+
     if (t->header.level == 0) {
         if (td->ignore && !ignore) {
             traverse_ptr oldtp;
@@ -529,26 +577,33 @@ static NTSTATUS find_item_in_tree(device_extension* Vcb, tree* t, traverse_ptr* 
     } else {
         NTSTATUS Status;
 
-        while (td && td->treeholder.tree && IsListEmpty(&td->treeholder.tree->itemlist)) {
-            td = prev_item(t, td);
-        }
-
-        if (!td)
-            return STATUS_NOT_FOUND;
-
         if (t->header.level <= level) {
             tp->tree = t;
             tp->item = td;
             return STATUS_SUCCESS;
         }
 
-        if (!td->treeholder.tree) {
-            Status = do_load_tree(Vcb, &td->treeholder, t->root, t, td, Irp);
-            if (!NT_SUCCESS(Status)) {
-                ERR("do_load_tree returned %08lx\n", Status);
-                return Status;
+        /* Load and skip empty child trees before descending. */
+        while (td) {
+            if (!td->treeholder.tree) {
+                Status = do_load_tree(Vcb, &td->treeholder, t->root, t, td, Irp);
+                if (!NT_SUCCESS(Status)) {
+                    ERR("do_load_tree returned %08lx\n", Status);
+                    return Status;
+                }
             }
+
+            if (!td->treeholder.tree || td->treeholder.tree->header.level >= t->header.level)
+                return STATUS_INTERNAL_ERROR;
+
+            if (!IsListEmpty(&td->treeholder.tree->itemlist))
+                break;
+
+            td = prev_item(t, td);
         }
+
+        if (!td)
+            return STATUS_NOT_FOUND;
 
         Status = find_item_in_tree(Vcb, td->treeholder.tree, tp, searchkey, ignore, level, Irp);
 
@@ -602,10 +657,53 @@ NTSTATUS find_item_to_level(device_extension* Vcb, root* r, traverse_ptr* tp, co
     return Status;
 }
 
+static bool find_first_item_in_tree(device_extension* Vcb, tree* t, traverse_ptr* result, bool ignore, PIRP Irp) {
+    NTSTATUS Status;
+    tree_data* td;
+
+    if (t->header.level == 0) {
+        td = first_item(t);
+
+        if (!ignore) {
+            while (td && td->ignore)
+                td = next_item(t, td);
+        }
+
+        if (!td)
+            return false;
+
+        result->tree = t;
+        result->item = td;
+        return true;
+    }
+
+    td = first_item(t);
+
+    while (td) {
+        if (!td->treeholder.tree) {
+            Status = do_load_tree(Vcb, &td->treeholder, t->root, t, td, Irp);
+            if (!NT_SUCCESS(Status)) {
+                ERR("do_load_tree returned %08lx\n", Status);
+                return false;
+            }
+        }
+
+        if (td->treeholder.tree && td->treeholder.tree->header.level < t->header.level &&
+            find_first_item_in_tree(Vcb, td->treeholder.tree, result, ignore, Irp))
+            return true;
+
+        td = next_item(t, td);
+    }
+
+    return false;
+}
+
 __attribute__((nonnull(1,2,3)))
 bool find_next_item(_Requires_lock_held_(_Curr_->tree_lock) device_extension* Vcb, const traverse_ptr* tp, traverse_ptr* next_tp, bool ignore, PIRP Irp) {
     tree* t;
-    tree_data *td = NULL, *next;
+    tree* parent;
+    tree_data* td;
+    tree_data* next;
     NTSTATUS Status;
 
     next = next_item(tp->tree, tp->item);
@@ -629,81 +727,32 @@ bool find_next_item(_Requires_lock_held_(_Curr_->tree_lock) device_extension* Vc
         return true;
     }
 
-    if (!tp->tree->parent)
-        return false;
-
     t = tp->tree;
-    do {
-        if (t->parent) {
-            td = next_item(t->parent, t->paritem);
 
-            if (td) break;
-        }
+    while (t && t->parent) {
+        parent = t->parent;
+        td = next_item(parent, t->paritem);
 
-        t = t->parent;
-    } while (t);
-
-    if (!t)
-        return false;
-
-    if (!td->treeholder.tree) {
-        Status = do_load_tree(Vcb, &td->treeholder, t->parent->root, t->parent, td, Irp);
-        if (!NT_SUCCESS(Status)) {
-            ERR("do_load_tree returned %08lx\n", Status);
-            return false;
-        }
-    }
-
-    t = td->treeholder.tree;
-
-    while (t->header.level != 0) {
-        tree_data* fi;
-
-        fi = first_item(t);
-
-        if (!fi)
-            return false;
-
-        if (!fi->treeholder.tree) {
-            Status = do_load_tree(Vcb, &fi->treeholder, t->parent->root, t, fi, Irp);
-            if (!NT_SUCCESS(Status)) {
-                ERR("do_load_tree returned %08lx\n", Status);
-                return false;
+        while (td) {
+            if (!td->treeholder.tree) {
+                Status = do_load_tree(Vcb, &td->treeholder, parent->root, parent, td, Irp);
+                if (!NT_SUCCESS(Status)) {
+                    ERR("do_load_tree returned %08lx\n", Status);
+                    return false;
+                }
             }
+
+            if (td->treeholder.tree && td->treeholder.tree->header.level < parent->header.level &&
+                find_first_item_in_tree(Vcb, td->treeholder.tree, next_tp, ignore, Irp))
+                return true;
+
+            td = next_item(parent, td);
         }
 
-        t = fi->treeholder.tree;
+        t = parent;
     }
 
-    next_tp->tree = t;
-    next_tp->item = first_item(t);
-
-    if (!next_tp->item)
-        return false;
-
-    if (!ignore && next_tp->item->ignore) {
-        traverse_ptr ntp2;
-        bool b;
-
-        while ((b = find_next_item(Vcb, next_tp, &ntp2, true, Irp))) {
-            *next_tp = ntp2;
-
-            if (!next_tp->item->ignore)
-                break;
-        }
-
-        if (!b)
-            return false;
-    }
-
-#ifdef DEBUG_PARANOID
-    if (!ignore && next_tp->item->ignore) {
-        ERR("error - returning ignored item\n");
-        int3;
-    }
-#endif
-
-    return true;
+    return false;
 }
 
 __attribute__((nonnull(1)))
@@ -717,65 +766,95 @@ static __inline tree_data* last_item(tree* t) {
 }
 
 __attribute__((nonnull(1,2,3)))
-bool find_prev_item(_Requires_lock_held_(_Curr_->tree_lock) device_extension* Vcb, const traverse_ptr* tp, traverse_ptr* prev_tp, PIRP Irp) {
-    tree* t;
-    tree_data* td;
+static bool find_last_visible_item_in_tree(device_extension* Vcb, tree* t, traverse_ptr* result, PIRP Irp) {
     NTSTATUS Status;
+    tree_data* td;
 
-    // FIXME - support ignore flag
-    if (prev_item(tp->tree, tp->item)) {
-        prev_tp->tree = tp->tree;
-        prev_tp->item = prev_item(tp->tree, tp->item);
+    if (t->header.level == 0) {
+        td = last_item(t);
 
+        while (td && td->ignore)
+            td = prev_item(t, td);
+
+        if (!td)
+            return false;
+
+        result->tree = t;
+        result->item = td;
         return true;
     }
 
-    if (!tp->tree->parent)
-        return false;
+    td = last_item(t);
 
-    t = tp->tree;
-    while (t && (!t->parent || !prev_item(t->parent, t->paritem))) {
-        t = t->parent;
-    }
-
-    if (!t)
-        return false;
-
-    td = prev_item(t->parent, t->paritem);
-
-    if (!td->treeholder.tree) {
-        Status = do_load_tree(Vcb, &td->treeholder, t->parent->root, t->parent, td, Irp);
-        if (!NT_SUCCESS(Status)) {
-            ERR("do_load_tree returned %08lx\n", Status);
-            return false;
-        }
-    }
-
-    t = td->treeholder.tree;
-
-    while (t->header.level != 0) {
-        tree_data* li;
-
-        li = last_item(t);
-
-        if (!li->treeholder.tree) {
-            Status = do_load_tree(Vcb, &li->treeholder, t->parent->root, t, li, Irp);
+    while (td) {
+        if (!td->treeholder.tree) {
+            Status = do_load_tree(Vcb, &td->treeholder, t->root, t, td, Irp);
             if (!NT_SUCCESS(Status)) {
                 ERR("do_load_tree returned %08lx\n", Status);
                 return false;
             }
         }
 
-        t = li->treeholder.tree;
+        if (td->treeholder.tree && td->treeholder.tree->header.level < t->header.level &&
+            find_last_visible_item_in_tree(Vcb, td->treeholder.tree, result, Irp))
+            return true;
+
+        td = prev_item(t, td);
     }
 
-    prev_tp->tree = t;
-    prev_tp->item = last_item(t);
-
-    return true;
+    return false;
 }
 
-__attribute__((nonnull(1,2)))
+__attribute__((nonnull(1,2,3)))
+bool find_prev_item(_Requires_lock_held_(_Curr_->tree_lock) device_extension* Vcb, const traverse_ptr* tp, traverse_ptr* prev_tp, PIRP Irp) {
+    tree* t;
+    tree_data* td;
+    NTSTATUS Status;
+
+    if (!tp->tree || !tp->item)
+        return false;
+
+    td = prev_item(tp->tree, tp->item);
+
+    /* Skip transaction-overlay entries which are not visible to the caller. */
+    while (td && td->ignore)
+        td = prev_item(tp->tree, td);
+
+    if (td) {
+        prev_tp->tree = tp->tree;
+        prev_tp->item = td;
+        return true;
+    }
+
+    t = tp->tree;
+
+    while (t && t->parent) {
+        tree* parent = t->parent;
+
+        td = prev_item(parent, t->paritem);
+
+        while (td) {
+            if (!td->treeholder.tree) {
+                Status = do_load_tree(Vcb, &td->treeholder, parent->root, parent, td, Irp);
+                if (!NT_SUCCESS(Status)) {
+                    ERR("do_load_tree returned %08lx\n", Status);
+                    return false;
+                }
+            }
+
+            if (td->treeholder.tree && td->treeholder.tree->header.level < parent->header.level &&
+                find_last_visible_item_in_tree(Vcb, td->treeholder.tree, prev_tp, Irp))
+                return true;
+
+            td = prev_item(parent, td);
+        }
+
+        t = parent;
+    }
+
+    return false;
+}
+
 void free_trees_root(device_extension* Vcb, root* r) {
     LIST_ENTRY* le;
     ULONG level;

@@ -872,7 +872,7 @@ typedef struct {
     calc_job* cj;
 } comp_part;
 
-NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void* data, PIRP Irp, LIST_ENTRY* rollback) {
+static NTSTATUS write_compressed_batch(fcb* fcb, uint64_t start_data, uint64_t end_data, void* data, PIRP Irp, LIST_ENTRY* rollback) {
     NTSTATUS Status;
     uint64_t i;
     unsigned int num_parts = (unsigned int)sector_align(end_data - start_data, COMPRESSED_EXTENT_SIZE) / COMPRESSED_EXTENT_SIZE;
@@ -1200,6 +1200,36 @@ NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void
     mark_fcb_dirty(fcb);
 
     ExFreePool(parts);
+
+    return STATUS_SUCCESS;
+}
+
+/*
+ * Keep compression working sets bounded. A comp_part contains a full
+ * COMPRESSED_EXTENT_SIZE output buffer, so allocating one for every part
+ * of a very large write can consume approximately the size of the input
+ * file (and then allocate another contiguous output buffer).
+ *
+ * Process at most 16 MB per batch. Each batch is independently represented
+ * by normal Btrfs compressed extents; the caller's rollback list still
+ * covers all batches if a later batch fails.
+ */
+NTSTATUS write_compressed(fcb* fcb, uint64_t start_data, uint64_t end_data, void* data, PIRP Irp, LIST_ENTRY* rollback) {
+    const uint64_t batch_size = (uint64_t)COMPRESSED_EXTENT_SIZE * 128;
+    uint64_t batch_start = start_data;
+
+    while (batch_start < end_data) {
+        uint64_t batch_end = min(batch_start + batch_size, end_data);
+        NTSTATUS Status = write_compressed_batch(fcb, batch_start, batch_end,
+                                                 (uint8_t*)data + (batch_start - start_data),
+                                                 Irp, rollback);
+        if (!NT_SUCCESS(Status)) {
+            ERR("write_compressed_batch returned %08lx at offset %I64x\n", Status, batch_start);
+            return Status;
+        }
+
+        batch_start = batch_end;
+    }
 
     return STATUS_SUCCESS;
 }

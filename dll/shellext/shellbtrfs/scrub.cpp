@@ -123,10 +123,15 @@ void BtrfsScrub::UpdateTextBox(HWND hwndDlg, btrfs_query_scrub* bqs) {
             btrfs_scrub_error* bse = &bqs2->errors;
 
             do {
-                if (bse->recovered)
-                    recoverable_errors++;
-                else
+                if (bse->read_error) {
+                    wstring_sprintf(u, L"Read I/O error on device %I64x at physical offset %I64x (NTSTATUS %08lx)",
+                                    bse->device, bse->address, bse->read_status);
                     unrecoverable_errors++;
+                } else {
+                    if (bse->recovered)
+                        recoverable_errors++;
+                    else
+                        unrecoverable_errors++;
 
                 if (bse->parity) {
                     if (!load_string(module, IDS_SCRUB_MSG_RECOVERABLE_PARITY, t))
@@ -174,6 +179,8 @@ void BtrfsScrub::UpdateTextBox(HWND hwndDlg, btrfs_query_scrub* bqs) {
                     else
                         wstring_sprintf(u, t, bse->address, bse->device, bse->data.filename_length / sizeof(WCHAR),
                             bse->data.filename, bse->data.offset);
+                }
+
                 }
 
                 s += u;

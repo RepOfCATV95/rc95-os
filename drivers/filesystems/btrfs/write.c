@@ -2380,6 +2380,33 @@ void free_write_data_stripes(write_data_context* wtc) {
     }
 }
 
+/*
+ * Return the last non-deleted extent in logical file order. The extent list
+ * is sorted by file offset; append-heavy workloads (large sequential copies)
+ * should not have to rescan every older extent for each write.
+ */
+static uint64_t get_fcb_extent_length(const extent* ext) {
+    if (ext->extent_data.type == EXTENT_TYPE_INLINE)
+        return ext->extent_data.decoded_size;
+
+    return ((EXTENT_DATA2*)ext->extent_data.data)->num_bytes;
+}
+
+static extent* get_last_fcb_extent(fcb* fcb) {
+    LIST_ENTRY* le = fcb->extents.Blink;
+
+    while (le != &fcb->extents) {
+        extent* ext = CONTAINING_RECORD(le, extent, list_entry);
+
+        if (!ext->ignore)
+            return ext;
+
+        le = le->Blink;
+    }
+
+    return NULL;
+}
+
 __attribute__((nonnull(1,2,3)))
 void add_extent(_In_ fcb* fcb, _In_ LIST_ENTRY* prevextle, _In_ __drv_aliasesMem extent* newext) {
     LIST_ENTRY* le = prevextle->Flink;
@@ -2402,6 +2429,15 @@ __attribute__((nonnull(1,2,6)))
 NTSTATUS excise_extents(device_extension* Vcb, fcb* fcb, uint64_t start_data, uint64_t end_data, PIRP Irp, LIST_ENTRY* rollback) {
     NTSTATUS Status;
     LIST_ENTRY* le;
+
+    {
+        extent* last = get_last_fcb_extent(fcb);
+
+        /* Appending beyond EOF cannot overlap any existing extent. */
+        if (!last || (last->offset <= start_data &&
+                      get_fcb_extent_length(last) <= start_data - last->offset))
+            return STATUS_SUCCESS;
+    }
 
     le = fcb->extents.Flink;
 
@@ -2775,19 +2811,24 @@ NTSTATUS add_extent_to_fcb(_In_ fcb* fcb, _In_ uint64_t offset, _In_reads_bytes_
 
     RtlCopyMemory(&ext->extent_data, ed, edsize);
 
-    le = fcb->extents.Flink;
-    while (le != &fcb->extents) {
-        extent* oldext = CONTAINING_RECORD(le, extent, list_entry);
+    if (IsListEmpty(&fcb->extents) ||
+        offset > CONTAINING_RECORD(fcb->extents.Blink, extent, list_entry)->offset) {
+        InsertTailList(&fcb->extents, &ext->list_entry);
+    } else {
+        le = fcb->extents.Flink;
+        while (le != &fcb->extents) {
+            extent* oldext = CONTAINING_RECORD(le, extent, list_entry);
 
-        if (oldext->offset >= offset) {
-            InsertHeadList(le->Blink, &ext->list_entry);
-            goto end;
+            if (oldext->offset >= offset) {
+                InsertHeadList(le->Blink, &ext->list_entry);
+                goto end;
+            }
+
+            le = le->Flink;
         }
 
-        le = le->Flink;
+        InsertTailList(&fcb->extents, &ext->list_entry);
     }
-
-    InsertTailList(&fcb->extents, &ext->list_entry);
 
 end:
     add_insert_extent_rollback(rollback, fcb, ext);
@@ -2915,22 +2956,27 @@ static bool try_extend_data(device_extension* Vcb, fcb* fcb, uint64_t start_data
     LIST_ENTRY* le;
     extent* ext = NULL;
 
-    le = fcb->extents.Flink;
+    ext = get_last_fcb_extent(fcb);
 
-    while (le != &fcb->extents) {
-        extent* nextext = CONTAINING_RECORD(le, extent, list_entry);
+    if (!ext || ext->offset > start_data) {
+        ext = NULL;
+        le = fcb->extents.Flink;
 
-        if (!nextext->ignore) {
-            if (nextext->offset == start_data) {
+        while (le != &fcb->extents) {
+            extent* nextext = CONTAINING_RECORD(le, extent, list_entry);
+
+            if (!nextext->ignore) {
+                if (nextext->offset == start_data) {
+                    ext = nextext;
+                    break;
+                } else if (nextext->offset > start_data)
+                    break;
+
                 ext = nextext;
-                break;
-            } else if (nextext->offset > start_data)
-                break;
+            }
 
-            ext = nextext;
+            le = le->Flink;
         }
-
-        le = le->Flink;
     }
 
     if (!ext)
@@ -3941,7 +3987,21 @@ NTSTATUS do_write_file(fcb* fcb, uint64_t start, uint64_t end_data, void* data, 
 
     last_cow_start = 0;
 
-    le = fcb->extents.Flink;
+    {
+        extent* last = get_last_fcb_extent(fcb);
+
+        /*
+         * Sequential appends are by far the common case for large file
+         * copies. If the last live extent ends before this write, there
+         * cannot be an extent to COW or overwrite in the requested range.
+         */
+        if (!last || (last->offset <= start &&
+                      get_fcb_extent_length(last) <= start - last->offset))
+            le = &fcb->extents;
+        else
+            le = fcb->extents.Flink;
+    }
+
     while (le != &fcb->extents) {
         extent* ext = CONTAINING_RECORD(le, extent, list_entry);
 
@@ -4384,7 +4444,7 @@ NTSTATUS write_file2(device_extension* Vcb, PIRP Irp, LARGE_INTEGER offset, void
         fcb->Header.ValidDataLength.QuadPart = newlength;
         TRACE("fcb %p FileSize = %I64x\n", fcb, fcb->Header.FileSize.QuadPart);
 
-        if (!make_inline && !compress && off64 == start_data && off64 + *length == end_data) {
+        if (!make_inline && off64 == start_data && off64 + *length == end_data) {
             data = buf;
             no_buf = true;
         } else {
