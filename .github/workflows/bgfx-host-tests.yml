@@ -1,0 +1,27 @@
+name: BGFX host regression tests
+on:
+  push:
+    branches:
+      - work/rc95ldr-bootloader-rearchitecture
+  pull_request:
+    branches:
+      - work/rc95ldr-bootloader-rearchitecture
+  workflow_dispatch:
+jobs:
+  bgfx-renderer:
+    name: RC95LDR BGFX renderer (${{ matrix.compiler }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        env:
+          CC: ${{ matrix.compiler }}
+        run: cmake -S boot/rc95ldr/tests/host -B build/rc95ldr-bgfx -DCMAKE_BUILD_TYPE=Debug
+      - name: Build BGFX, firmware-menu, and UEFI adapter regression targets
+        run: cmake --build build/rc95ldr-bgfx --target rc95ldr_bgfx_tests rc95ldr_firmware_menu_tests rc95ldr_uefi_services_tests rc95ldr_uefi_video_tests --parallel
+      - name: Run BGFX, firmware-menu, and UEFI adapter regression tests
+        run: ctest --test-dir build/rc95ldr-bgfx --output-on-failure -R "^(rc95ldr_bgfx_tests|rc95ldr_firmware_menu_tests|rc95ldr_uefi_services_tests|rc95ldr_uefi_video_tests)$"

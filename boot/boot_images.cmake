@@ -45,6 +45,16 @@ if(DEFINED EFI_PLATFORM_ID)
     set(_efisys_file  ${CMAKE_CURRENT_BINARY_DIR}/efisys.bin) # get_target_property(_efisys_file  efisys  LOCATION)
 endif()
 
+# Optional native RC95LDR El Torito image. The complete no-emulation image
+# contains CD Stage 0, B95S, and the already-loaded Stage-1 image. Its El Torito
+# load count must cover every 512-byte sector in that image.
+set(RC95LDR_BIOS_CD_BOOT_IMAGE "" CACHE FILEPATH
+    "Generated RC95LDR El Torito boot image (512-byte sectors)")
+set(RC95LDR_BIOS_CD_BOOT_LOAD_SIZE "" CACHE STRING
+    "Exact El Torito load count for the RC95LDR image, in 512-byte sectors")
+set(RC95LDR_BIOS_CD_BOOT_TARGET "" CACHE STRING
+    "Optional build target that generates RC95LDR_BIOS_CD_BOOT_IMAGE")
+
 # Create an mkisofs sort file that defines an explicit ordering to place the
 # boot files at the beginning of the ISO image, making its analysis easier.
 # See mkisofs/schilytools/mkisofs/README.sort for more details.
@@ -70,6 +80,10 @@ ${_isobtrt_file} 2
 if(DEFINED EFI_PLATFORM_ID)
     string(APPEND ISO_SORT_FILE_DATA "${_efisys_file} 1\n")
 endif()
+if(_rc95ldr_cd_boot_enabled)
+    string(APPEND ISO_SORT_FILE_DATA
+        "${RC95LDR_BIOS_CD_BOOT_IMAGE} 5\n")
+endif()
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/bootfiles.sort ${ISO_SORT_FILE_DATA})
 
 # ISO image identifier names
@@ -90,8 +104,17 @@ set(ISO_BOOT_FILES_OPTIONS
 
 # BIOS-based PC boot entry and hybrid MBR (x86/x64 only)
 if(ARCH STREQUAL "i386" OR ARCH STREQUAL "amd64")
-    set(ISO_BOOT_OPTIONS
-        -eltorito-platform x86 -eltorito-boot loader/isoboot.bin -no-emul-boot -boot-load-size 4)
+    if(_rc95ldr_cd_boot_enabled)
+        set(ISO_BOOT_OPTIONS
+            -eltorito-platform x86 -eltorito-boot ${_bios_boot_iso_path}
+            -no-emul-boot ${_bios_boot_load_options})
+    else()
+        set(ISO_BOOT_OPTIONS
+            -eltorito-platform x86 -eltorito-boot loader/isoboot.bin
+            -no-emul-boot -boot-load-size 4)
+    endif()
+    # BootCDRegTest remains on its dedicated legacy image until it gets an
+    # equivalent RC95LDR regression-test bootstrap.
     set(ISO_BOOT_OPTIONS_REGTEST
         -eltorito-platform x86 -eltorito-boot loader/isobtrt.bin -no-emul-boot -boot-load-size 4)
 
@@ -156,7 +179,7 @@ add_custom_target(bootcd
         ${ISO_COMMON_OPTIONS} ${ISO_BOOT_OPTIONS} ${ISO_BOOT_FILES_OPTIONS} ${ISO_LAYOUT_OPTIONS}
         -path-list ${CMAKE_CURRENT_BINARY_DIR}/bootcd.$<CONFIG>.lst
     ${ISO_HYBRID_BOOTCD}
-    DEPENDS ${ISO_HYBRID_DEPENDS} native-mkisofs livecd
+    DEPENDS ${ISO_HYBRID_DEPENDS} ${_rc95ldr_cd_boot_depends} native-mkisofs livecd
     VERBATIM)
 
 ## BootCDRegTest
@@ -193,5 +216,4 @@ add_custom_target(livecd
 if(DEFINED EFI_PLATFORM_ID)
     # For devices such as USB drives, add also the EFI boot image into efi/boot.
     add_cd_file(TARGET efisys FILE ${CMAKE_CURRENT_BINARY_DIR}/efisys.bin DESTINATION loader NO_CAB FOR bootcd regtest)
-    add_cd_file(TARGET uefildr DESTINATION efi/boot NO_CAB NAME_ON_CD boot${EFI_PLATFORM_ID}.efi FOR bootcd regtest)
 endif()

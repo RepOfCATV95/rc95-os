@@ -29,7 +29,6 @@ extern VOID WinLdrSetupEms(_In_ PCSTR BootOptions);
 
 PLOADER_SYSTEM_BLOCK WinLdrSystemBlock;
 /**/PCWSTR BootFileSystem = NULL;/**/
-
 BOOLEAN VirtualBias = FALSE;
 BOOLEAN SosEnabled = FALSE;
 BOOLEAN SafeBoot = FALSE;
@@ -452,35 +451,31 @@ WinLdrLoadModule(PCSTR ModuleName,
                  TYPE_OF_MEMORY MemoryType)
 {
     ULONG FileId;
+    FILEINFORMATION FileInformation;
+    ARC_STATUS ArcStatus;
     PVOID PhysicalBase;
-    FILEINFORMATION FileInfo;
-    ULONG FileSize;
-    ARC_STATUS Status;
-    ULONG BytesRead;
+    ULONG FileSize, BytesRead = 0;
 
     *Size = 0;
-
-    /* Open the image file */
     NtLdrOutputLoadMsg(ModuleName, NULL);
-    Status = ArcOpen((PSTR)ModuleName, OpenReadOnly, &FileId);
-    if (Status != ESUCCESS)
+
+    ArcStatus = FsOpenFile((PSTR)ModuleName, NULL, OpenReadOnly, &FileId);
+    if (ArcStatus != ESUCCESS)
     {
-        /* In case of errors, we just return, without complaining to the user */
-        WARN("Error while opening '%s', Status: %u\n", ModuleName, Status);
+        WARN("Could not open '%s' (status %u)\n", ModuleName, ArcStatus);
         return NULL;
     }
 
-    /* Retrieve its size */
-    Status = ArcGetFileInformation(FileId, &FileInfo);
-    if (Status != ESUCCESS)
+    ArcStatus = ArcGetFileInformation(FileId, &FileInformation);
+    if (ArcStatus != ESUCCESS ||
+        FileInformation.EndingAddress.QuadPart <= 0 ||
+        (ULONGLONG)FileInformation.EndingAddress.QuadPart > MAXULONG)
     {
         ArcClose(FileId);
         return NULL;
     }
-    FileSize = FileInfo.EndingAddress.LowPart;
-    *Size = FileSize;
+    FileSize = (ULONG)FileInformation.EndingAddress.QuadPart;
 
-    /* Allocate memory */
     PhysicalBase = MmAllocateMemoryWithType(FileSize, MemoryType);
     if (PhysicalBase == NULL)
     {
@@ -489,17 +484,18 @@ WinLdrLoadModule(PCSTR ModuleName,
         return NULL;
     }
 
-    /* Load the whole file */
-    Status = ArcRead(FileId, PhysicalBase, FileSize, &BytesRead);
+    ArcStatus = ArcRead(FileId, PhysicalBase, FileSize, &BytesRead);
     ArcClose(FileId);
-    if (Status != ESUCCESS)
+    if (ArcStatus != ESUCCESS || BytesRead != FileSize)
     {
-        WARN("Error while reading '%s', Status: %u\n", ModuleName, Status);
+        WARN("Could not read '%s' (status %u, bytes %lu/%lu)\n",
+             ModuleName, ArcStatus, BytesRead, FileSize);
+        MmFreeMemory(PhysicalBase);
         return NULL;
     }
 
+    *Size = FileSize;
     TRACE("Loaded %s at 0x%x with size 0x%x\n", ModuleName, PhysicalBase, FileSize);
-
     return PhysicalBase;
 }
 
@@ -1418,7 +1414,7 @@ LoadAndBootWindowsCommon(
         return ENOEXEC;
     }
 
-    /* Cleanup INI file */
+    /* The native BCD path did not initialize the compatibility INI parser. */
     IniCleanup();
 
 /****
@@ -1431,6 +1427,15 @@ LoadAndBootWindowsCommon(
     UiSetProgressBarText("Loading boot drivers...");
     Success = WinLdrLoadBootDrivers(LoaderBlock, BootPath);
     TRACE("Boot drivers loading %s\n", Success ? "successful" : "failed");
+    if (!Success)
+    {
+        /* A boot-start driver failure is fatal for a native handoff. The
+           driver list may have been pruned for diagnostics, but continuing
+           would start the kernel with an incomplete boot-critical set. */
+        PeLdrImportDllLoadCallback = NULL;
+        UiMessageBox("One or more boot-critical drivers could not be loaded.");
+        return ENOEXEC;
+    }
 
     UiSetProgressBarSubset(0, 100);
 
@@ -1489,10 +1494,8 @@ LoadAndBootWindowsCommon(
     /* Map pages and create memory descriptors */
     WinLdrSetupMemoryLayout(LoaderBlock);
 
-#if defined(_M_IX86) || defined(_M_AMD64)
-    /* Hibernation file I/O needs the firmware descriptor tables. */
-    WinLdrResumeFromHibernation(SystemPartition);
-#endif
+/* Hibernation restore is owned by RC95LDR/WINLOAD. The legacy
+       FreeLoader NT loader must not restore RC95 hibernation images. */
 
     /* Set processor context */
     WinLdrSetProcessorContext(OperatingSystemVersion);

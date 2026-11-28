@@ -93,9 +93,6 @@ PVOID WinLdrLoadModule(PCSTR ModuleName, PULONG Size,
 BOOLEAN
 WinLdrSetupMemoryLayout(IN OUT PLOADER_PARAMETER_BLOCK LoaderBlock);
 
-VOID
-WinLdrResumeFromHibernation(
-    _In_ PCSTR SystemPartition);
 
 #ifdef _M_AMD64
 BOOLEAN

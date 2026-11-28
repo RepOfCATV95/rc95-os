@@ -53,6 +53,7 @@
 @ cdecl MmGetMemoryMap()
 @ cdecl MmGetSystemMemoryMapTypeString()
 @ cdecl MmGetTotalPagesInLookupTable()
+@ cdecl MmGetLowestPhysicalPage()
 
 # PeLdr
 @ cdecl PeLdrAllocateDataTableEntry()

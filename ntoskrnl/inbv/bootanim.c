@@ -14,6 +14,7 @@
 
 #include <ntoskrnl.h>
 #include "inbv/logo.h"
+#include "../bgk/include/bgfx.h"
 
 /* GLOBALS *******************************************************************/
 /*
@@ -338,6 +339,12 @@ DisplayFilter(
         /* Turn off hacks */
         NoNT4 = TRUE;
 
+        /* If Windows 8+ GOP boot screen is used, stop the GOP operations, kill BGFX engine */
+        if ( BGFXGraphicsActive )
+        {
+            KillBGFXEngine();
+        }
+
         /* Avoid drawing progress bar while in process of entering text-mode boot screen */
         if ( !BootSeqEntered )
             BootSeqEntered = TRUE;
@@ -510,6 +517,18 @@ DisplayBootBitmap(
     {
         BootSeqEntered = TRUE;
         FirstCall = FALSE;
+    }
+}
+
+CODE_SEG("INIT")
+VOID
+NTAPI
+FinalizeBootLogo(VOID)
+{
+    if (BGFXGraphicsActive)
+    {
+        KillBGFXEngine();
+        return;
     }
 }
 

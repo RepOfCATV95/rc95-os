@@ -214,6 +214,41 @@ PVOID MmAllocateHighestMemoryBelowAddress(SIZE_T MemorySize, PVOID DesiredAddres
 
 VOID MmFreeMemory(PVOID MemoryPointer)
 {
+    PFN_NUMBER FirstPage, LowestPage, PageIndex, PageCount, TotalPages;
+    PPAGE_LOOKUP_TABLE_ITEM PageMap;
+
+    if (!MemoryPointer || !PageLookupTableAddress ||
+        (((ULONG_PTR)MemoryPointer) & MM_PAGE_MASK) != 0)
+        return;
+
+    FirstPage = MmGetPageNumberFromAddress(MemoryPointer);
+    LowestPage = MmGetLowestPhysicalPage();
+    TotalPages = MmGetTotalPagesInLookupTable();
+
+    if (FirstPage < LowestPage)
+        return;
+
+    PageIndex = FirstPage - LowestPage;
+    if (PageIndex >= TotalPages)
+        return;
+
+    PageMap = (PPAGE_LOOKUP_TABLE_ITEM)PageLookupTableAddress;
+    PageCount = PageMap[PageIndex].PageAllocationLength;
+
+    /* Only the exact base of a live allocation carries its allocation size. */
+    if (!PageCount || PageCount > TotalPages - PageIndex ||
+        PageMap[PageIndex].PageAllocated == LoaderFree ||
+        FreePagesInLookupTable > TotalPages ||
+        PageCount > TotalPages - FreePagesInLookupTable)
+        return;
+
+    MmMarkPagesInLookupTable(PageLookupTableAddress,
+                             FirstPage,
+                             PageCount,
+                             LoaderFree);
+    FreePagesInLookupTable += PageCount;
+
+    MmUpdateLastFreePageHint(PageLookupTableAddress, TotalPages);
 }
 
 #if DBG

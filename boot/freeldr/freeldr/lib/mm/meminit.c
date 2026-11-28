@@ -47,6 +47,12 @@ MmGetTotalPagesInLookupTable(VOID)
     return TotalPagesInLookupTable;
 }
 
+PFN_NUMBER
+MmGetLowestPhysicalPage(VOID)
+{
+    return MmLowestPhysicalPage;
+}
+
 #if DBG
 typedef struct
 {
@@ -549,7 +555,8 @@ VOID MmMarkPagesInLookupTable(PVOID PageLookupTable, PFN_NUMBER StartPage, PFN_N
         }
 #endif
         RealPageLookupTable[Index].PageAllocated = PageAllocated;
-        RealPageLookupTable[Index].PageAllocationLength = (PageAllocated != LoaderFree) ? 1 : 0;
+        /* Only MmAllocatePagesInLookupTable records allocation extents. */
+        RealPageLookupTable[Index].PageAllocationLength = 0;
     }
     TRACE("MmMarkPagesInLookupTable() Done\n");
 }

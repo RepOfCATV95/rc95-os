@@ -1,4 +1,3 @@
 
-#add_subdirectory(bgfx)
-#add_subdirectory(fs)
-#add_subdirectory(winload)
+add_subdirectory(bootdata)
+add_subdirectory(bootres)

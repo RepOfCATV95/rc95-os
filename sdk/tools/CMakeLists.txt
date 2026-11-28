@@ -17,6 +17,11 @@ if(MSVC)
     add_compile_options("/wd4267")
 endif()
 
+# Native FreeType is for build-time font rasterizers only; it is never linked into target binaries.
+add_subdirectory(freetype-host)
+
+add_subdirectory(bootfontgen)
+
 add_host_tool(bin2c bin2c.c)
 add_host_tool(gendib gendib/gendib.c)
 add_host_tool(geninc geninc/geninc.c)

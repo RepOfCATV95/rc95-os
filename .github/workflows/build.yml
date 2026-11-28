@@ -6,6 +6,92 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  rc95ldr-standalone:
+    name: RC95LDR standalone libraries and regression tests (${{ matrix.compiler }})
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+      fail-fast: false
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Source checkout
+      uses: actions/checkout@v6
+    - name: Configure
+      env:
+        CC: ${{ matrix.compiler }}
+      run: cmake -S boot/rc95ldr/tests/host -B build/rc95ldr-standalone -DCMAKE_BUILD_TYPE=Debug
+    - name: Build RC95LDR host regression tests
+      run: >-
+        cmake --build build/rc95ldr-standalone --target
+        rc95ldr_bcd_tests
+        rc95ldr_discovery_tests
+        rc95ldr_loaderblock_hive_tests
+        rc95ldr_serviceorder_tests
+        rc95ldr_textui_tests
+        rc95ldr_pe_tests
+        rc95ldr_uefi_disk_tests
+        rc95ldr_uefi_volume_tests
+        rc95ldr_uefi_discovery_tests
+        rc95ldr_uefi_entry_tests
+        rc95ldr_uefi_services_tests
+        rc95ldr_winload_uefi_entry
+        rc95ldr_uefi_memory_tests
+        rc95ldr_winload_entry_tests
+        rc95ldr_bios_tests
+        rc95ldr_bios_firmware_state_tests
+        rc95ldr_bios_module_tests
+        rc95ldr_ramdisk_tests
+        rc95ldr_module_services_tests
+        rc95ldr_fat32_tests
+        rc95ldr_ntfs_geometry_tests
+        rc95ldr_ntfs_runlist_tests
+        rc95ldr_ntfs_record_tests
+        rc95ldr_ntfs_stream_tests
+        rc95ldr_ntfs_volume_tests
+        rc95ldr_ntfs_index_tests
+        rc95ldr_bcd_policy_tests
+        rc95ldr_dependency_tests
+        rc95ldr_handoff_tests
+        rc95ldr_rc95nativeprovider_tests
+        rc95ldr_ntprepare_tests
+        rc95ldr_osprepare_tests
+        rc95ldr_profile_tests
+        rc95ldr_platforminventory_tests
+        rc95ldr_resume_tests
+        rc95ldr_memorymap_tests
+        rc95ldr_volumeprovider_tests
+        rc95ldr_iso9660_tests
+        rc95ldr_module_handoff_tests
+        rc95ldr_veneer_btrfs_tests
+        rc95ldr_btrfs_volume_tests
+        rc95ldr_winload_btrfs_policy_tests
+        rc95ldr_bios_cd_tests
+    - name: Run RC95LDR host regression tests
+      run: >-
+        ctest --test-dir build/rc95ldr-standalone
+        --output-on-failure
+        -R "rc95ldr_(bcd|discovery|loaderblock_hive|serviceorder|textui|pe|uefi_disk|uefi_volume|uefi_discovery|uefi_entry|uefi_services|uefi_memory|winload_entry|bios|bios_firmware_state|bios_module|ramdisk|module_services|fat32|ntfs_geometry|ntfs_runlist|ntfs_record|ntfs_stream|ntfs_volume|ntfs_index|bcd_policy|dependency|handoff|rc95nativeprovider|ntprepare|osprepare|profile|platforminventory|resume|memorymap|volumeprovider|iso9660|module_handoff|veneer_btrfs|btrfs_volume|winload_btrfs_policy|bios_cd(_stage0)?|bios_stage0|bios_image_packer)_tests"
+
+
+  rc95ldr-btrfs-fuzz:
+    name: RC95LDR Btrfs parser fuzz smoke test
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Source checkout
+      uses: actions/checkout@v6
+    - name: Configure sanitized libFuzzer target
+      run: >-
+        cmake -S boot/rc95ldr/tests/host -B build/rc95ldr-btrfs-fuzz
+        -DCMAKE_C_COMPILER=clang
+        -DCMAKE_BUILD_TYPE=Debug
+        -DRC95LDR_ENABLE_LIBFUZZER=ON
+    - name: Build Btrfs libFuzzer
+      run: cmake --build build/rc95ldr-btrfs-fuzz --target rc95ldr_veneer_btrfs_fuzz
+    - name: Fuzz Btrfs superblock parser
+      run: >-
+        ./build/rc95ldr-btrfs-fuzz/rc95ldr_veneer_btrfs_fuzz
+        -max_total_time=30 -timeout=2 -max_len=4096
+
   build-linux:
     strategy:
       matrix:

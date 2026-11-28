@@ -8,6 +8,8 @@
 /* INCLUDES ******************************************************************/
 
 #include <uefildr.h>
+#include <DevicePath.h>
+#include <string.h>
 
 #include <debug.h>
 DBG_DEFAULT_CHANNEL(DISK);
@@ -1070,7 +1072,8 @@ UefiInitializeBootDevices(VOID)
     EFI_STATUS Status;
     ULONG ArcDriveIndex;
 
-    DiskReadBufferSize = EFI_PAGE_SIZE;
+    /* 64 KiB aligned bounce buffer supports GPT arrays and 4Kn/8Kn media. */
+    DiskReadBufferSize = 64u * 1024u;
     DiskReadBuffer = NULL;
     DiskReadBufferRaw = NULL;
     DiskReadBufferAlignment = 1;
@@ -1367,3 +1370,5 @@ UefiDiskGetCacheableBlockCount(UCHAR DriveNumber)
 
     return (ULONG)(BlockIo->Media->LastBlock + 1);
 }
+
+

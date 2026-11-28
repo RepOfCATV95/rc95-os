@@ -1,5 +1,7 @@
 add_subdirectory(at)
 add_subdirectory(attrib)
+add_subdirectory(bcdboot)
+add_subdirectory(bcdedit)
 add_subdirectory(certutil)
 add_subdirectory(chcp)
 add_subdirectory(clip)

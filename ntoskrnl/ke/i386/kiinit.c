@@ -574,15 +574,24 @@ KiInitializeKernel(IN PKPROCESS InitProcess,
         (KeFeatureBits & KF_RDTSC) ? TRUE: FALSE;
     SharedUserData->ProcessorFeatures[PF_RDRAND_INSTRUCTION_AVAILABLE] =
         (KeFeatureBits & KF_RDRAND) ? TRUE : FALSE;
-    // Note: On x86 we lack support for saving/restoring SSE state
+    /*
+     * FXSR is enabled during machine-dependent initialization and the
+     * context-switch path saves/restores the complete FXSAVE area. Only
+     * advertise later XMM instruction sets when both the hardware and the
+     * OS-managed SSE state support are present.
+     */
     SharedUserData->ProcessorFeatures[PF_SSE3_INSTRUCTIONS_AVAILABLE] =
-        (KeFeatureBits & KF_SSE3) ? TRUE : FALSE;
+        ((KeFeatureBits & (KF_FXSR | KF_XMMI | KF_SSE3)) ==
+         (KF_FXSR | KF_XMMI | KF_SSE3)) ? TRUE : FALSE;
     SharedUserData->ProcessorFeatures[PF_SSSE3_INSTRUCTIONS_AVAILABLE] =
-        (KeFeatureBits & KF_SSSE3) ? TRUE : FALSE;
+        ((KeFeatureBits & (KF_FXSR | KF_XMMI | KF_SSSE3)) ==
+         (KF_FXSR | KF_XMMI | KF_SSSE3)) ? TRUE : FALSE;
     SharedUserData->ProcessorFeatures[PF_SSE4_1_INSTRUCTIONS_AVAILABLE] =
-        (KeFeatureBits & KF_SSE4_1) ? TRUE : FALSE;
+        ((KeFeatureBits & (KF_FXSR | KF_XMMI | KF_SSE4_1)) ==
+         (KF_FXSR | KF_XMMI | KF_SSE4_1)) ? TRUE : FALSE;
     SharedUserData->ProcessorFeatures[PF_SSE4_2_INSTRUCTIONS_AVAILABLE] =
-        (KeFeatureBits & KF_SSE4_2) ? TRUE : FALSE;
+        ((KeFeatureBits & (KF_FXSR | KF_XMMI | KF_SSE4_2)) ==
+         (KF_FXSR | KF_XMMI | KF_SSE4_2)) ? TRUE : FALSE;
 
     /* Set up the thread-related fields in the PRCB */
     Prcb->CurrentThread = InitThread;
