@@ -19,8 +19,8 @@ typedef struct _PO_BTRFS_DEVICE_ENTRY
     ULONGLONG DeviceId;
     ULONGLONG Size;
     ULONGLONG MaxSize;
-    BOOL ReadOnly;
-    BOOL Missing;
+    LONG ReadOnly;
+    LONG Missing;
     ULONG DeviceNumber;
     ULONG PartitionNumber;
     ULONGLONG Stats[5];

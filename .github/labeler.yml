@@ -19,6 +19,11 @@ freeldr:
   - any-glob-to-any-file:
     - boot/freeldr/**
 
+RC95LDR:
+- changed-files:
+  - any-glob-to-any-file:
+    - boot/rc95ldr/**
+
 "kernel&hal":
 - changed-files:
   - any-glob-to-any-file:

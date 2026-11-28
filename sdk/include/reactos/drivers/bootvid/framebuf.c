@@ -5,6 +5,7 @@
  * COPYRIGHT:   Copyright 2023-2026 Hermès Bélusca-Maïto <hermes.belusca-maito@reactos.org>
  */
 
+#include <debug.h>
 #include <arc/arc.h>   // For CONFIGURATION_COMPONENT*
 #include <ndk/kefuncs.h>
 #include <drivers/bootvid/framebuf.h>

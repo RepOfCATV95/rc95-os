@@ -2,6 +2,8 @@
 include(boot_images.cmake)
 
 add_subdirectory(bootdata)
+add_subdirectory(rc95ldr)
+include(rc95ldr/boot_images.cmake)
 add_subdirectory(freeldr)
 add_subdirectory(rtl)
 

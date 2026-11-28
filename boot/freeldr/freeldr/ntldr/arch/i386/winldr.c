@@ -95,6 +95,72 @@ DumpGDTEntry(ULONG_PTR Base, ULONG Selector)
 PHARDWARE_PTE PDE;
 PHARDWARE_PTE HalPageTable;
 
+/* Temporary physical restore window reserved for RC95 hiberfile chunks. */
+#define RC95_HIBER_RESTORE_WINDOW 0xFFC10000u
+#define RC95_HIBER_RESTORE_PTE_INDEX ((RC95_HIBER_RESTORE_WINDOW - 0xFFC00000u) >> MM_PAGE_SHIFT)
+
+BOOLEAN
+WinLdrActivateHiberPageTables(VOID)
+{
+    if (PDE == NULL || HalPageTable == NULL || !(__readcr0() & 0x80000000u))
+        return FALSE;
+    /* Activate the complete FreeLoader page-directory hierarchy, not just
+       the temporary hiber restore PTE window. */
+    __writecr3((ULONG_PTR)PDE);
+    return __readcr3() == (ULONG_PTR)PDE;
+}
+
+BOOLEAN WinLdrHiberMappingReady(VOID)
+{
+    return PDE != NULL && HalPageTable != NULL &&
+           __readcr3() == (ULONG_PTR)PDE;
+}
+
+BOOLEAN
+WinLdrMapHiberRange(ULONGLONG PhysicalAddress, ULONG Length, PVOID *Mapping)
+{
+    ULONG Page, Count;
+    if (!Mapping || !HalPageTable || !Length || Length > 64 * 1024 ||
+        (PhysicalAddress & MM_PAGE_MASK) || (Length & MM_PAGE_MASK) ||
+        PhysicalAddress > 0xFFFFFFFFULL ||
+        (ULONGLONG)Length > 0x100000000ULL - PhysicalAddress)
+        return FALSE;
+    Count = Length >> MM_PAGE_SHIFT;
+    if (RC95_HIBER_RESTORE_PTE_INDEX + Count > 1024)
+        return FALSE;
+    for (Page = 0; Page < Count; ++Page)
+    {
+        PHARDWARE_PTE Pte = &HalPageTable[RC95_HIBER_RESTORE_PTE_INDEX + Page];
+        if (Pte->Valid) return FALSE;
+    }
+    for (Page = 0; Page < Count; ++Page)
+    {
+        PHARDWARE_PTE Pte = &HalPageTable[RC95_HIBER_RESTORE_PTE_INDEX + Page];
+        RtlZeroMemory(Pte, sizeof(*Pte));
+        Pte->PageFrameNumber = (ULONG)((PhysicalAddress >> MM_PAGE_SHIFT) + Page);
+        Pte->Valid = 1;
+        Pte->Write = 1;
+    }
+    __writecr3(__readcr3());
+    *Mapping = (PVOID)(ULONG_PTR)RC95_HIBER_RESTORE_WINDOW;
+    return TRUE;
+}
+
+VOID
+WinLdrUnmapHiberRange(PVOID Mapping, ULONG Length)
+{
+    ULONG Page, Count;
+    if (Mapping != (PVOID)(ULONG_PTR)RC95_HIBER_RESTORE_WINDOW ||
+        !HalPageTable || !Length || Length > 64 * 1024 ||
+        (Length & MM_PAGE_MASK))
+        return;
+    Count = Length >> MM_PAGE_SHIFT;
+    for (Page = 0; Page < Count; ++Page)
+        RtlZeroMemory(&HalPageTable[RC95_HIBER_RESTORE_PTE_INDEX + Page],
+                      sizeof(HalPageTable[0]));
+    __writecr3(__readcr3());
+}
+
 PUCHAR PhysicalPageTablesBuffer;
 PUCHAR KernelPageTablesBuffer;
 ULONG PhysicalPageTables;

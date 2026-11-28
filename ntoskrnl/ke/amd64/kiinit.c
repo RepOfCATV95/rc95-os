@@ -36,9 +36,9 @@ PVOID KiP0DoubleFaultStack = &KiP0DoubleFaultStackData[KERNEL_STACK_SIZE];
 
 ULONGLONG BootCycles, BootCyclesEnd;
 
-void KiInitializeSegments();
-void KiSystemCallEntry64();
-void KiSystemCallEntry32();
+VOID NTAPI KiInitializeSegments(VOID);
+VOID NTAPI KiSystemCallEntry64(VOID);
+VOID NTAPI KiSystemCallEntry32(VOID);
 
 /* FUNCTIONS *****************************************************************/
 
@@ -182,8 +182,8 @@ KiInitializeCpu(PKIPCR Pcr)
     if ((FeatureBits & REQUIRED_FEATURE_BITS) != REQUIRED_FEATURE_BITS)
     {
         /* If not, bugcheck system */
-        FrLdrDbgPrint("CPU doesn't have needed features! Has: 0x%x, required: 0x%x\n",
-                FeatureBits, REQUIRED_FEATURE_BITS);
+        FrLdrDbgPrint("CPU doesn't have needed features! Has: 0x%I64x, required: 0x%I64x\n",
+                FeatureBits, (ULONG64)REQUIRED_FEATURE_BITS);
         KeBugCheck(0);
     }
 

@@ -16,19 +16,17 @@ else()
     message(FATAL_ERROR "Unknown ARCH '" ${ARCH} "', cannot generate a valid UEFI boot image filename.")
 endif()
 
-## efisys.bin
+## efisys.bin (EFISYS: EFI/BOOT/boot<arch>.efi is RC95LDR, rc95ldr.efi)
+# UEFI firmware starts the removable-media path directly, so the EFISYS FAT
+# image carries no BIOS boot sector and has no FreeLoader dependency.
+# The final target is rc95ldr_uefi (rc95ldr.efi), defined in boot/rc95ldr.
 if(DEFINED EFI_PLATFORM_ID)
-    # The FAT boot sector is only built for x86/x64
-    if(ARCH STREQUAL "i386" OR ARCH STREQUAL "amd64")
-        set(EFISYS_BOOT_SECTOR -boot ${CMAKE_CURRENT_BINARY_DIR}/freeldr/bootsect/fat.bin)
-        set(EFISYS_BOOT_SECTOR_DEPENDS fat)
-    endif()
-
     add_custom_target(efisys
         COMMAND native-fatten ${CMAKE_CURRENT_BINARY_DIR}/efisys.bin -format 2880 EFIBOOT
-            ${EFISYS_BOOT_SECTOR}
-            -mkdir EFI -mkdir EFI/BOOT -add $<TARGET_FILE:uefildr> EFI/BOOT/boot${EFI_PLATFORM_ID}.efi
-        DEPENDS native-fatten ${EFISYS_BOOT_SECTOR_DEPENDS} uefildr
+            -mkdir EFI -mkdir EFI/BOOT -mkdir EFI/rc95ldr
+            -add $<TARGET_FILE:rc95ldr_uefi> EFI/BOOT/boot${EFI_PLATFORM_ID}.efi
+            -add $<TARGET_FILE:rc95ldr_uefi> EFI/rc95ldr/rc95ldr.efi
+        DEPENDS native-fatten rc95ldr_uefi
         VERBATIM)
 endif()
 
@@ -37,9 +35,13 @@ endif()
 # arbitrary empty directories to the ISO image using mkisofs.
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/empty)
 
-# Retrieve the full paths to the generated files of the 'isombr', 'isoboot', 'isobtrt' and 'efisys' targets
+# Retrieve the full paths to the generated boot files.
+# - etfsboot.com (El Torito, BIOS, ISO 9660 only) is the RC95LDR etfsmbr image
+#   (2048 bytes, boot-load-size 4); it loads /rc95ldr.sys from the ISO root.
+# - 'isombr' (hybrid MBR) and 'isobtrt' (BootCDRegTest) are still the legacy
+#   images; neither loads freeldr.sys, rosload.exe or uefildr.efi from this file.
 set(_isombr_file  ${CMAKE_CURRENT_BINARY_DIR}/freeldr/bootsect/isombr.bin)  # get_target_property(_isombr_file  isombr  LOCATION)
-set(_isoboot_file ${CMAKE_CURRENT_BINARY_DIR}/freeldr/bootsect/isoboot.bin) # get_target_property(_isoboot_file isoboot LOCATION)
+set(_etfsboot_file ${CMAKE_CURRENT_BINARY_DIR}/rc95ldr/bootsect/etfsmbr.bin)
 set(_isobtrt_file ${CMAKE_CURRENT_BINARY_DIR}/freeldr/bootsect/isobtrt.bin) # get_target_property(_isobtrt_file isobtrt LOCATION)
 if(DEFINED EFI_PLATFORM_ID)
     set(_efisys_file  ${CMAKE_CURRENT_BINARY_DIR}/efisys.bin) # get_target_property(_efisys_file  efisys  LOCATION)
@@ -64,7 +66,7 @@ endif()
 #
 set(ISO_SORT_FILE_DATA "\
 ${CMAKE_CURRENT_BINARY_DIR}/empty/boot.catalog 4
-${_isoboot_file} 3
+${_etfsboot_file} 3
 ${_isobtrt_file} 2
 ")
 if(DEFINED EFI_PLATFORM_ID)
@@ -90,8 +92,12 @@ set(ISO_BOOT_FILES_OPTIONS
 
 # BIOS-based PC boot entry and hybrid MBR (x86/x64 only)
 if(ARCH STREQUAL "i386" OR ARCH STREQUAL "amd64")
+    # El Torito BIOS entry: etfsboot.com, no emulation, 4 x 512-byte sectors.
     set(ISO_BOOT_OPTIONS
-        -eltorito-platform x86 -eltorito-boot loader/isoboot.bin -no-emul-boot -boot-load-size 4)
+        -eltorito-platform x86 -eltorito-boot loader/etfsboot.com
+        -no-emul-boot -boot-load-size 4)
+    # BootCDRegTest remains on its dedicated legacy image until it gets an
+    # equivalent RC95LDR regression-test bootstrap.
     set(ISO_BOOT_OPTIONS_REGTEST
         -eltorito-platform x86 -eltorito-boot loader/isobtrt.bin -no-emul-boot -boot-load-size 4)
 
@@ -156,7 +162,7 @@ add_custom_target(bootcd
         ${ISO_COMMON_OPTIONS} ${ISO_BOOT_OPTIONS} ${ISO_BOOT_FILES_OPTIONS} ${ISO_LAYOUT_OPTIONS}
         -path-list ${CMAKE_CURRENT_BINARY_DIR}/bootcd.$<CONFIG>.lst
     ${ISO_HYBRID_BOOTCD}
-    DEPENDS ${ISO_HYBRID_DEPENDS} native-mkisofs livecd
+    DEPENDS ${ISO_HYBRID_DEPENDS} rc95ldr_bootsect native-mkisofs livecd
     VERBATIM)
 
 ## BootCDRegTest
@@ -193,5 +199,18 @@ add_custom_target(livecd
 if(DEFINED EFI_PLATFORM_ID)
     # For devices such as USB drives, add also the EFI boot image into efi/boot.
     add_cd_file(TARGET efisys FILE ${CMAKE_CURRENT_BINARY_DIR}/efisys.bin DESTINATION loader NO_CAB FOR bootcd regtest)
-    add_cd_file(TARGET uefildr DESTINATION efi/boot NO_CAB NAME_ON_CD boot${EFI_PLATFORM_ID}.efi FOR bootcd regtest)
+endif()
+
+if(ARCH STREQUAL "i386" OR ARCH STREQUAL "amd64")
+    # El Torito boot image (BIOS, ISO 9660 medium only).
+    add_cd_file(FILE ${_etfsboot_file} DESTINATION loader NAME_ON_CD etfsboot.com NO_CAB FOR bootcd)
+    add_dependencies(bootcd rc95ldr_bootsect)
+
+    # VENEER, the BTRFS shim, is carried on the media for the installer.
+    if(TARGET veneer_bios)
+        add_cd_file(TARGET veneer_bios DESTINATION loader NAME_ON_CD veneer.exe NO_CAB FOR bootcd regtest)
+    endif()
+endif()
+if(DEFINED EFI_PLATFORM_ID AND TARGET veneer_uefi)
+    add_cd_file(TARGET veneer_uefi DESTINATION loader NAME_ON_CD veneer.efi NO_CAB FOR bootcd regtest)
 endif()

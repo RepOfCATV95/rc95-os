@@ -11,6 +11,8 @@
 /* INCLUDES ******************************************************************/
 
 #include <ntoskrnl.h>
+#include "../bgk/include/bgfx.h"
+#include "../bgk/include/bgfx_animation.h"
 #include "inbv/logo.h"
 
 /* GLOBALS *******************************************************************/
@@ -420,6 +422,13 @@ NTAPI
 InbvNotifyDisplayOwnershipLost(
     _In_ INBV_RESET_DISPLAY_PARAMETERS Callback)
 {
+
+    if (BGFXGraphicsActive)
+    {
+        /* Kill the BGFX framework */
+        KillBGFXEngine();
+    }
+
     /* Check if we're installed */
     if (InbvBootDriverInstalled)
     {
@@ -643,6 +652,9 @@ InbvIndicateProgress(VOID)
 {
     ULONG Percentage;
 
+    /* Advance RC95-OS BGK indeterminate animation when its display is active. */
+    BgfxAnimationTick();
+
     /* Increase progress */
     InbvProgressIndicator.Count++;
 
@@ -707,6 +719,9 @@ InbvUpdateProgressBar(
     _In_ ULONG Percentage)
 {
     ULONG TotalProgress;
+
+    /* Time-throttled; harmless when BGK animation is not active. */
+    BgfxAnimationTick();
 
     /* Make sure the progress bar is enabled, that we own and are installed */
     if (ShowProgressBar &&

@@ -20,6 +20,10 @@
 /* INCLUDES *******************************************************************/
 
 #include <freeldr.h>
+#include <string.h>
+#if defined(UEFIBOOT) && defined(_M_AMD64)
+#include "ntldr/winldr.h"
+#endif
 
 #include <debug.h>
 DBG_DEFAULT_CHANNEL(WARNING);
@@ -287,6 +291,18 @@ VOID
 LoadOperatingSystem(
     _In_ OperatingSystemItem* OperatingSystem)
 {
+#ifdef UEFIBOOT
+    /*
+     * This is the compatibility INI/ARC dispatcher. Native UEFI BCD
+     * candidates must be dispatched by the partition-bound native loader,
+     * never converted to OperatingSystemItem or an ARC argument vector.
+     */
+    UNREFERENCED_PARAMETER(OperatingSystem);
+    UiMessageBoxCritical(
+        "Refusing legacy INI/ARC dispatch on UEFI.\n"
+        "No kernel handoff was attempted.");
+    return;
+#else
     ULONG_PTR SectionId = OperatingSystem->SectionId;
     const OS_LOADING_METHOD* OSLoadingMethod;
     ULONG Argc;
@@ -313,6 +329,7 @@ LoadOperatingSystem(
     /* Start the OS loader */
     OSLoadingMethod->OsLoader(Argc, Argv, NULL);
     FrLdrHeapFree(Argv, TAG_STRING);
+#endif /* !UEFIBOOT */
 }
 
 #ifdef HAS_OPTION_MENU_EDIT_CMDLINE
@@ -390,6 +407,7 @@ VOID RunLoader(VOID)
     ULONG OperatingSystemCount;
     ULONG SelectedOperatingSystem;
     ULONG i;
+    BOOLEAN IniInitialized = FALSE;
 
 #ifdef _M_IX86
 #ifndef UEFIBOOT
@@ -399,8 +417,10 @@ VOID RunLoader(VOID)
 #endif
 #endif
 
-    /* Open FREELDR.INI and load the global FreeLoader settings */
-    if (!IniFileInitialize())
+    /* FreeLoader's compatibility menu configuration comes from FREELDR.INI
+       on both BIOS and UEFI. */
+    IniInitialized = IniFileInitialize();
+    if (!IniInitialized)
         UiMessageBoxCritical("Error initializing .ini file.");
     LoadSettings(NULL);
 #if 0
@@ -414,6 +434,9 @@ VOID RunLoader(VOID)
     /* UI main initialization. If it fails, fall back to default UI. */
     if (!UiInitialize(TRUE))
         UiMessageBoxCritical("Unable to initialize UI.");
+
+
+
 
     /* If no FREELDR.INI, skip everything else and fall back to the FreeLdr setup menu */
     if (IsListEmpty(IniGetFileSectionListHead()))
@@ -495,6 +518,7 @@ Fallback:
 
 Reboot:
     UiUnInitialize("Rebooting...");
-    IniCleanup();
+    if (IniInitialized)
+        IniCleanup();
     return;
 }

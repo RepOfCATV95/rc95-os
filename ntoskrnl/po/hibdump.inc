@@ -218,12 +218,16 @@ PopAtaLoadAddress(
     PUCHAR Base = Stack->CommandBase;
 
     PO_DUMP_ATA_ADDRESS Address;
+    BOOLEAN AddressValid;
 
-    ASSERT(PopDumpAtaBuildAddress(Stack->Lba48,
-                                  Stack->Device,
-                                  Lba,
-                                  Count,
-                                  &Address));
+    AddressValid = PopDumpAtaBuildAddress(Stack->Lba48,
+                                          Stack->Device,
+                                          Lba,
+                                          Count,
+                                          &Address);
+    ASSERT(AddressValid);
+    if (!AddressValid)
+        return;
 
     WRITE_PORT_UCHAR(Base + 6, Address.DeviceHead);
     if (Stack->Lba48)

@@ -1,0 +1,14 @@
+/* RC95-OS boot logo and eight-frame indeterminate activity animation. */
+"RC95OSLOGO.BMP" RCDATA "resources/images/RC95OSLOGO.BMP"
+
+"RC95OSANIM00.BMP" RCDATA "resources/animation/RC95OS-ANIM00.BMP"
+"RC95OSANIM01.BMP" RCDATA "resources/animation/RC95OS-ANIM01.BMP"
+"RC95OSANIM02.BMP" RCDATA "resources/animation/RC95OS-ANIM02.BMP"
+"RC95OSANIM03.BMP" RCDATA "resources/animation/RC95OS-ANIM03.BMP"
+"RC95OSANIM04.BMP" RCDATA "resources/animation/RC95OS-ANIM04.BMP"
+"RC95OSANIM05.BMP" RCDATA "resources/animation/RC95OS-ANIM05.BMP"
+"RC95OSANIM06.BMP" RCDATA "resources/animation/RC95OS-ANIM06.BMP"
+"RC95OSANIM07.BMP" RCDATA "resources/animation/RC95OS-ANIM07.BMP"
+
+/* Numeric RCDATA ID 0x95 is checked by IsBootResGenuine(). */
+0x95 RCDATA "resources/metadata/rc95bootres_owner.bin"

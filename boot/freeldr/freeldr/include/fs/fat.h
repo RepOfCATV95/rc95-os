@@ -158,6 +158,10 @@ typedef struct
 #define FATX16  4
 #define FATX32  5
 
+/* Returns TRUE only when FileId belongs to a mounted FAT32 volume. */
+BOOLEAN FatIsFat32File(_In_ ULONG FileId);
+
+
 #define ISFATX(FT) ((FT) == FATX16 || (FT) == FATX32)
 
 typedef struct _FAT_VOLUME_INFO *PFAT_VOLUME_INFO;

@@ -284,6 +284,68 @@ WinLdrPrepareHiberMapping(VOID)
 }
 
 BOOLEAN
+WinLdrActivateHiberPageTables(VOID)
+{
+    if (PxeBase == NULL || HiberRestorePageTable == NULL ||
+        !(__readcr0() & 0x80000000u))
+        return FALSE;
+    /* Switch to the complete FreeLoader PML4. It includes the loader's
+       identity/kernel mappings and the reserved hiber restore window. */
+    __writecr3((ULONG64)PxeBase);
+    return __readcr3() == (ULONG64)PxeBase;
+}
+
+BOOLEAN WinLdrHiberMappingReady(VOID)
+{
+    return PxeBase != NULL && HiberRestorePageTable != NULL &&
+           __readcr3() == (ULONG64)PxeBase;
+}
+
+BOOLEAN
+WinLdrMapHiberRange(ULONGLONG PhysicalAddress, ULONG Length, PVOID *Mapping)
+{
+    ULONG Page, Count, PteIndex;
+    if (!Mapping || HiberRestorePageTable == NULL || Length == 0 ||
+        Length > 64 * 1024 || (PhysicalAddress & (PAGE_SIZE - 1)) ||
+        (Length & (PAGE_SIZE - 1)) || PhysicalAddress >= (1ULL << 40) ||
+        (ULONGLONG)Length > (1ULL << 40) - PhysicalAddress)
+        return FALSE;
+    Count = Length >> PAGE_SHIFT;
+    PteIndex = VAtoPTI(HIBER_RESTORE_WINDOW);
+    if (PteIndex + Count > 512) return FALSE;
+    for (Page = 0; Page < Count; ++Page)
+        if (HiberRestorePageTable[PteIndex + Page].Valid) return FALSE;
+    for (Page = 0; Page < Count; ++Page)
+    {
+        PHARDWARE_PTE Pte = &HiberRestorePageTable[PteIndex + Page];
+        RtlZeroMemory(Pte, sizeof(*Pte));
+        Pte->PageFrameNumber = (PhysicalAddress >> PAGE_SHIFT) + Page;
+        Pte->Write = 1;
+        Pte->Valid = 1;
+    }
+    __writecr3((ULONG64)PxeBase);
+    *Mapping = (PVOID)(ULONG_PTR)HIBER_RESTORE_WINDOW;
+    return TRUE;
+}
+
+VOID
+WinLdrUnmapHiberRange(PVOID Mapping, ULONG Length)
+{
+    ULONG Page, Count, PteIndex;
+    if (Mapping != (PVOID)(ULONG_PTR)HIBER_RESTORE_WINDOW ||
+        HiberRestorePageTable == NULL || Length == 0 ||
+        Length > 64 * 1024 || (Length & (PAGE_SIZE - 1)))
+        return;
+    Count = Length >> PAGE_SHIFT;
+    PteIndex = VAtoPTI(HIBER_RESTORE_WINDOW);
+    if (PteIndex + Count > 512) return;
+    for (Page = 0; Page < Count; ++Page)
+        RtlZeroMemory(&HiberRestorePageTable[PteIndex + Page],
+                      sizeof(HiberRestorePageTable[0]));
+    __writecr3((ULONG64)PxeBase);
+}
+
+BOOLEAN
 WinLdrMapHiberChunk(
     ULONGLONG PhysicalAddress,
     ULONG Length,

@@ -891,7 +891,7 @@ InstallBootloaderFiles(
     _In_ PCUNICODE_STRING SystemRootPath,
     _In_ PCUNICODE_STRING SourceRootPath)
 {
-    /* Set the SYSTEM, HIDDEN and READONLY attributes to the FreeLoader files */
+    /* Set the SYSTEM, HIDDEN and READONLY attributes on the boot loader files. */
     static const ULONG ProtectAttribs =
         (FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY);
 
@@ -899,34 +899,30 @@ InstallBootloaderFiles(
     WCHAR SrcPath[MAX_PATH];
     WCHAR DstPath[MAX_PATH];
 
-    /* Copy FreeLoader to the system partition, always overwriting the older version */
-    CombinePaths(SrcPath, ARRAYSIZE(SrcPath), 2, SourceRootPath->Buffer, L"\\loader\\freeldr.sys");
-    CombinePaths(DstPath, ARRAYSIZE(DstPath), 2, SystemRootPath->Buffer, L"freeldr.sys");
+    /* Install RC95LDR on the system partition, replacing any previous copy. */
+    CombinePaths(SrcPath, ARRAYSIZE(SrcPath), 2, SourceRootPath->Buffer, L"\\loader\\rc95ldr.sys");
+    CombinePaths(DstPath, ARRAYSIZE(DstPath), 2, SystemRootPath->Buffer, L"rc95ldr.sys");
 
     DPRINT("Copy: %S ==> %S\n", SrcPath, DstPath);
     Status = SetupCopyFile(SrcPath, DstPath, FALSE);
     if (!NT_SUCCESS(Status))
     {
-        DPRINT1("SetupCopyFile() failed (Status 0x%08lx)\n", Status);
+        DPRINT1("SetupCopyFile(rc95ldr.sys) failed (Status 0x%08lx)\n", Status);
         return Status;
     }
-
-    /* Protect freeldr.sys (this is optional, so any potential errors are ignored) */
     SetupSetFileAttributes(DstPath, ProtectAttribs);
 
-    /* Copy rosload to the system partition, always overwriting the older version */
-    CombinePaths(SrcPath, ARRAYSIZE(SrcPath), 2, SourceRootPath->Buffer, L"\\loader\\rosload.exe");
-    CombinePaths(DstPath, ARRAYSIZE(DstPath), 2, SystemRootPath->Buffer, L"rosload.exe");
+    /* Install the OS loader in the installed system's system32 directory. */
+    CombinePaths(SrcPath, ARRAYSIZE(SrcPath), 2, SourceRootPath->Buffer, L"\\loader\\winload.exe");
+    CombinePaths(DstPath, ARRAYSIZE(DstPath), 3, SystemRootPath->Buffer, L"system32", L"winload.exe");
 
     DPRINT("Copy: %S ==> %S\n", SrcPath, DstPath);
     Status = SetupCopyFile(SrcPath, DstPath, FALSE);
     if (!NT_SUCCESS(Status))
     {
-        DPRINT1("SetupCopyFile() failed (Status 0x%08lx)\n", Status);
+        DPRINT1("SetupCopyFile(system32\\winload.exe) failed (Status 0x%08lx)\n", Status);
         return Status;
     }
-
-    /* Protect rosload.exe (this is optional, so any potential errors are ignored) */
     SetupSetFileAttributes(DstPath, ProtectAttribs);
 
     return STATUS_SUCCESS;
@@ -1244,6 +1240,20 @@ InstallBtrfsBootcodeToPartition(
         DPRINT1("InstallBootloaderFiles() failed (Status %lx)\n", Status);
         return Status;
     }
+
+    /* Btrfs boot sectors use the filesystem veneer at the partition root. */
+    CombinePaths(SrcPath, ARRAYSIZE(SrcPath), 2, SourceRootPath->Buffer, L"\\loader\\veneer.exe");
+    CombinePaths(DstPath, ARRAYSIZE(DstPath), 2, SystemRootPath->Buffer, L"veneer.exe");
+
+    DPRINT("Copy Btrfs veneer: %S ==> %S\n", SrcPath, DstPath);
+    Status = SetupCopyFile(SrcPath, DstPath, FALSE);
+    if (!NT_SUCCESS(Status))
+    {
+        DPRINT1("SetupCopyFile(veneer.exe) failed (Status 0x%08lx)\n", Status);
+        return Status;
+    }
+    SetupSetFileAttributes(DstPath,
+                           FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_READONLY);
 
     /* Prepare for possibly updating 'freeldr.ini' */
     DoesFreeLdrExist = DoesFileExist_2(SystemRootPath->Buffer, L"freeldr.ini");

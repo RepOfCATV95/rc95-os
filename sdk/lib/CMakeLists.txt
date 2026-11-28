@@ -65,7 +65,11 @@ add_subdirectory(vcstartup)
 add_subdirectory(vkd3d)
 add_subdirectory(wine2ros)
 add_subdirectory(wdmguid)
-add_subdirectory(libwim)
+# RC95LDR's WIM filesystem may add the shared library earlier in the
+# configure graph. Do not create the same CMake target a second time.
+if(NOT TARGET libwim)
+    add_subdirectory(libwim)
+endif()
 
 else()
 

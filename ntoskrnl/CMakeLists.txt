@@ -45,7 +45,15 @@ add_executable(ntoskrnl
     ${CMAKE_CURRENT_BINARY_DIR}/ntoskrnl.def)
 set_module_type(ntoskrnl kernel)
 
-source_group(TREE ${REACTOS_SOURCE_DIR}/ntoskrnl PREFIX "Source Files" FILES ${NTOSKRNL_SOURCE})
+# The kernel also compiles the shared ARC boot-display discovery helper from
+# sdk/include. Keep that external source out of the ntoskrnl TREE group.
+set(NTOSKRNL_TREE_SOURCES ${NTOSKRNL_SOURCE})
+list(REMOVE_ITEM NTOSKRNL_TREE_SOURCES
+    ${REACTOS_SOURCE_DIR}/sdk/include/reactos/drivers/bootvid/framebuf.c)
+source_group(TREE ${REACTOS_SOURCE_DIR}/ntoskrnl PREFIX "Source Files"
+    FILES ${NTOSKRNL_TREE_SOURCES})
+source_group("Source Files\\BootVideo"
+    FILES ${REACTOS_SOURCE_DIR}/sdk/include/reactos/drivers/bootvid/framebuf.c)
 
 target_link_libraries(ntoskrnl ntoskrnl_vista cportlib csq ${PSEH_LIB} arbiter cmlib ntlsalib rtl rtl_vista ${ROSSYM_LIB} libcntpr setjmp wdmguid poguid ioevent sdbread_km)
 

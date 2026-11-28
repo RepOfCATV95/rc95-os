@@ -33,6 +33,11 @@ NTAPI
 DisplayBootBitmap(
     _In_ BOOLEAN TextMode);
 
+CODE_SEG("INIT")
+VOID
+NTAPI
+FinalizeBootLogo(VOID);
+
 VOID
 NTAPI
 DisplayHibernationScreen(VOID);

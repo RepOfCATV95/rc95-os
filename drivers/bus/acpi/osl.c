@@ -912,12 +912,12 @@ AcpiOsReadMemory (
 
     switch (Width)
     {
-    case 8:  *Value = READ_REGISTER_UCHAR((volatile UCHAR *)Mapping); break;
-    case 16: *Value = READ_REGISTER_USHORT((volatile USHORT *)Mapping); break;
-    case 32: *Value = READ_REGISTER_ULONG((volatile ULONG *)Mapping); break;
+    case 8:  *Value = READ_REGISTER_UCHAR((PUCHAR)Mapping); break;
+    case 16: *Value = READ_REGISTER_USHORT((PUSHORT)Mapping); break;
+    case 32: *Value = READ_REGISTER_ULONG((PULONG)Mapping); break;
     default:
-        *Value = (UINT64)READ_REGISTER_ULONG((volatile ULONG *)Mapping);
-        *Value |= ((UINT64)READ_REGISTER_ULONG((volatile ULONG *)((PUCHAR)Mapping + sizeof(ULONG))) << 32);
+        *Value = (UINT64)READ_REGISTER_ULONG((PULONG)Mapping);
+        *Value |= ((UINT64)READ_REGISTER_ULONG((PULONG)((PUCHAR)Mapping + sizeof(ULONG))) << 32);
         break;
     }
 
@@ -946,12 +946,12 @@ AcpiOsWriteMemory (
 
     switch (Width)
     {
-    case 8:  WRITE_REGISTER_UCHAR((volatile UCHAR *)Mapping, (UCHAR)Value); break;
-    case 16: WRITE_REGISTER_USHORT((volatile USHORT *)Mapping, (USHORT)Value); break;
-    case 32: WRITE_REGISTER_ULONG((volatile ULONG *)Mapping, (ULONG)Value); break;
+    case 8:  WRITE_REGISTER_UCHAR((PUCHAR)Mapping, (UCHAR)Value); break;
+    case 16: WRITE_REGISTER_USHORT((PUSHORT)Mapping, (USHORT)Value); break;
+    case 32: WRITE_REGISTER_ULONG((PULONG)Mapping, (ULONG)Value); break;
     default:
-        WRITE_REGISTER_ULONG((volatile ULONG *)Mapping, (ULONG)Value);
-        WRITE_REGISTER_ULONG((volatile ULONG *)((PUCHAR)Mapping + sizeof(ULONG)), (ULONG)(Value >> 32));
+        WRITE_REGISTER_ULONG((PULONG)Mapping, (ULONG)Value);
+        WRITE_REGISTER_ULONG((PULONG)((PUCHAR)Mapping + sizeof(ULONG)), (ULONG)(Value >> 32));
         break;
     }
 

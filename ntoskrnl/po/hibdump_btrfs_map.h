@@ -98,7 +98,7 @@ PopDumpBtrfsMultiplyOverflowU64(
     _In_ ULONGLONG B,
     _Out_ PULONGLONG Result)
 {
-    if (A != 0 && B > MAXULONGLONG / A)
+    if (A != 0 && B > (~(ULONGLONG)0) / A)
         return TRUE;
     *Result = A * B;
     return FALSE;

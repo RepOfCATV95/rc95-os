@@ -116,6 +116,7 @@ VOID MmSetMemoryType(PVOID MemoryAddress, SIZE_T MemorySize, TYPE_OF_MEMORY NewT
 
 PPAGE_LOOKUP_TABLE_ITEM MmGetMemoryMap(PFN_NUMBER *NoEntries);            // Returns a pointer to the memory mapping table and a number of entries in it
 PFN_NUMBER MmGetTotalPagesInLookupTable(VOID);
+PFN_NUMBER MmGetLowestPhysicalPage(VOID);
 
 //BOOLEAN    MmInitializeMemoryManager(ULONG LowMemoryStart, ULONG LowMemoryLength);
 BOOLEAN    MmInitializeMemoryManager(VOID);

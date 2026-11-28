@@ -707,7 +707,6 @@ static NTSTATUS scrub_extent_dup(device_extension* Vcb, chunk* c, uint64_t offse
     NTSTATUS Status;
     bool csum_error = false;
     ULONG i;
-    CHUNK_ITEM_STRIPE* cis = (CHUNK_ITEM_STRIPE*)&c->chunk_item[1];
     uint16_t present_devices = 0;
 
     if (csum) {
@@ -1303,7 +1302,7 @@ static NTSTATUS scrub_extent_raid10(device_extension* Vcb, chunk* c, uint64_t of
 
                                                         recovered = true;
                                                         break;
-                                                    } else
+                                                    }
                                                 }
                                             }
 
@@ -2764,7 +2763,6 @@ end3:
             break;
     } while (stripe < stripe_end);
 
-end2:
     chunk_unlock_range(Vcb, c, run_start, run_end - run_start);
 
     for (i = 0; i < c->chunk_item->num_stripes; i++) {
@@ -3195,7 +3193,6 @@ static void __stdcall scrub_thread(void* context) {
     KeQuerySystemTime(&time);
     Vcb->scrub.duration.QuadPart += time.QuadPart - Vcb->scrub.resume_time.QuadPart;
 
-end:
     ZwClose(Vcb->scrub.thread);
     Vcb->scrub.thread = NULL;
 

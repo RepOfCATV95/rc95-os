@@ -5089,14 +5089,14 @@ static bool get_hiberfile_disk_cluster(device_extension* Vcb, uint64_t address, 
                     dev->readonly || dev->seeding ||
                     dev->devitem.dev_id != stripe->dev_id ||
                     RtlCompareMemory(&dev->devitem.device_uuid, &stripe->dev_uuid, sizeof(BTRFS_UUID)) != sizeof(BTRFS_UUID) ||
-                    dev->devitem.sector_size != sector_size ||
+                    dev->devitem.minimal_io_size != sector_size ||
                     address - c->offset > UINT64_MAX - stripe->offset)
                     continue;
 
                 physical = stripe->offset + (address - c->offset);
 
                 if ((physical % sector_size) != 0 || (length % sector_size) != 0 ||
-                    physical > dev->size || length > dev->size - physical ||
+                    physical > dev->devitem.num_bytes || length > dev->devitem.num_bytes - physical ||
                     (physical >> Vcb->sector_shift) > MAXLONGLONG)
                     continue;
 
@@ -5296,13 +5296,13 @@ static NTSTATUS get_hiber_mapping(device_extension* Vcb, btrfs_hiber_mapping_req
                 if (dev->devitem.dev_id != stripe->dev_id ||
                     RtlCompareMemory(&dev->devitem.device_uuid, &stripe->dev_uuid,
                                      sizeof(BTRFS_UUID)) != sizeof(BTRFS_UUID) ||
-                    stripe->offset > dev->size ||
-                    member_span > dev->size - stripe->offset) {
+                    stripe->offset > dev->devitem.num_bytes ||
+                    member_span > dev->devitem.num_bytes - stripe->offset) {
                     Status = STATUS_FILE_CORRUPT_ERROR;
                     break;
                 }
 
-                dst->device_size = dev->size;
+                dst->device_size = dev->devitem.num_bytes;
                 if (dev->readonly) {
                     dst->flags |= BTRFS_HIBER_STRIPE_READONLY;
                     out->flags |= BTRFS_HIBER_MAPPING_FLAG_READONLY;

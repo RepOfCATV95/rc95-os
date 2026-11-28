@@ -993,6 +993,101 @@ SmpTranslateSystemPartitionInformation(VOID)
     NtClose(KeyHandle);
 }
 
+
+/*
+ * Locate the BCD store on the system partition and mount it as the live
+ * BCD registry hive. The boot loader has already selected the system
+ * partition; SmpTranslateSystemPartitionInformation publishes its DOS path
+ * as Setup\\BootDir. Keep this separate from SYSTEM: BCD is an independent
+ * hive and must never be loaded over the active system registry.
+ */
+static NTSTATUS
+SmpMountBootConfigurationData(VOID)
+{
+    NTSTATUS Status;
+    UNICODE_STRING KeyName, ValueName, TargetName, SourceName;
+    OBJECT_ATTRIBUTES KeyAttributes, TargetAttributes, SourceAttributes;
+    HANDLE KeyHandle;
+    ULONG ResultLength;
+    WCHAR BootDirectory[MAX_PATH], BcdPath[MAX_PATH];
+    struct
+    {
+        KEY_VALUE_PARTIAL_INFORMATION Information;
+        WCHAR Data[MAX_PATH];
+    } ValueBuffer;
+    static const PCWSTR BcdRelativePaths[] =
+    {
+        L"EFI\\Microsoft\\Boot\\BCD",
+        L"Boot\\BCD"
+    };
+    ULONG Index;
+
+    RtlInitUnicodeString(&KeyName,
+        L"\\Registry\\Machine\\Software\\Microsoft\\Windows\\CurrentVersion\\Setup");
+    InitializeObjectAttributes(&KeyAttributes, &KeyName,
+        OBJ_CASE_INSENSITIVE, NULL, NULL);
+    Status = NtOpenKey(&KeyHandle, KEY_READ, &KeyAttributes);
+    if (!NT_SUCCESS(Status))
+    {
+        DPRINT("SMSS: BootDir is unavailable; skipping BCD mount (0x%lx)\n",
+               Status);
+        return Status;
+    }
+
+    RtlInitUnicodeString(&ValueName, L"BootDir");
+    Status = NtQueryValueKey(KeyHandle, &ValueName,
+        KeyValuePartialInformation, &ValueBuffer, sizeof(ValueBuffer),
+        &ResultLength);
+    NtClose(KeyHandle);
+    if (!NT_SUCCESS(Status) ||
+        ValueBuffer.Information.Type != REG_SZ ||
+        ValueBuffer.Information.DataLength < sizeof(WCHAR) ||
+        ValueBuffer.Information.DataLength > sizeof(ValueBuffer.Data))
+    {
+        DPRINT("SMSS: No usable system-partition BootDir; BCD not mounted (0x%lx)\n",
+               Status);
+        return NT_SUCCESS(Status) ? STATUS_OBJECT_NAME_NOT_FOUND : Status;
+    }
+
+    RtlCopyMemory(BootDirectory, ValueBuffer.Information.Data,
+                  ValueBuffer.Information.DataLength);
+    BootDirectory[(ValueBuffer.Information.DataLength / sizeof(WCHAR)) - 1] = UNICODE_NULL;
+
+    RtlInitUnicodeString(&TargetName,
+                         L"\\Registry\\Machine\\BCD00000000");
+    InitializeObjectAttributes(&TargetAttributes, &TargetName,
+                               OBJ_CASE_INSENSITIVE | OBJ_OPENIF,
+                               NULL, NULL);
+
+    for (Index = 0; Index < RTL_NUMBER_OF(BcdRelativePaths); ++Index)
+    {
+        Status = RtlStringCchPrintfW(BcdPath, RTL_NUMBER_OF(BcdPath),
+                                     L"\\??\\%s%s", BootDirectory,
+                                     BcdRelativePaths[Index]);
+        if (!NT_SUCCESS(Status))
+            return Status;
+
+        RtlInitUnicodeString(&SourceName, BcdPath);
+        InitializeObjectAttributes(&SourceAttributes, &SourceName,
+                                   OBJ_CASE_INSENSITIVE, NULL, NULL);
+        Status = NtLoadKey(&TargetAttributes, &SourceAttributes);
+        if (NT_SUCCESS(Status))
+        {
+            DPRINT1("SMSS: Mounted BCD store from %wZ\n", &SourceName);
+            return STATUS_SUCCESS;
+        }
+
+        /* The UEFI ESP location is preferred; try the BIOS location next. */
+        DPRINT("SMSS: BCD candidate %wZ could not be mounted (0x%lx)\n",
+               &SourceName, Status);
+    }
+
+    /* BCD is optional to the generic Session Manager startup path. */
+    DPRINT1("SMSS: No mountable BCD store found on the system partition (0x%lx)\n",
+            Status);
+    return Status;
+}
+
 NTSTATUS
 NTAPI
 SmpCreateSecurityDescriptors(IN BOOLEAN InitialCall)
@@ -2372,6 +2467,15 @@ SmpLoadDataFromRegistry(OUT PUNICODE_STRING InitialCommand)
         SMSS_CHECKPOINT(SmpInitializeDosDevices, Status);
         return Status;
     }
+
+    /*
+     * Resolve the boot/system partition now that DOS-device links exist,
+     * then mount its BCD hive before starting boot-execute commands.
+     */
+    SmpTranslateSystemPartitionInformation();
+    Status = SmpMountBootConfigurationData();
+    if (!NT_SUCCESS(Status))
+        DPRINT("SMSS: Continuing without a mounted BCD hive (0x%lx)\n", Status);
 
     /* Next create the session directory... */
     RtlInitUnicodeString(&DestinationString, L"\\Sessions");

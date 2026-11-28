@@ -28,6 +28,14 @@ AI is here to help RC95-OS reach its goals. The AGENTS.md proves that otherwise.
 
 ---
 
+## Bootloader roadmap
+
+RC95-OS will continue to ship **FreeLoader as a fallback bootloader**. RC95LDR and WINLOAD are planned to become standalone boot components only after memory mapping, kernel loading and handoff, boot-time driver loading, pre-OS video-mode support, and filesystem/storage support are fully implemented and validated together. The standalone transition does **not** mean that FreeLoader is being removed.
+
+See [RC95LDR_FUTURE_PLANS.md](RC95LDR_FUTURE_PLANS.md) for the consolidated roadmap, component responsibilities, implementation stages, and standalone completion criteria.
+
+---
+
 ## License
 
 RC95-OS is licensed under the [GNU GPL 3.0](COPYING). Code inherited from other projects are licensed under GPL 2.0 (represented by [COPYING2](COPYING2), [COPYING.LIB](COPYING.LIB) and [COPYING.ARM](COPYING.ARM)), LGPL 2.1, BSD and MIT licenses.
